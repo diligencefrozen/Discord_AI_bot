@@ -1,5 +1,5 @@
 # hf_client.py ─ Discord.py + HuggingFace InferenceClient  (Python 3.9 호환)
-import os, asyncio, io, httpx, discord, random
+import os, asyncio, io, httpx, discord, random, re
 from discord.ext import commands
 from typing import Optional, List
 from huggingface_hub import InferenceClient
@@ -77,6 +77,7 @@ LINK_REGEX = re.compile(
     r'|gall\.dcinside\.com'
     r'|m\.dcinside\.com'
     r'|news\.(naver|v\.daum)\.com',
+    re.IGNORECASE,    
 )
 
 # ────── on_message: 웃음 반응 + 링크 필터  
