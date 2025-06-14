@@ -1,9 +1,10 @@
 # hf_client.py ─ Discord.py + HuggingFace InferenceClient  (Python 3.9 호환)
-import os, asyncio, io, httpx, discord, random, re
+import os, asyncio, io, httpx, discord, random, re, datetime
 from discord.ext import commands
 from typing import Optional, List
+from pytz import timezone
 from huggingface_hub import InferenceClient
-from dotenv import load_dotenv           # NEW
+from dotenv import load_dotenv           
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
@@ -55,6 +56,18 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ────── 삭제 로그 채널 매핑 ──────
+LOG_ROUTES = {
+    1064823080100306995: {937715555232780318, 944520863389208606, 1098896878768234556,
+                           1155789990173868122, 1064823080100306995, 932654164201336872,
+                           989509986793168926, 944522706894872606},
+    1383468537229738156: {865821307969732648, 1134766793249013780, 1176877764608004156,
+                           802904099816472619, 820536422808944662, 1383468537229738156},
+    1065283543640576103: {1247409483353821335, 721047251862159420, 904343326654885939,
+                           862310554567835658, 915207176518270981, 1065283543640576103},
+}
+# 채널별 빠른 조회용 딕셔너리
+CHANNEL_TO_LOG = {src: dst for dst, src_set in LOG_ROUTES.items() for src in src_set}
 
 # ────── 웃음 반응 데이터 ──────  
 LAUGH_KEYWORDS = ("ㅋㅋ", "ㅎㅎ", "하하", "히히", "호호", "크크")
@@ -99,6 +112,32 @@ LINK_REGEX = re.compile(
     re.IGNORECASE,    
 )
 
+# ────── 메시지 삭제 로그 ──────
+@bot.event
+async def on_message_delete(message: discord.Message):
+    log_ch_id = CHANNEL_TO_LOG.get(message.channel.id)
+    if not log_ch_id:                       # 로그 대상 아님
+        return
+
+    log_channel = bot.get_channel(log_ch_id)
+    if not log_channel:
+        return
+
+    seoul_time = datetime.datetime.now(timezone("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+    content = message.content or "[첨부 파일 / 스티커 등]"
+    if len(content) > 1024:
+        content = content[:1021] + "…"
+
+    embed = discord.Embed(
+        title="메시지 삭제 기록",
+        description=f"**User:** {message.author.mention}\n**Channel:** {message.channel.mention}",
+        color=0xFF0000,
+    )
+    embed.add_field(name="Deleted Content", value=content, inline=False)
+    embed.set_footer(text=f"{message.guild.name} | {seoul_time}")
+
+    await log_channel.send(embed=embed)
+    
 # ────── on_message: 웃음 반응 + 링크 필터  
 @bot.event
 async def on_message(message: discord.Message):
