@@ -77,7 +77,6 @@ LINK_REGEX = re.compile(
     r'|gall\.dcinside\.com'
     r'|m\.dcinside\.com'
     r'|news\.(naver|v\.daum)\.com',
-    re.IGNORECASE,
 )
 
 # ────── on_message: 웃음 반응 + 링크 필터  
