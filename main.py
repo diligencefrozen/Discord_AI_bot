@@ -5,7 +5,7 @@ from typing import Optional, List
 from pytz import timezone
 from huggingface_hub import InferenceClient
 from dotenv import load_dotenv           
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
@@ -30,11 +30,11 @@ def charge(tokens):
     if token_used > TOKEN_BUDGET:
         raise RuntimeError("Free quota exhausted – further calls blocked!")
 
-def force_korean(text: str) -> str:
-    # 영어 비율이 50% 이상이면 번역 API로 강제 변환
-    if sum(ch.isalpha() for ch in text) / max(len(text),1) > 0.5:
-        return Translator().translate(text, dest="ko").text
-    return text
+def translate_to_korean(text: str) -> str:
+    try:
+        return GoogleTranslator(source='auto', target='ko').translate(text)
+    except Exception:
+        return text  # 실패 시 원문 반환
     
 # ────────── 금칙어 사전 ──────────
 BAD_ROOTS = {
