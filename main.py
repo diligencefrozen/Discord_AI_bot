@@ -61,6 +61,56 @@ LAUGH_EMOJIS = [
 ]
 
 
+# ────── 링크 필터링 설정 
+ALLOWED_CHANNELS = {
+    944520863389208606, 1098896878768234556, 1064823080100306995,
+    932654164201336872, 989509986793168926, 944522706894872606,
+    1134766793249013780, 802904099816472619, 820536422808944662,
+    1176877764608004156,
+}
+LINK_REGEX = re.compile(
+    r'https?://\S+'
+    r'|youtu\.be'
+    r'|youtube\.com'
+    r'|gall\.dcinside\.com'
+    r'|m\.dcinside\.com'
+    r'|news\.(naver|v\.daum)\.com',
+    re.IGNORECASE,
+)
+
+# ────── on_message: 웃음 반응 + 링크 필터  
+@bot.event
+async def on_message(message: discord.Message):
+    # 1) 봇 자신의 메시지는 무시
+    if message.author.id == bot.user.id:
+        return
+
+    # 2) 허용 채널에서 링크 감지 시 삭제
+    if (
+        message.channel.id in ALLOWED_CHANNELS
+        and LINK_REGEX.search(message.content)
+    ):
+        await message.delete()
+        warn = discord.Embed(
+            description=f"{message.author.mention} 이런; 규칙을 위반하지마세요.",
+            color=0xff0000,
+        )
+        await message.channel.send(embed=warn)
+        # 이후 명령 파싱은 불필요(삭제된 메시지이므로) → 조기 return
+        return
+
+    # 2) 웃음 키워드 반응
+    if any(k in message.content for k in LAUGH_KEYWORDS):
+        quote = random.choice(LAUGH_QUOTES)
+        emoji = random.choice(LAUGH_EMOJIS)
+        await message.channel.send(
+            embed=discord.Embed(title=quote, description=emoji, color=0x00ff00)
+        )
+
+    # 3) 다른 명령 처리 계속
+    await bot.process_commands(message)
+
+
 # ────── 헬퍼 ──────
 def split_paragraphs(text: str, lim: int = MAX_MSG) -> List[str]:
     parts, buf = [], ""
@@ -81,24 +131,6 @@ def fix_code(chunks: List[str]) -> List[str]:
             open_block = not open_block
         fixed.append(ch)
     return fixed
-
-
-# ────── on_message : 웃음 반응  
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    if any(k in message.content for k in LAUGH_KEYWORDS):
-        quote = random.choice(LAUGH_QUOTES)
-        emoji = random.choice(LAUGH_EMOJIS)
-        await message.channel.send(
-            embed=discord.Embed(title=quote, description=emoji, color=0x00ff00)
-        )
-
-    # 명령어 처리 계속
-    await bot.process_commands(message)
-
 
 # ────── 커맨드 ──────
 @bot.command(name="ask", help="!ask <질문>")
