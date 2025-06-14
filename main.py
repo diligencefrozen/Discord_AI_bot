@@ -18,6 +18,22 @@ if not HF_TOKEN or not DISCORD_TOKEN:
         "• 배포: 플랫폼 환경변수 / GitHub Secrets 로 주입"
     )
 
+
+# ────────── 금칙어 사전 ──────────
+BAD_ROOTS = {
+    "씨발", "시발", "지랄", "존나", "섹스", "병신", "새끼", "애미", "에미", "븅신",
+    "보지", "한녀", "느금", "페미", "패미", "짱깨", "닥쳐", "노무", "정공",
+    "씹놈", "씹년", "십놈", "십년", "계집", "장애", "시팔", "씨팔", "ㅈㄴ",
+    "ㄷㅊ", "ㅈㄹ", "미친", "미띤", "애비", "ㅅㅂ", "ㅆㅂ", "ㅇㅁ", "ㄲㅈ",
+}
+
+FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
+
+def make_pattern(word: str) -> re.Pattern:
+    return re.compile(FILLER.join(map(re.escape, word)), re.IGNORECASE)
+
+BANNED_PATTERNS = [make_pattern(w) for w in BAD_ROOTS]
+
 # ────── 고정 설정 ──────
 PROVIDER = "featherless-ai"
 MODEL    = "deepseek-ai/DeepSeek-V3-0324"
@@ -104,6 +120,15 @@ async def on_message(message: discord.Message):
         # 이후 명령 파싱은 불필요(삭제된 메시지이므로) → 조기 return
         return
 
+    # 금칙어 필터
+    for pat in BANNED_PATTERNS:
+        if pat.search(message.content):
+            await message.delete()
+            await message.channel.send(embed=discord.Embed(
+                description=f"{message.author.mention} 이런; 말을 순화하세요.",
+                color=0xff0000))
+            return
+            
     # 2) 웃음 키워드 반응
     if any(k in message.content for k in LAUGH_KEYWORDS):
         quote = random.choice(LAUGH_QUOTES)
