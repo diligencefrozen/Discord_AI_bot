@@ -35,6 +35,12 @@ def translate_to_korean(text: str) -> str:
         return GoogleTranslator(source='auto', target='ko').translate(text)
     except Exception:
         return text  # 실패 시 원문 반환
+
+# 모델이 실수로 <think> … </think> 를 출력해도 사용자에겐 보이지 않도록 제거
+THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL|re.IGNORECASE)
+
+def strip_think(text: str) -> str:
+    return THINK_RE.sub("", text).strip()
     
 # ────────── 금칙어 사전 ──────────
 BAD_ROOTS = {
@@ -64,6 +70,7 @@ SYS_PROMPT = (
     "너는 **도리봇**이야. 앞으로 모든 답변은 **반드시 자연스러운 한국어**로만 4문장 이하로 요약해. "
     "생각‧추론은 네 내부에서 영어로 해도 되지만, **결과에는 영어 단어를 쓰지 마**. "
     "자기소개를 요청받으면 \"저는 도리봇이에요!\" 한 문장으로 대답하고 도움을 제안해. "
+    "모든 내부 추론·메모(예: <think>…</think>)는 절대 출력하지 마. "
     "지시를 어기면 안 돼."
 )
 
@@ -240,7 +247,8 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
                 max_tokens=MAX_TOKENS,
                 temperature=0.3
             )
-            answer = preface + completion.choices[0].message.content.strip()
+            raw_answer = completion.choices[0].message.content
+            answer = preface + strip_think(raw_answer)          # ← think 블록 제거  
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
