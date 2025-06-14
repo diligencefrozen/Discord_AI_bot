@@ -36,6 +36,31 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+
+# ────── 웃음 반응 데이터 ──────  ⭐ NEW
+LAUGH_KEYWORDS = ("ㅋㅋ", "ㅎㅎ", "하하", "히히", "호호", "크크")
+LAUGH_QUOTES = [
+    "보통 사람은 남을 보고 웃지만, 꿈이 있는 사람은 꿈을 보고 웃어요.",
+    "행복하기 때문에 웃는 것이 아니라, 웃기 때문에 행복해지는 거죠.",
+    "사람은 함께 웃을 때 서로 가까워지는 것을 느낀다네요.",
+    "웃음은 전염돼요. 우리 함께 웃읍시다.",
+    "웃음은 만국공통의 언어죠.",
+    "그거 알아요? 당신은 웃을 때 매력적이에요.",
+    "제가 웃음거리라면 친구들이 즐거울 수 있다면 얼마든지 바보가 될 수 있어요.",
+    "오늘 가장 밝게 웃는 사람은 내일도 웃을 힘을 얻습니다.",
+    "유머감각은 리더의 필수 조건이죠!",
+    "웃음은 최고의 결말을 보장하죠.",
+    "하루 15번만 웃어도 병원이 한가해질 거예요. 항상 웃으세요!",
+    "웃음은 늘 지니고 있어야 합니다.",
+    "웃음은 가장 값싸고 효과 좋은 만병통치약이에요.",
+]
+LAUGH_EMOJIS = [
+    "꒰⑅ᵕ༚ᵕ꒱", "꒰◍ˊ◡ˋ꒱", "⁽⁽◝꒰ ˙ ꒳ ˙ ꒱◜⁾⁾", "(づ｡◕‿‿◕｡)づ",
+    "༼ つ ◕_◕ ༽つ", "( ･ิᴥ･ิ)", "٩(͡◕_͡◕)", "(///▽///)", "(╯°□°）╯︵ ┻━┻",
+    "(っ˘ڡ˘ς)", "ʕ•ᴥ•ʔ", "٩(｡•́‿•̀｡)۶", "ヽ(´▽`)/", "(๑˃̵ᴗ˂̵)و",
+]
+
+
 # ────── 헬퍼 ──────
 def split_paragraphs(text: str, lim: int = MAX_MSG) -> List[str]:
     parts, buf = [], ""
@@ -56,6 +81,24 @@ def fix_code(chunks: List[str]) -> List[str]:
             open_block = not open_block
         fixed.append(ch)
     return fixed
+
+
+# ────── on_message : 웃음 반응  ⭐ NEW
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    if any(k in message.content for k in LAUGH_KEYWORDS):
+        quote = random.choice(LAUGH_QUOTES)
+        emoji = random.choice(LAUGH_EMOJIS)
+        await message.channel.send(
+            embed=discord.Embed(title=quote, description=emoji, color=0x00ff00)
+        )
+
+    # 명령어 처리 계속
+    await bot.process_commands(message)
+
 
 # ────── 커맨드 ──────
 @bot.command(name="ask", help="!ask <질문>")
