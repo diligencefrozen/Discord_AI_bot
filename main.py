@@ -61,7 +61,7 @@ BANNED_PATTERNS = [make_pattern(w) for w in BAD_ROOTS]
 PROVIDER = "novita"
 MODEL    = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
 
-MAX_TOKENS = 300
+MAX_TOKENS = 512
 
 MAX_MSG  = 1_900        # 메시지 한 덩어리 최대 길이
 FILE_TH  = 6_000        # 6k↑면 txt 파일로 첨부
