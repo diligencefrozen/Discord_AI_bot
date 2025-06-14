@@ -37,7 +37,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-# ────── 웃음 반응 데이터 ──────  ⭐ NEW
+# ────── 웃음 반응 데이터 ──────  
 LAUGH_KEYWORDS = ("ㅋㅋ", "ㅎㅎ", "하하", "히히", "호호", "크크")
 LAUGH_QUOTES = [
     "보통 사람은 남을 보고 웃지만, 꿈이 있는 사람은 꿈을 보고 웃어요.",
@@ -83,7 +83,7 @@ def fix_code(chunks: List[str]) -> List[str]:
     return fixed
 
 
-# ────── on_message : 웃음 반응  ⭐ NEW
+# ────── on_message : 웃음 반응  
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -132,7 +132,7 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
         except Exception as e:
             answer = f"⚠️ HF 호출 오류: {e}"
 
-    # 길이·파일 처리
+    # 길이,파일 처리
     if len(answer) > FILE_TH:
         io_buf = io.StringIO(answer)
         await ctx.reply("📄 답변이 길어 파일로 첨부했어요!",
