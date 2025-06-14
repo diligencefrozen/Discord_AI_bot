@@ -36,8 +36,10 @@ def make_pattern(word: str) -> re.Pattern:
 BANNED_PATTERNS = [make_pattern(w) for w in BAD_ROOTS]
 
 # ────── 고정 설정 ──────
-PROVIDER = "featherless-ai"
-MODEL    = "deepseek-ai/DeepSeek-V3-0324"
+PROVIDER = "novita"
+MODEL    = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+
+MAX_TOKENS = 256
 
 MAX_MSG  = 1_900        # 메시지 한 덩어리 최대 길이
 FILE_TH  = 6_000        # 6k↑면 txt 파일로 첨부
@@ -216,11 +218,12 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
         try:
             completion = hf.chat.completions.create(
                 model=MODEL,
+                # provider 명시를 안전하게 유지
                 messages=[
                     {"role": "system", "content": SYS_PROMPT},
                     {"role": "user",   "content": prompt},
                 ],
-                max_tokens=300,
+                max_tokens=MAX_TOKENS,
             )
             answer = preface + completion.choices[0].message.content.strip()
 
