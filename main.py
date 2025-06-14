@@ -5,6 +5,7 @@ from typing import Optional, List
 from pytz import timezone
 from huggingface_hub import InferenceClient
 from dotenv import load_dotenv           
+from googletrans import Translator
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
@@ -19,7 +20,22 @@ if not HF_TOKEN or not DISCORD_TOKEN:
         "• 배포: 플랫폼 환경변수 / GitHub Secrets 로 주입"
     )
 
+# 매달 5만 token(=입력+출력)을 넘지 않도록 간단히 차단
+TOKEN_BUDGET = 50_000          # novita 무료 월 한도
+token_used = 0                 # 전역 카운터
 
+def charge(tokens):
+    global token_used
+    token_used += tokens
+    if token_used > TOKEN_BUDGET:
+        raise RuntimeError("Free quota exhausted – further calls blocked!")
+
+def force_korean(text: str) -> str:
+    # 영어 비율이 50% 이상이면 번역 API로 강제 변환
+    if sum(ch.isalpha() for ch in text) / max(len(text),1) > 0.5:
+        return Translator().translate(text, dest="ko").text
+    return text
+    
 # ────────── 금칙어 사전 ──────────
 BAD_ROOTS = {
     "씨발", "시발", "지랄", "존나", "섹스", "병신", "새끼", "애미", "에미", "븅신",
@@ -37,7 +53,7 @@ BANNED_PATTERNS = [make_pattern(w) for w in BAD_ROOTS]
 
 # ────── 고정 설정 ──────
 PROVIDER = "novita"
-MODEL    = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+MODEL    = "deepseek-ai/DeepSeek-R1-Llama-8B-Instruct"
 
 MAX_TOKENS = 256
 
@@ -45,12 +61,10 @@ MAX_MSG  = 1_900        # 메시지 한 덩어리 최대 길이
 FILE_TH  = 6_000        # 6k↑면 txt 파일로 첨부
 
 SYS_PROMPT = (
-    "You are **DoriBot (도리봇)**, a friendly multilingual assistant. "
-    "Whatever language the user speaks, always think and reason **in English** first. "
-    "Then translate your final answer into **natural, friendly Korean** (maximum four sentences), "
-    "highlighting only the key points. "
-    "If the user asks about your identity, cheerfully answer \"저는 도리봇이에요!\" "
-    "and offer help. Never exceed four Korean sentences in total."
+    "너는 **도리봇**이야. 앞으로 모든 답변은 **반드시 자연스러운 한국어**로만 4문장 이하로 요약해. "
+    "생각‧추론은 네 내부에서 영어로 해도 되지만, **결과에는 영어 단어를 쓰지 마**. "
+    "자기소개를 요청받으면 \"저는 도리봇이에요!\" 한 문장으로 대답하고 도움을 제안해. "
+    "지시를 어기면 안 돼."
 )
 
 hf  = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
@@ -224,6 +238,7 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
                     {"role": "user",   "content": prompt},
                 ],
                 max_tokens=MAX_TOKENS,
+                temperature=0.3
             )
             answer = preface + completion.choices[0].message.content.strip()
 
