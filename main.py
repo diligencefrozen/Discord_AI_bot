@@ -36,22 +36,33 @@ def translate_to_korean(text: str) -> str:
     except Exception:
         return text  # 실패 시 원문 반환
 
-# 모델이 실수로 <think> … </think> 를 출력해도 사용자에겐 보이지 않도록 제거
+# --------------------------------------------------------------------------------
+# ❶ <think> 블록 제거 + 내부 독백 제거 헬퍼
+# --------------------------------------------------------------------------------
 THINK_RE = re.compile(
     r"""
-    (               
-      (?:<\s*\/?\s*think[^>]*>)        
-    | (?:\[\s*\/?\s*think\s*\])        
-    | (?:```+\s*think[\s\S]*?```+)     
+    (                
+      (?:<\s*\/\s*think[^>]*>)        
+    | (?:<\s*think[^>]*>)               
+    | (?:\[\s*\/\s*think\s*\])     
+    | (?:```+\s*think[\s\S]*?```+)    
     )
     """,
-    re.IGNORECASE | re.VERBOSE
+    re.IGNORECASE | re.VERBOSE,
 )
 
 def strip_think(text: str) -> str:
+
     while THINK_RE.search(text):
         text = THINK_RE.sub("", text)
     return text.strip()
+
+
+def keep_last_paragraph(text: str) -> str:
+
+    cleaned = strip_think(text)
+    parts = re.split(r"\n\s*\n", cleaned)
+    return parts[-1].strip()
     
 # ────────── 금칙어 사전 ──────────
 BAD_ROOTS = {
@@ -78,10 +89,8 @@ MAX_MSG  = 1_900        # 메시지 한 덩어리 최대 길이
 FILE_TH  = 6_000        # 6k↑면 txt 파일로 첨부
 
 SYS_PROMPT = (
-    "너는 도리봇이야. 어떤 질문이 와도 핵심만 뽑아 "
-    "자연스러운 한국어 4문장 이하로 무조건 요약해. "
-    "영어 단어·기호는 쓰지 말고, 예시는 생략해. "
-    "내부 추론·메모는 반드시 숨기고, 최종 출력엔 절대 <think> 태그나 그 내용을 포함하지 마."
+    "너는 도리봇이야. 어떤 질문에도 핵심만 골라 **자연스런 한국어 4문장 이하**로 답해. "
+    "영어·기호 없이 간결하게. 내부 추론이나 메모는 절대 노출하지 마."
 )
 
 hf  = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
@@ -234,46 +243,48 @@ def fix_code(chunks: List[str]) -> List[str]:
         fixed.append(ch)
     return fixed
 
-# ────── 커맨드 ──────
+# ────── ask 커맨드 ──────
 @bot.command(name="ask", help="!ask <질문>")
 async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
-    # 프롬프트 없으면 예시 질문
     if prompt is None:
         prompt   = "애플페이가 뭐야?"
-        preface  = ("💡 예시 질문으로 ‘애플페이가 뭐야?’를 보여 드릴게요!\n"
-                    "다음부터는 `!ask 질문내용` 형식으로 물어보시면 됩니다.\n\n")
+        preface  = (
+            "💡 예시 질문으로 ‘애플페이가 뭐야?’를 보여 드릴게요!\n"
+            "다음부터는 `!ask 질문내용` 형식으로 물어보시면 됩니다.\n\n"
+        )
     else:
         preface = ""
 
     async with ctx.typing():
         try:
             completion = hf.chat.completions.create(
-                model=MODEL,
-                # provider 명시를 안전하게 유지
-                messages=[
+                model       = MODEL,
+                messages    = [
                     {"role": "system", "content": SYS_PROMPT},
                     {"role": "user",   "content": prompt},
                 ],
-                max_tokens=MAX_TOKENS,
-                temperature=0.3
+                max_tokens  = MAX_TOKENS,
+                temperature = 0.3,
             )
+
             raw_answer = completion.choices[0].message.content
-            answer = preface + strip_think(raw_answer)          # ← think 블록 제거  
+            answer     = preface + keep_last_paragraph(raw_answer)
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
-                answer = (f"⚠️ **404**: `{MODEL}` 모델은 Provider **{PROVIDER}** "
-                          "에서 Serverless Inference를 지원하지 않아요.")
+                answer = (
+                    f"⚠️ **404**: `{MODEL}` 모델은 Provider **{PROVIDER}** 에서 "
+                    "Serverless Inference를 지원하지 않아요."
+                )
             else:
                 answer = f"⚠️ HTTP {e.response.status_code}: {e.response.text[:200]}"
         except Exception as e:
             answer = f"⚠️ HF 호출 오류: {e}"
 
-    # 길이,파일 처리
+    # 너무 길면 파일로 전달
     if len(answer) > FILE_TH:
         io_buf = io.StringIO(answer)
-        await ctx.reply("📄 답변이 길어 파일로 첨부했어요!",
-                        file=discord.File(io_buf, "answer.txt"))
+        await ctx.reply("📄 답변이 길어 파일로 첨부했어요!", file=discord.File(io_buf, "answer.txt"))
         return
 
     for part in fix_code(split_paragraphs(answer)):
