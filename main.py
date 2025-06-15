@@ -37,10 +37,21 @@ def translate_to_korean(text: str) -> str:
         return text  # 실패 시 원문 반환
 
 # 모델이 실수로 <think> … </think> 를 출력해도 사용자에겐 보이지 않도록 제거
-THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL|re.IGNORECASE)
+THINK_RE = re.compile(
+    r"""
+    (               
+      (?:<\s*\/?\s*think[^>]*>)        
+    | (?:\[\s*\/?\s*think\s*\])        
+    | (?:```+\s*think[\s\S]*?```+)     
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
 
 def strip_think(text: str) -> str:
-    return THINK_RE.sub("", text).strip()
+    while THINK_RE.search(text):
+        text = THINK_RE.sub("", text)
+    return text.strip()
     
 # ────────── 금칙어 사전 ──────────
 BAD_ROOTS = {
