@@ -81,7 +81,7 @@ BANNED_PATTERNS = [make_pattern(w) for w in BAD_ROOTS]
 
 # ────── 고정 설정 ──────
 PROVIDER = "novita"
-MODEL    = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+MODEL    = "google/gemma-7b-it"
 
 MAX_TOKENS = 512
 
