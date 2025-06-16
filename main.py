@@ -339,27 +339,30 @@ async def on_message(message: discord.Message):
             return
         
         # ─── ① ‘모배’·‘배그’ 안내 ───
-        if re.search(r"(모배|배그)", message.content, re.I):
+        if re.search(rf"(모{FILLER}배|배{FILLER}그)", message.content, re.I):
             pubg = discord.Embed(
                 title="📱 PUBG MOBILE",
                 description=(
-                    "2018-05-16 국내 서비스 시작 → **글로벌 매출 1위** 달성!\n"
-                    "꾸준한 업데이트로 여전히 사랑받는 모바일 배틀로얄입니다."
+                    "2018-05-16\n 국내 서비스 시작 → \n\n**글로벌 매출 1위** 달성!\n"
+                    "꾸준한 업데이트로 여전히 \n사랑받는 모바일 배틀로얄입니다."
                     ),
-                    color=0x2596F3,                     # 밝은 블루
+                    color=0x2596F3,
                     timestamp=datetime.datetime.now(seoul_tz),
                     )
-            pubg.set_thumbnail(url="https://pds.joongang.co.kr/news/component/htmlphoto_mmdata/201701/27/htm_20170127164048356272.JPG")   # 원하는 아이콘으로 교체
+            pubg.set_thumbnail(
+                url="https://pds.joongang.co.kr/news/component/htmlphoto_mmdata/201701/27/htm_20170127164048356272.JPG"
+                )
             pubg.set_footer(text="즐겜은 좋지만 과몰입은 금물 😉")
             
             await message.channel.send(
-                content=f"**{message.author.mention}** 님, @everyone 을 태그해 분대원을 모아보세요!",
+                content=f"**{message.author.mention}** 님, @everyone 을 \n\n태그해 분대원을 모아보세요!",
                 embed=pubg,
                 )
             return
         
         # ─── ② ‘게임’ 키워드 경고 ───
-        if re.search(r"(게+/?[1/]*임|겜|game)", message.content, re.I):
+        game_regex = rf"(게{FILLER}임|겜|game)"
+        if re.search(game_regex, message.content, re.I):
             warn_msg = random.choice([
                 "게임은 **질병**입니다.",
                 "게임 중독… 상상 그 이상을 파괴합니다.",
@@ -375,12 +378,10 @@ async def on_message(message: discord.Message):
                 "사람들과 **오프라인 대화**를 늘려보세요.",
                 "게임 대신 **새 취미**를 찾아볼까요?",
                 ])
-            emoji_pick = random.choice(LAUGH_EMOJIS)
-            
             warn = discord.Embed(
                 title="🚨 게임 경고",
-                description=f"{warn_msg}\n\n{emoji_pick}",
-                color=0xFF5656,                      # 밝은 레드-핑크
+                description=f"{warn_msg}\n\n{random.choice(LAUGH_EMOJIS)}",
+                color=0xFF5656,
                 timestamp=datetime.datetime.now(seoul_tz),
                 )
             warn.set_footer(text="진화한 도리봇이 걱정하고 있어요 🕹️❌")
