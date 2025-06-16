@@ -167,8 +167,6 @@ MAX_TOKENS = 512
 MAX_MSG  = 1_900        # 메시지 한 덩어리 최대 길이
 FILE_TH  = 6_000        # 6k↑면 txt 파일로 첨부
 
-SYS_PROMPT = (
-
 # “항상 4문장 이하로 요약 답변” 시스템 프롬프트
 SYS_PROMPT = (
     "너는 ‘도리봇’이야.\n\n"
