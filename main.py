@@ -337,7 +337,57 @@ async def on_message(message: discord.Message):
         if code in message.content:
             await message.channel.send(embed=make_enlarge_embed(message.author, url))
             return
-
+        
+        # ─── ① ‘모배’·‘배그’ 안내 ───
+        if re.search(r"(모배|배그)", message.content, re.I):
+            pubg = discord.Embed(
+                title="📱 PUBG MOBILE",
+                description=(
+                    "2018-05-16 국내 서비스 시작 → **글로벌 매출 1위** 달성!\n"
+                    "꾸준한 업데이트로 여전히 사랑받는 모바일 배틀로얄입니다."
+                    ),
+                    color=0x2596F3,                     # 밝은 블루
+                    timestamp=datetime.datetime.now(seoul_tz),
+                    )
+            pubg.set_thumbnail(url="https://pds.joongang.co.kr/news/component/htmlphoto_mmdata/201701/27/htm_20170127164048356272.JPG")   # 원하는 아이콘으로 교체
+            pubg.set_footer(text="즐겜은 좋지만 과몰입은 금물 😉")
+            
+            await message.channel.send(
+                content=f"**{message.author.mention}** 님, @everyone 을 태그해 분대원을 모아보세요!",
+                embed=pubg,
+                )
+            return
+        
+        # ─── ② ‘게임’ 키워드 경고 ───
+        if re.search(r"(게+/?[1/]*임|겜|game)", message.content, re.I):
+            warn_msg = random.choice([
+                "게임은 **질병**입니다.",
+                "게임 중독… 상상 그 이상을 파괴합니다.",
+                "게임은 **마약**입니다.",
+                "부모님께 **게임 시간을 정해 달라**고 부탁드려보세요.",
+                "부모·자녀가 같이 게임하면 역효과! 🙅‍♂️",
+                "컴퓨터를 켜고 끄는 **시간을 정합시다**.",
+                "PC를 **공개된 장소**로 옮기세요. 지금!",
+                "게임을 안 하면 불안한가요?\n**당신 인생이 위험합니다.**",
+                "지금 당장 게임을 **삭제**해요. 새 사람이 됩니다.",
+                "처음부터 피하기 힘들다면 **사용 시간을 정해요.**",
+                "우리 **산책** 나갈래요?",
+                "사람들과 **오프라인 대화**를 늘려보세요.",
+                "게임 대신 **새 취미**를 찾아볼까요?",
+                ])
+            emoji_pick = random.choice(LAUGH_EMOJIS)
+            
+            warn = discord.Embed(
+                title="🚨 게임 경고",
+                description=f"{warn_msg}\n\n{emoji_pick}",
+                color=0xFF5656,                      # 밝은 레드-핑크
+                timestamp=datetime.datetime.now(seoul_tz),
+                )
+            warn.set_footer(text="진화한 도리봇이 걱정하고 있어요 🕹️❌")
+            
+            await message.channel.send(embed=warn)
+            return
+            
 # ────── 헬퍼 ──────
 def split_paragraphs(text: str, lim: int = MAX_MSG) -> List[str]:
     parts, buf = [], ""
