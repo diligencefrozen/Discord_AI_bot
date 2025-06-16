@@ -1,4 +1,4 @@
-# hf_client.py ─ Discord.py + HuggingFace InferenceClient  (Python 3.9 호환)
+# main.py (Python 3.9 호환)
 import os, asyncio, io, httpx, discord, random, re, datetime
 from discord.ext import commands
 from typing import Optional, List
