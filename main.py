@@ -63,6 +63,81 @@ def keep_last_paragraph(text: str) -> str:
     cleaned = strip_think(text)
     parts = re.split(r"\n\s*\n", cleaned)
     return parts[-1].strip()
+
+# ────── 이모지 → 확대된 이미지  ────── #
+EMOJI_IMAGES = {
+    ":dccon:" : "https://i.imgur.com/kJDrG0s.png",
+    **{f":{i:02d}:": url for i, url in enumerate([          
+        "https://iili.io/2QqWlrG.png",  # 01
+        "https://iili.io/2QqWaBn.png",  # 02
+        "https://iili.io/2QqW7LX.png",  # 03
+        "https://iili.io/2QqW5Xt.png",  # 04
+        "https://iili.io/2QqW12f.png",  # 05
+        "https://iili.io/2QqWGkl.png",  # 06
+        "https://iili.io/2QqWMp2.png",  # 07
+        "https://iili.io/3DrZnmN.png",  # 08
+        "https://iili.io/3DrZxII.png",  # 09
+        "https://iili.io/2QqWhQ9.png",  # 10
+        "https://iili.io/3DrZzXt.png",  # 11
+        "https://iili.io/2QqWNEu.png",  # 12
+        "https://iili.io/2QqWOrb.png",  # 13
+        "https://iili.io/2QqWk2j.png",  # 14
+        "https://iili.io/2QqWvYx.png",  # 15
+        "https://iili.io/2QqW8kQ.png",  # 16
+        "https://iili.io/2QqWgTB.png",  # 17
+        "https://iili.io/2QqWrhP.png",  # 18
+        "https://iili.io/2QqW4Q1.png",  # 19
+        "https://iili.io/2QqWPCF.png",  # 20
+        "https://iili.io/3DUcuPS.png",  # 21
+        "https://iili.io/2QqWs4a.png",  # 22
+        "https://iili.io/2QqWQ3J.png",  # 23
+        "https://iili.io/3DUc5l9.png",  # 24
+        "https://iili.io/2QqWtvR.png",  # 25
+        "https://iili.io/2QqWDpp.png",  # 26
+        "https://iili.io/2QqWmTN.png",  # 27
+        "https://iili.io/2QqWpjI.png",  # 28
+        "https://iili.io/2QqWyQt.png",  # 29
+        "https://iili.io/2QqXHCX.png",  # 30
+        "https://iili.io/2QqXJGn.png",  # 31
+        "https://iili.io/2QqXd4s.png",  # 32
+        "https://iili.io/2QqX33G.png",  # 33
+        "https://iili.io/2QqXFaf.png",  # 34
+        "https://iili.io/2QqXKv4.png",  # 35
+        "https://iili.io/2QqXfyl.png",  # 36
+        "https://iili.io/2QqXBu2.png",  # 37
+        "https://iili.io/2QqXCjS.png",  # 38
+        "https://iili.io/2QqXnZ7.png",  # 39
+        "https://iili.io/2QqXxn9.png",  # 40
+        "https://iili.io/2QqXzGe.png",  # 41
+        "https://iili.io/2QqXI6u.png",  # 42
+        "https://iili.io/2QqXu3b.png",  # 43
+        "https://iili.io/2QqXAaj.png",  # 44
+        "https://iili.io/2QqXR8x.png",  # 45
+        "https://iili.io/2QqX5yQ.png",  # 46
+        "https://iili.io/2QqXYuV.png",  # 47
+        "https://iili.io/2QqXawB.png",  # 48
+        "https://iili.io/2QqXcZP.png",  # 49
+        "https://iili.io/2QqX0n1.jpg",  # 50
+    ], start=1)}
+}
+
+PASTELS = [0xF9D7D6, 0xF5E6CA, 0xD2E5F4, 0xD4E8D4, 0xE5D1F2, 0xFFF3C8]
+seoul_tz = timezone("Asia/Seoul")  
+
+def make_enlarge_embed(user: discord.Member, img_url: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔍 **이모지 확대!**",
+        description=f"**{user.mention}** 님이 보낸 \n\n이모지를 *크게* 보여드려요.",
+        color=random.choice(PASTELS),
+        timestamp=datetime.datetime.now(seoul_tz),  
+    )
+    embed.set_image(url=img_url)
+    embed.set_thumbnail(url=img_url)
+    embed.set_footer(
+        text="진화한도리봇",               
+        icon_url="https://i.imgur.com/d1Ef9W8.jpeg"
+    )
+    return embed
     
 # ────────── 금칙어 사전 ──────────
 BAD_ROOTS = {
@@ -256,7 +331,12 @@ async def on_message(message: discord.Message):
 
     # 3) 다른 명령 처리 계속
     await bot.process_commands(message)
-
+    
+    # 이모지 감지
+    for code, url in EMOJI_IMAGES.items():
+        if code in message.content:
+            await message.channel.send(embed=make_enlarge_embed(message.author, url))
+            return
 
 # ────── 헬퍼 ──────
 def split_paragraphs(text: str, lim: int = MAX_MSG) -> List[str]:
