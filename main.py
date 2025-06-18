@@ -391,7 +391,7 @@ async def on_message(message: discord.Message):
         logging.info(f"[HOT] word={hot!r}, roll={(rng := random.random()):.3f}")
         
         if hot and rng < 0.15:
-            await message.channel.send(f"💡 흠.. **‘{hot}’** 이야기가 많네요!\n`!ask {hot}` 로 검색해봐요?")
+            tip = f"💡 흠.. **‘{hot}’** 이야기가 많네요!\n`!ask {hot}` 로 검색해봐요?"
             await message.channel.send(tip)
 
 # ────────── ask 명령 ──────────
