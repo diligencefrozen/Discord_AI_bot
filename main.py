@@ -1,17 +1,20 @@
 # main.py (Python 3.9 호환)
-import os, asyncio, io, httpx, discord, random, re, datetime
+
+# ────────────────────────────────────────────────────────────────────────────
+# 기본 모듈,라이브러리 로드
+# ────────────────────────────────────────────────────────────────────────────
+import asyncio, io, httpx, discord, random, re, datetime, logging
 from discord.ext import commands
-from typing import Optional, List
 from pytz import timezone
-from huggingface_hub import InferenceClient
-from dotenv import load_dotenv           
+from typing import Optional, List
 from deep_translator import GoogleTranslator
+from huggingface_hub import InferenceClient
+from collections import deque, Counter
+from dotenv import load_dotenv    
+import itertools, string
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
-
-HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 if not HF_TOKEN or not DISCORD_TOKEN:
     raise RuntimeError(
@@ -29,143 +32,124 @@ def charge(tokens):
     token_used += tokens
     if token_used > TOKEN_BUDGET:
         raise RuntimeError("Free quota exhausted – further calls blocked!")
+        
+# ────────── 로깅 ──────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(message)s")
 
+# ────────── 토큰 예산 ──────────
+TOKEN_BUDGET = 50_000
+token_used = 0
+def charge(tokens: int):
+    global token_used
+    token_used += tokens
+    if token_used > TOKEN_BUDGET:
+        raise RuntimeError("Free quota exhausted – further calls blocked!")
+
+# ────────── 번역 도우미 ──────────
 def translate_to_korean(text: str) -> str:
     try:
-        return GoogleTranslator(source='auto', target='ko').translate(text)
+        return GoogleTranslator(source="auto", target="ko").translate(text)
     except Exception:
-        return text  # 실패 시 원문 반환
+        return text                                # 실패 시 원문 반환
 
-# --------------------------------------------------------------------------------
-# ❶ <think> 블록 제거 + 내부 독백 제거 
-# --------------------------------------------------------------------------------
+# ────────── 내부 <think> 제거 ──────────
 THINK_RE = re.compile(
-    r"""
-    (                
-      (?:<\s*\/\s*think[^>]*>)        
-    | (?:<\s*think[^>]*>)               
-    | (?:\[\s*\/\s*think\s*\])     
-    | (?:```+\s*think[\s\S]*?```+)    
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"""((?:<\s*/\s*think[^>]*>)|
+         (?:<\s*think[^>]*>)|
+         (?:\[\s*/\s*think\s*\])|
+         (?:```+\s*think[\s\S]*?```+))""",
+    re.I | re.X,
 )
-
-def strip_think(text: str) -> str:
-
-    while THINK_RE.search(text):
-        text = THINK_RE.sub("", text)
-    return text.strip()
-
-
-def keep_last_paragraph(text: str) -> str:
-
-    cleaned = strip_think(text)
+def strip_think(t: str) -> str:
+    while THINK_RE.search(t):
+        t = THINK_RE.sub("", t)
+    return t.strip()
+def keep_last_paragraph(t: str) -> str:
+    cleaned = strip_think(t)
     parts = re.split(r"\n\s*\n", cleaned)
     return parts[-1].strip()
 
-# ────── 이모지 → 확대된 이미지  ────── #
+# ────────────────────────────────────────────────────────────────────────────
+# ‘최근 메시지 기록’ – 지금 자주 언급되는 키워드 탐지를 위한 기능
+# ────────────────────────────────────────────────────────────────────────────
+MAX_BUFFER = 5   
+RECENT_MSGS: deque[str] = deque(maxlen=MAX_BUFFER)
+STOPWORDS = {"ㅋㅋ", "ㅎㅎ", "음", "이건", "그건"} | set(string.punctuation)
+def tokenize(txt: str) -> list[str]:
+    tokens = re.split(r"[^\w가-힣]+", txt.lower())
+    return [
+        t for t in tokens
+        if t and t not in STOPWORDS and len(t) > 1 and not t.isdigit()
+    ]
+def pick_hot_keyword() -> Optional[str]:
+    freq = Counter(itertools.chain.from_iterable(map(tokenize, RECENT_MSGS)))
+    if not freq:
+        return None
+    word, cnt = freq.most_common(1)[0]
+    return word if cnt >= 2 else None          # 2 회 이상 등장 시 채택
+
+# ────────────────────────────────────────────────────────────────────────────
+# 이모지 확대 – :01: ~ :50: / :dccon: ▶ 원본 PNG 링크 표시
+# ────────────────────────────────────────────────────────────────────────────
 EMOJI_IMAGES = {
-    ":dccon:" : "https://i.imgur.com/kJDrG0s.png",
-    **{f":{i:02d}:": url for i, url in enumerate([          
-        "https://iili.io/2QqWlrG.png",  # 01
-        "https://iili.io/2QqWaBn.png",  # 02
-        "https://iili.io/2QqW7LX.png",  # 03
-        "https://iili.io/2QqW5Xt.png",  # 04
-        "https://iili.io/2QqW12f.png",  # 05
-        "https://iili.io/2QqWGkl.png",  # 06
-        "https://iili.io/2QqWMp2.png",  # 07
-        "https://iili.io/3DrZnmN.png",  # 08
-        "https://iili.io/3DrZxII.png",  # 09
-        "https://iili.io/2QqWhQ9.png",  # 10
-        "https://iili.io/3DrZzXt.png",  # 11
-        "https://iili.io/2QqWNEu.png",  # 12
-        "https://iili.io/2QqWOrb.png",  # 13
-        "https://iili.io/2QqWk2j.png",  # 14
-        "https://iili.io/2QqWvYx.png",  # 15
-        "https://iili.io/2QqW8kQ.png",  # 16
-        "https://iili.io/2QqWgTB.png",  # 17
-        "https://iili.io/2QqWrhP.png",  # 18
-        "https://iili.io/2QqW4Q1.png",  # 19
-        "https://iili.io/2QqWPCF.png",  # 20
-        "https://iili.io/3DUcuPS.png",  # 21
-        "https://iili.io/2QqWs4a.png",  # 22
-        "https://iili.io/2QqWQ3J.png",  # 23
-        "https://iili.io/3DUc5l9.png",  # 24
-        "https://iili.io/2QqWtvR.png",  # 25
-        "https://iili.io/2QqWDpp.png",  # 26
-        "https://iili.io/2QqWmTN.png",  # 27
-        "https://iili.io/2QqWpjI.png",  # 28
-        "https://iili.io/2QqWyQt.png",  # 29
-        "https://iili.io/2QqXHCX.png",  # 30
-        "https://iili.io/2QqXJGn.png",  # 31
-        "https://iili.io/2QqXd4s.png",  # 32
-        "https://iili.io/2QqX33G.png",  # 33
-        "https://iili.io/2QqXFaf.png",  # 34
-        "https://iili.io/2QqXKv4.png",  # 35
-        "https://iili.io/2QqXfyl.png",  # 36
-        "https://iili.io/2QqXBu2.png",  # 37
-        "https://iili.io/2QqXCjS.png",  # 38
-        "https://iili.io/2QqXnZ7.png",  # 39
-        "https://iili.io/2QqXxn9.png",  # 40
-        "https://iili.io/2QqXzGe.png",  # 41
-        "https://iili.io/2QqXI6u.png",  # 42
-        "https://iili.io/2QqXu3b.png",  # 43
-        "https://iili.io/2QqXAaj.png",  # 44
-        "https://iili.io/2QqXR8x.png",  # 45
-        "https://iili.io/2QqX5yQ.png",  # 46
-        "https://iili.io/2QqXYuV.png",  # 47
-        "https://iili.io/2QqXawB.png",  # 48
-        "https://iili.io/2QqXcZP.png",  # 49
-        "https://iili.io/2QqX0n1.jpg",  # 50
+    ":dccon:": "https://i.imgur.com/kJDrG0s.png",
+    **{f":{i:02d}:": url for i, url in enumerate([
+        "https://iili.io/2QqWlrG.png","https://iili.io/2QqWaBn.png","https://iili.io/2QqW7LX.png", # 1 2 3
+        "https://iili.io/2QqW5Xt.png","https://iili.io/2QqW12f.png","https://iili.io/2QqWGkl.png", # 4 5 6
+        "https://iili.io/2QqWMp2.png","https://iili.io/3DrZnmN.png","https://iili.io/3DrZxII.png", # 7 8 9
+        "https://iili.io/2QqWhQ9.png","https://iili.io/3DrZzXt.png","https://iili.io/2QqWNEu.png", # 10 11 12
+        "https://iili.io/2QqWOrb.png","https://iili.io/2QqWk2j.png","https://iili.io/2QqWvYx.png", # 13 14 15
+        "https://iili.io/2QqW8kQ.png","https://iili.io/2QqWgTB.png","https://iili.io/2QqWrhP.png", # 16 17 18
+        "https://iili.io/2QqW4Q1.png","https://iili.io/2QqWPCF.png","https://iili.io/3DUcuPS.png", # 19 20 21
+        "https://iili.io/2QqWs4a.png","https://iili.io/2QqWQ3J.png","https://iili.io/3DUc5l9.png", # 22 23 24
+        "https://iili.io/2QqWtvR.png","https://iili.io/2QqWDpp.png","https://iili.io/2QqWmTN.png", # 25 26 27 
+        "https://iili.io/2QqWpjI.png","https://iili.io/2QqWyQt.png","https://iili.io/2QqXHCX.png", # 28 29 30
+        "https://iili.io/2QqXJGn.png","https://iili.io/2QqXd4s.png","https://iili.io/2QqX33G.png", # 31 32 33 
+        "https://iili.io/2QqXFaf.png","https://iili.io/2QqXKv4.png","https://iili.io/2QqXfyl.png", # 34 35 36
+        "https://iili.io/2QqXBu2.png","https://iili.io/2QqXCjS.png","https://iili.io/2QqXnZ7.png", # 37 38 39
+        "https://iili.io/2QqXxn9.png","https://iili.io/2QqXzGe.png","https://iili.io/2QqXI6u.png", # 40 41 42
+        "https://iili.io/2QqXu3b.png","https://iili.io/2QqXAaj.png","https://iili.io/2QqXR8x.png", # 43 44 45
+        "https://iili.io/2QqX5yQ.png","https://iili.io/2QqXYuV.png","https://iili.io/2QqXawB.png", # 46 47 48
+        "https://iili.io/2QqXcZP.png","https://iili.io/2QqX0n1.jpg", # 49 50
     ], start=1)}
 }
-
-PASTELS = [0xF9D7D6, 0xF5E6CA, 0xD2E5F4, 0xD4E8D4, 0xE5D1F2, 0xFFF3C8]
-seoul_tz = timezone("Asia/Seoul")  
-
+PASTELS = [0xF9D7D6,0xF5E6CA,0xD2E5F4,0xD4E8D4,0xE5D1F2,0xFFF3C8]
+seoul_tz = timezone("Asia/Seoul")
 def make_enlarge_embed(user: discord.Member, img_url: str) -> discord.Embed:
-    embed = discord.Embed(
-        title="🔍 **이모지 확대!**",
-        description=f"**{user.mention}** 님이 보낸 \n\n이모지를 *크게* 보여드려요.",
-        color=random.choice(PASTELS),
-        timestamp=datetime.datetime.now(seoul_tz),  
+    return (discord.Embed(
+            title="🔍 **이모지 확대!**",
+            description=f"**{user.mention}** 님이 보낸\n이모지를 *크게* 보여드려요.",
+            color=random.choice(PASTELS),
+            timestamp=datetime.datetime.now(seoul_tz),
+        )
+        .set_image(url=img_url)
+        .set_thumbnail(url=img_url)
+        .set_footer(text="진화한도리봇", icon_url="https://i.imgur.com/d1Ef9W8.jpeg")
     )
-    embed.set_image(url=img_url)
-    embed.set_thumbnail(url=img_url)
-    embed.set_footer(
-        text="진화한도리봇",               
-        icon_url="https://i.imgur.com/d1Ef9W8.jpeg"
-    )
-    return embed
-    
-# ────────── 금칙어 사전 ──────────
+
+# ────────────────────────────────────────────────────────────────────────────
+# 금칙어(욕설,혐오) 패턴 – filler 패턴으로 우회 입력도 탐지
+# ────────────────────────────────────────────────────────────────────────────
 BAD_ROOTS = {
-    "씨발", "시발", "지랄", "존나", "섹스", "병신", "새끼", "애미", "에미", "븅신",
-    "보지", "한녀", "느금", "페미", "패미", "짱깨", "닥쳐", "노무", "정공",
-    "씹놈", "씹년", "십놈", "십년", "계집", "장애", "시팔", "씨팔", "ㅈㄴ",
-    "ㄷㅊ", "ㅈㄹ", "미친", "미띤", "애비", "ㅅㅂ", "ㅆㅂ", "ㅇㅁ", "ㄲㅈ","ㅄ",
-    "닥치", "씨벌", "시벌", "븅띤", "치매", "시드방", "또라이", "도라이", 
-    "피싸개", "정신병", "조선족", "쪽발이", "쪽빨이", "쪽바리", "쪽팔이", "쪽빨이",
-    "아가리", "ㅇㄱㄹ", "fuck", "Fuck", "FUCK", "ㅗ", "좆", "설거지", "난교", "ㅂㅅ", 
-    "재명", "재앙", "개놈", "개년", "sex", "Sex", "SEX",  
+    "씨발","시발","지랄","존나","섹스","병신","새끼","애미","에미","븅신","보지",
+    "한녀","느금","페미","패미","짱깨","닥쳐","노무","정공","씹놈","씹년","십놈",
+    "십년","계집","장애","시팔","씨팔","ㅈㄴ","ㄷㅊ","ㅈㄹ","미친","미띤","애비",
+    "ㅅㅂ","ㅆㅂ","ㅇㅁ","ㄲㅈ","ㅄ","닥치","씨벌","시벌","븅띤","치매","또라이",
+    "도라이","피싸개","정신병","조선족","쪽발이","쪽빨이","쪽바리","쪽팔이",
+    "아가리","ㅇㄱㄹ","fuck","좆","설거지","난교","재명","재앙","개놈","개년",
+    "sex",
 }
-
 FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
+BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD_ROOTS]
 
-def make_pattern(word: str) -> re.Pattern:
-    return re.compile(FILLER.join(map(re.escape, word)), re.IGNORECASE)
-
-BANNED_PATTERNS = [make_pattern(w) for w in BAD_ROOTS]
-
-# ────── 고정 설정 ──────
-PROVIDER = "novita"
-MODEL    = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
-
+# ────────── HF / Discord 설정 ──────────
+HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
+PROVIDER      = "novita"
+MODEL         = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 MAX_TOKENS = 512
-
-MAX_MSG  = 1_900        # 메시지 한 덩어리 최대 길이
-FILE_TH  = 6_000        # 6k↑면 txt 파일로 첨부
+MAX_MSG   = 1900
+FILE_TH   = 6000
 
 # “항상 4문장 이하로 요약 답변” 시스템 프롬프트
 SYS_PROMPT = (
@@ -210,38 +194,40 @@ SYS_PROMPT = (
     "규칙을 어기면 즉시 수정하고 재출력해."
 )
 
-hf  = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
+hf = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ────── 삭제 로그 채널 매핑 ──────
+# ────────────────────────────────────────────────────────────────────────────
+# 삭제한 메세지를 저장할 채팅방을 설정함.
+# ────────────────────────────────────────────────────────────────────────────
 LOG_ROUTES = {
-    1064823080100306995: {     # PUBG M : 배사모
+    1064823080100306995: { # PUBG M : 배사모
         937715555232780318, 944520863389208606, 1098896878768234556,
-        1064823080100306995, 932654164201336872,
-        989509986793168926, 944522706894872606,
+        1064823080100306995, 932654164201336872, 989509986793168926,
+        944522706894872606,
     },
-    1383468537229738156: {     # 아사모 서버
+    1383468537229738156: { # 아사모 서버
         865821307969732648, 1134766793249013780, 1176877764608004156,
         802904099816472619, 820536422808944662, 1383468537229738156,
     },
-    1065283543640576103: {     # 삼사모 서버 
+    1065283543640576103: { # 삼사모 서버 
         1247409483353821335, 721047251862159420, 904343326654885939,
         862310554567835658, 915207176518270981, 1065283543640576103,
     },
-    1383987919454343269: {     # PUBG : 배사모 서버
-        1247494689876086804,   
-        1247543437478330410, 
-        1383987919454343269,   
+    1383987919454343269: { # PUBG : 배사모 서버
+        1247494689876086804, 1247543437478330410, 1383987919454343269,
     },
 }
 
-# 채널별 빠른 조회용 딕셔너리
-CHANNEL_TO_LOG = {src: dst for dst, src_set in LOG_ROUTES.items() for src in src_set}
+CHANNEL_TO_LOG = {src: dst for dst, srcs in LOG_ROUTES.items() for src in srcs}
 
-# ────── 웃음 반응 데이터 ──────  
-LAUGH_KEYWORDS = ("ㅋㅋ", "ㅎㅎ", "하하", "히히", "호호", "크크")
+# ────────────────────────────────────────────────────────────────────────────
+# ‘웃음’ 상호작용 기능
+# ────────────────────────────────────────────────────────────────────────────
+LAUGH_KEYWORDS = ("ㅋㅋ","ㅎㅎ","하하","히히","호호","크크")
 LAUGH_QUOTES = [
     "보통 사람은 남을 보고 웃지만, 꿈이 있는 사람은 꿈을 보고 웃어요.",
     "행복하기 때문에 웃는 것이 아니라, 웃기 때문에 행복해지는 거죠.",
@@ -257,14 +243,11 @@ LAUGH_QUOTES = [
     "웃음은 늘 지니고 있어야 합니다.",
     "웃음은 가장 값싸고 효과 좋은 만병통치약이에요.",
 ]
-LAUGH_EMOJIS = [
-    "꒰⑅ᵕ༚ᵕ꒱", "꒰◍ˊ◡ˋ꒱", "⁽⁽◝꒰ ˙ ꒳ ˙ ꒱◜⁾⁾", "(づ｡◕‿‿◕｡)づ",
-    "༼ つ ◕_◕ ༽つ", "( ･ิᴥ･ิ)", "٩(͡◕_͡◕)", "(///▽///)", "(╯°□°）╯︵ ┻━┻",
-    "(っ˘ڡ˘ς)", "ʕ•ᴥ•ʔ", "٩(｡•́‿•̀｡)۶", "ヽ(´▽`)/", "(๑˃̵ᴗ˂̵)و",
-]
+LAUGH_EMOJIS = ["꒰⑅ᵕ༚ᵕ꒱","꒰◍ˊ◡ˋ꒱","⁽⁽◝꒰ ˙ ꒳ ˙ ꒱◜⁾⁾","(づ｡◕‿‿◕｡)づ","༼ つ ◕_◕ ༽つ"]
 
-
-# ────── 링크 필터링 설정 
+# ────────────────────────────────────────────────────────────────────────────
+# 링크 필터 – 허용 채널 외 링크 업로드 시 자동 삭제
+# ────────────────────────────────────────────────────────────────────────────
 ALLOWED_CHANNELS = {
     944520863389208606, 1098896878768234556, 1064823080100306995,
     932654164201336872, 989509986793168926, 944522706894872606,
@@ -272,154 +255,144 @@ ALLOWED_CHANNELS = {
     1176877764608004156, 1247409483353821335, 721047251862159420,
     904343326654885939, 862310554567835658, 915207176518270981,
     1065283543640576103, 1247494689876086804, 1247543437478330410,
-    1383987919454343269,    
+    1383987919454343269,
 }
 LINK_REGEX = re.compile(
-    r'https?://\S+'
-    r'|youtu\.be'
-    r'|youtube\.com'
-    r'|gall\.dcinside\.com'
-    r'|m\.dcinside\.com'
-    r'|news\.(naver|v\.daum)\.com',
-    re.IGNORECASE,    
+    r'https?://\S+|youtu\.be|youtube\.com|gall\.dcinside\.com|m\.dcinside\.com|news\.(naver|v\.daum)\.com',
+    re.I,
 )
 
-# ────── 메시지 삭제 로그 ──────
+# ────────────────────────────────────────────────────────────────────────────
+# 메세지 삭제 기록 기능.
+# ────────────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_message_delete(message: discord.Message):
     log_ch_id = CHANNEL_TO_LOG.get(message.channel.id)
-    if not log_ch_id:                       # 로그 대상 아님
+    if not log_ch_id:
         return
-
-    log_channel = bot.get_channel(log_ch_id)
-    if not log_channel:
+    log_ch = bot.get_channel(log_ch_id)
+    if not log_ch:
         return
-
-    seoul_time = datetime.datetime.now(timezone("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
-    content = message.content or "[첨부 파일 / 스티커 등]"
-    if len(content) > 1024:
-        content = content[:1021] + "…"
-
-    embed = discord.Embed(
-        title="메시지 삭제 기록",
-        description=f"**User:** {message.author.mention}\n**Channel:** {message.channel.mention}",
-        color=0xFF0000,
+    ts = datetime.datetime.now(seoul_tz).strftime("%Y-%m-%d %H:%M:%S")
+    content = (message.content or "[첨부 파일 / 스티커 등]")[:1024]
+    embed = (
+        discord.Embed(
+            title="메시지 삭제 기록",
+            description=f"**User:** {message.author.mention}\n**Channel:** {message.channel.mention}",
+            color=0xFF0000,
+        )
+        .add_field(name="Deleted Content", value=content, inline=False)
+        .set_footer(text=f"{message.guild.name} | {ts}")
     )
-    embed.add_field(name="Deleted Content", value=content, inline=False)
-    embed.set_footer(text=f"{message.guild.name} | {seoul_time}")
+    await log_ch.send(embed=embed)
 
-    await log_channel.send(embed=embed)
-    
-# ────── on_message: 웃음 반응 + 링크 필터  
+# ────────── 메인 on_message ──────────
 @bot.event
 async def on_message(message: discord.Message):
-    # 1) 봇 자신의 메시지는 무시
+
+    RECENT_MSGS.append(message.clean_content)
+    logging.info(f"[RECENT_MSGS] {len(RECENT_MSGS):>3}개 │ latest → {RECENT_MSGS[-1]!r}")
+
+    # 봇 자신의 메시지는 무시
     if message.author.id == bot.user.id:
         return
 
-    # 2) 허용 채널에서 링크 감지 시 삭제
-    if (
-        message.channel.id in ALLOWED_CHANNELS
-        and LINK_REGEX.search(message.content)
-    ):
+    # 링크 삭제
+    if message.channel.id in ALLOWED_CHANNELS and LINK_REGEX.search(message.content):
         await message.delete()
-        warn = discord.Embed(
-            description=f"{message.author.mention} 이런; 규칙을 위반하지마세요.",
-            color=0xff0000,
+        await message.channel.send(
+            embed=discord.Embed(description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요. ", color=0xFF0000)
         )
-        await message.channel.send(embed=warn)
-        # 이후 명령 파싱은 불필요(삭제된 메시지이므로) → 조기 return
         return
 
-    # 금칙어 필터
-    for pat in BANNED_PATTERNS:
-        if pat.search(message.content):
+    # 금칙어
+    for p in BANNED_PATTERNS:
+        if p.search(message.content):
             await message.delete()
-            await message.channel.send(embed=discord.Embed(
-                description=f"{message.author.mention} 이런; 말을 순화하세요.",
-                color=0xff0000))
+            await message.channel.send(
+                embed=discord.Embed(description=f"{message.author.mention} 이런; 말을 순화하세요.", color=0xFF0000)
+            )
             return
-            
-    # 2) 웃음 키워드 반응
+
+    # 웃음 상호작용
     if any(k in message.content for k in LAUGH_KEYWORDS):
-        quote = random.choice(LAUGH_QUOTES)
-        emoji = random.choice(LAUGH_EMOJIS)
         await message.channel.send(
-            embed=discord.Embed(title=quote, description=emoji, color=0x00ff00)
+            embed=discord.Embed(
+                title=random.choice(LAUGH_QUOTES),
+                description=random.choice(LAUGH_EMOJIS),
+                color=0x00FF00,
+            )
         )
 
-    # 3) 다른 명령 처리 계속
+    # 명령 실행
     await bot.process_commands(message)
-    
-    # 이모지 감지
+
+    # 이모지 확대
     for code, url in EMOJI_IMAGES.items():
         if code in message.content:
             await message.channel.send(embed=make_enlarge_embed(message.author, url))
             return
-        
-        # ─── ① ‘모배’·‘배그’ 안내 ───
-        if re.search(rf"(모{FILLER}배|배{FILLER}그)", message.content, re.I):
-            pubg = discord.Embed(
+
+    # ‘모배','배그’ 안내
+    if re.search(rf"(모{FILLER}배|배{FILLER}그)", message.content, re.I):
+        pubg = (
+            discord.Embed(
                 title="📱 PUBG MOBILE",
-                description=(
-                    "2018-05-16\n 국내 서비스 시작 → \n\n**글로벌 매출 1위** 달성!\n"
-                    "꾸준한 업데이트로 여전히 \n사랑받는 모바일 배틀로얄입니다."
-                    ),
-                    color=0x2596F3,
-                    timestamp=datetime.datetime.now(seoul_tz),
-                    )
-            pubg.set_thumbnail(
-                url="https://pds.joongang.co.kr/news/component/htmlphoto_mmdata/201701/27/htm_20170127164048356272.JPG"
-                )
-            pubg.set_footer(text="즐겜은 좋지만 과몰입은 금물 😉")
-            
-            await message.channel.send(
-                content=f"**{message.author.mention}** 님, @everyone 을 \n\n태그해 분대원을 모아보세요!",
-                embed=pubg,
-                )
-            return
-        
-        # ─── ② ‘게임’ 키워드 경고 ───
-        game_regex = rf"(게{FILLER}임|겜|game)"
-        if re.search(game_regex, message.content, re.I):
-            warn_msg = random.choice([
-                "게임은 **질병**입니다.",
-                "게임 중독… 상상 그 이상을 파괴합니다.",
-                "게임은 **마약**입니다.",
-                "부모님께 **게임 시간을 정해 달라**고 부탁드려보세요.",
-                "부모·자녀가 같이 게임하면 역효과! 🙅‍♂️",
-                "컴퓨터를 켜고 끄는 **시간을 정합시다**.",
-                "PC를 **공개된 장소**로 옮기세요. 지금!",
-                "게임을 안 하면 불안한가요?\n**당신 인생이 위험합니다.**",
-                "지금 당장 게임을 **삭제**해요. 새 사람이 됩니다.",
-                "처음부터 피하기 힘들다면 **사용 시간을 정해요.**",
-                "우리 **산책** 나갈래요?",
-                "사람들과 **오프라인 대화**를 늘려보세요.",
-                "게임 대신 **새 취미**를 찾아볼까요?",
-                ])
-            warn = discord.Embed(
+                description="2018-05-16 국내 서비스 시작 → **글로벌 매출 1위**!\n꾸준한 업데이트로 사랑받는 모바일 배틀로얄.",
+                color=0x2596F3,
+                timestamp=datetime.datetime.now(seoul_tz),
+            )
+            .set_thumbnail(url="https://pds.joongang.co.kr/news/component/htmlphoto_mmdata/201701/27/htm_20170127164048356272.JPG")
+            .set_footer(text="즐겜은 좋지만 과몰입은 금물 😉")
+        )
+        await message.channel.send(
+            content=f"**{message.author.mention}** 님, @everyone 을 태그해 분대원을 모아보세요!",
+            embed=pubg,
+        )
+        return
+
+    # ‘게임’ 경고
+    if re.search(rf"(게{FILLER}임|겜|game)", message.content, re.I):
+        warn_msg = random.choice([
+            "게임은 **질병**입니다.","게임 중독… 상상 그 이상을 파괴합니다.","게임은 **마약**입니다.",
+            "부모님께 **게임 시간을 정해 달라**고 부탁드려보세요.","컴퓨터를 켜고 끄는 **시간을 정합시다**.",
+            "PC를 **공개된 장소**로 옮기세요. 지금!","게임을 안 하면 불안한가요?\n**당신 인생이 위험합니다.**",
+            "지금 당장 게임을 **삭제**해요. 새 사람이 됩니다.",
+        ])
+        warn = (
+            discord.Embed(
                 title="🚨 게임 경고",
                 description=f"{warn_msg}\n\n{random.choice(LAUGH_EMOJIS)}",
                 color=0xFF5656,
                 timestamp=datetime.datetime.now(seoul_tz),
-                )
-            warn.set_footer(text="진화한 도리봇이 걱정하고 있어요 🕹️❌")
-            
-            await message.channel.send(embed=warn)
-            return
-            
-# ────── 헬퍼 ──────
+            )
+            .set_footer(text="진화한 도리봇이 걱정하고 있어요 🕹️❌")
+        )
+        await message.channel.send(embed=warn)
+        return
+
+    # 🔥 ‘핫 키워드’ 추천 -----------------------------------
+    if not message.content.startswith(("!", "/")) and message.content.strip():
+        hot = pick_hot_keyword()
+        
+        # 괄호로 감싸서 값 계산 → 포맷 적용 → rng 변수에도 저장
+        logging.info(f"[HOT] word={hot!r}, roll={(rng := random.random()):.3f}")
+        
+        if hot and rng < 0.15:
+            await message.channel.send(f"💡 흠.. **‘{hot}’** 이야기가 많네요!\n`!ask {hot}` 로 검색해봐요?")
+            await message.channel.send(tip)
+
+# ────────── ask 명령 ──────────
 def split_paragraphs(text: str, lim: int = MAX_MSG) -> List[str]:
-    parts, buf = [], ""
+    out, buf = [], ""
     for line in text.splitlines(keepends=True):
         if len(buf) + len(line) > lim:
-            parts.append(buf); buf = line
+            out.append(buf); buf = line
         else:
             buf += line
     if buf:
-        parts.append(buf)
-    return parts
-
+        out.append(buf)
+    return out
 def fix_code(chunks: List[str]) -> List[str]:
     fixed, open_block = [], False
     for ch in chunks:
@@ -429,63 +402,46 @@ def fix_code(chunks: List[str]) -> List[str]:
         fixed.append(ch)
     return fixed
 
-# ────── ask 커맨드 ──────
 @bot.command(name="ask", help="!ask <질문>")
 async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
     if prompt is None:
-        prompt   = "애플페이가 뭐야?"
-        preface  = (
-            "💡 예시 질문으로 ‘애플페이가 뭐야?’를 보여 드릴게요!\n"
-            "다음부터는 `!ask 질문내용` 형식으로 물어보시면 됩니다.\n\n"
-        )
+        prompt = "애플페이가 뭐야?"
+        preface = "💡 예시 질문으로 ‘애플페이가 뭐야?’를 보여 드릴게요!\n다음부터는 `!ask 질문내용` 형식으로 물어보시면 됩니다.\n\n"
     else:
         preface = ""
-
     async with ctx.typing():
         try:
-            completion = hf.chat.completions.create(
-                model       = MODEL,
-                messages    = [
-                    {"role": "system", "content": SYS_PROMPT},
-                    {"role": "user",   "content": prompt},
-                ],
-                max_tokens  = MAX_TOKENS,
-                temperature = 0.3,
+            comp = hf.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": SYS_PROMPT},
+                          {"role": "user", "content": prompt}],
+                max_tokens=MAX_TOKENS,
+                temperature=0.3,
             )
-
-            raw_answer = completion.choices[0].message.content
-            answer     = preface + keep_last_paragraph(raw_answer)
-
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                answer = (
-                    f"⚠️ **404**: `{MODEL}` 모델은 Provider **{PROVIDER}** 에서 "
-                    "Serverless Inference를 지원하지 않아요."
-                )
-            else:
-                answer = f"⚠️ HTTP {e.response.status_code}: {e.response.text[:200]}"
+            answer = preface + keep_last_paragraph(comp.choices[0].message.content)
         except Exception as e:
-            answer = f"⚠️ HF 호출 오류: {e}"
-
-    # 너무 길면 파일로 전달
+            answer = f"⚠️ 오류: {e}"
     if len(answer) > FILE_TH:
-        io_buf = io.StringIO(answer)
-        await ctx.reply("📄 답변이 길어 파일로 첨부했어요!", file=discord.File(io_buf, "answer.txt"))
+        await ctx.reply(
+            "📄 답변이 길어 파일로 첨부했어요!",
+            file=discord.File(io.StringIO(answer), "answer.txt"),
+        )
         return
-
     for part in fix_code(split_paragraphs(answer)):
         await ctx.reply(part)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
 
-# ────── 봇 상태 설정 ──────
+# ────────── 봇 상태 ──────────
 @bot.event
 async def on_ready():
     await bot.change_presence(
+        activity=discord.Game("!ask로 질문해 보세요!"),
         status=discord.Status.online,
-        activity=discord.Game("!ask로 질문해 보세요!")
     )
-    print(f"✅ Logged in as {bot.user} (ID {bot.user.id})")
+    logging.info(f"✅ Logged in as {bot.user} (ID {bot.user.id})")
 
-# ────── 실행 ──────
+# ────────── 실행 ──────────
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
+
+
