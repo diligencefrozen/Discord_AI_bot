@@ -29,7 +29,7 @@ if not HF_TOKEN or not DISCORD_TOKEN:
     raise RuntimeError(
         "HF_TOKEN 또는 DISCORD_TOKEN 환경변수가 설정되지 않았습니다.\n"
         "• 로컬 개발: .env 파일에 두 값 작성 후 재실행\n"
-        "• 배포: 플랫폼 환경변수 / GitHub Secrets 로 주입"
+        "• 배포: 플랫폼 환경변수 / Northflank Secrets 로 주입"
     )
 
 # 매달 5만 token(=입력+출력)을 넘지 않도록 간단히 차단
