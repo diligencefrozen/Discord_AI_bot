@@ -16,6 +16,15 @@ import itertools, string
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
+# ────────── HF / Discord 설정 ──────────
+HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
+PROVIDER      = "novita"
+MODEL         = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+MAX_TOKENS = 512
+MAX_MSG   = 1900
+FILE_TH   = 6000
+
 if not HF_TOKEN or not DISCORD_TOKEN:
     raise RuntimeError(
         "HF_TOKEN 또는 DISCORD_TOKEN 환경변수가 설정되지 않았습니다.\n"
@@ -141,15 +150,6 @@ BAD_ROOTS = {
 }
 FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
 BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD_ROOTS]
-
-# ────────── HF / Discord 설정 ──────────
-HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
-PROVIDER      = "novita"
-MODEL         = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-MAX_TOKENS = 512
-MAX_MSG   = 1900
-FILE_TH   = 6000
 
 # “항상 4문장 이하로 요약 답변” 시스템 프롬프트
 SYS_PROMPT = (
