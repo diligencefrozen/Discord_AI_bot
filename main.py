@@ -12,6 +12,7 @@ from huggingface_hub import InferenceClient
 from collections import deque, Counter
 from dotenv import load_dotenv    
 import itertools, string
+from discord.ui import View, Button 
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
