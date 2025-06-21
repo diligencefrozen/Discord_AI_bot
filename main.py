@@ -335,27 +335,27 @@ GAME_CARDS: dict[str, dict] = {
     },
 
     "tarkov": {
+
         "pattern": re.compile(r"(타르코프|탈콥|tarkov)", re.I),
-        "title":   "🕶️ **Escape from Tarkov**",
+
+        "title":   "🕶️ **은밀하게, 그곳을 탈출하라!**",
+        "thumb":   "https://iili.io/Fz78tRI.jpg",
+        "banner":  "https://iili.io/FzcPgNj.jpg",
+
         "desc": (
-            "★ 환불 정책 문제\n"
-            "★ 핵·버그 대응 논란\n"
-            "★ 서버 불안정 및 로딩 지연\n"
-            "★ 개발진 태도와 운영 철학\n"
-            "★ 고가 에디션·P2W 논란\n"
-            "★ 하드코어 시스템의 불합리성\n"
-            "★ 매치메이킹 부재·경제 시스템 혼란\n"
-            "★ 엔진 최적화 한계\n"
-            "★ 모드·PvE 접근 갈등\n\n"
+            "하드코어 FPS 게임을 좋아하는 유저들에게\n"
+            "깊이 있는 게임 경험을 제공하지만,  \n"
+            "초보자에게는 진입 장벽이 높은 게임임. \n"
 
         ),
-        "thumb":   "https://iili.io/Fz7CWu4.jpg",
-        "banner":  "https://iili.io/Fz78tRI.jpg",
+
         "links": [
-            ("Pre-order", "💳", "https://www.escapefromtarkov.com/preorder-page"),
-            ("Wiki",      "📚", "https://escapefromtarkov.fandom.com/wiki/Escape_from_Tarkov_Wiki"),
+            ("Pre-order / EoD", "💳", "https://www.escapefromtarkov.com/preorder-page"),
+            ("Wiki",    "📚", "https://escapefromtarkov.fandom.com/wiki/Escape_from_Tarkov_Wiki"),
+            ("Patch Notes", "📝", "https://www.escapefromtarkov.com/#news"),
         ],
-        "cta": "Check your mags & extract!",
+
+        "cta": "Think twice—then check your mags & try to extract!",
     },
 
     "minecraft": {
