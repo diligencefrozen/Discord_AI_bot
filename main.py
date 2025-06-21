@@ -337,24 +337,51 @@ async def on_message(message: discord.Message):
 
     # ‘모배','배그’ 안내
     if re.search(rf"(모{FILLER}배|배{FILLER}그)", message.content, re.I):
+        
         pubg = (
             discord.Embed(
-                title="📱 PUBG MOBILE",
+                title="🚀  **이제, 모든 곳이 배틀그라운드**",
                 description=(
-                    "2018-05-16\n 국내 서비스 시작 → \n\n**글로벌 매출 1위** 달성!\n"
-                    "꾸준한 업데이트로 여전히 \n사랑받는 모바일 배틀로얄입니다."
+                    "누적 매출 100억 달러를 돌파!\n"
+                    "글로벌 모바일 게임 매출 순위: 2위!\n\n"
                     ),
-                color=0x2596F3,
-                timestamp=datetime.datetime.now(seoul_tz),
-            )
-            .set_thumbnail(url="https://pds.joongang.co.kr/news/component/htmlphoto_mmdata/201701/27/htm_20170127164048356272.JPG")
-            .set_footer(text="즐겜은 좋지만 과몰입은 금물 😉")
+                    color=0x00B2FF,
+                    timestamp=datetime.datetime.now(seoul_tz),
+                    )
+                    .set_thumbnail(url="https://iili.io/FzATZBI.md.jpg")
+                    .set_image(url="https://iili.io/FzAaKEQ.jpg")
+                    .set_footer(text="Play hard, live harder✨")
+                    )
+        
+        class PUBGLinks(View):
+            def __init__(self):
+                super().__init__(timeout=None)
+                self.add_item(
+                    Button(
+                        label="Android", emoji="🤖",
+                        url="https://play.google.com/store/apps/details?id=com.pubg.krmobile"
+                        )
+                        )
+                self.add_item(
+                    Button(
+                        label="iOS", emoji="🍎",
+                        url="https://apps.apple.com/kr/app/%EB%B0%B0%ED%8B%80%EA%B7%B8%EB%9D%BC%EC%9A%B4%EB%93%9C/id1366526331"
+                        )
+                        )
+                self.add_item(
+                    Button(
+                        label="Official Discord", emoji="🌐",
+                        style=discord.ButtonStyle.link,
+                        url="https://discord.com/invite/pubgmobile"
+                        )
+                        )
+                
+    await message.channel.send(
+        content=f"{message.author.mention} Squad-up & jump in!",
+        embed=pubg,
+        view=PUBGLinks(),
         )
-        await message.channel.send(
-            content=f"**{message.author.mention}** 님, @everyone 을 태그해 분대원을 모아보세요!",
-            embed=pubg,
-        )
-        return
+    return
 
     # ‘게임’ 경고
     if re.search(rf"(게{FILLER}임|겜|game|친구)", message.content, re.I):
