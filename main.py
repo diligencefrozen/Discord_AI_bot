@@ -86,7 +86,8 @@ MAX_BUFFER = 5
 RECENT_MSGS: deque[str] = deque(maxlen=MAX_BUFFER)
 STOPWORDS = {"ㅋㅋ", "ㅎㅎ", "음", "이건", "그건", "다들", 
              "도리", "7호선", "칠호선", "나냡", 
-             "1인칭", "일인칭", "들쥐", "돌이"} | set(string.punctuation)
+             "1인칭", "일인칭", "들쥐", "돌이", "도리야", 
+            "나냡아", "호선아", "다들", "the", } | set(string.punctuation)
 def tokenize(txt: str) -> list[str]:
     tokens = re.split(r"[^\w가-힣]+", txt.lower())
     return [
