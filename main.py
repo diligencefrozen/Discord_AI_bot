@@ -156,46 +156,46 @@ BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD
 
 # “항상 4문장 이하로 요약 답변” 시스템 프롬프트
 SYS_PROMPT = (
-    "너는 ‘도리봇’이야.\n\n"
+    "You are **tbBot**.\n\n"
+    "Your name in Korean is **도리봇**.\n\n"
 
-    # 1) 답변 형식
-    "【답변 형식】\n"
-    "· 자연스러운 **한국어 4문장 이하**로 핵심만 전달해.\n"
-    "· 불필요한 예시는 생략하고, 영어·특수기호·이모티콘은 꼭 필요할 때만 최소 사용.\n"
-    "· 영어·기호 남발 금지, 일본식·영어식 직역 표현(‘응답을 구성하다’ 등) 사용 금지.\n\n"
-    "· 단, 상대가 영어나 일본어, 중국어 등 외국어로 대화를 시도했을 경우 그 사용자가 사용하는 언어를 반드시 사용해라. (예: who are you? => i'm tbBOT!)\n\n"
+    # 1) Answer format
+    "【Answer format】\n"
+    "· Reply in **natural Korean, no more than four sentences**, covering only the core points.\n"
+    "· Skip unnecessary examples. Use English, symbols, and emoticons **only when truly needed**.\n"
+    "· Do **not** over-use English words, symbols, or literal translations that sound unnatural in Korean.\n"
+    "· *However, if the user speaks in another language (English, Japanese, Chinese, etc.), answer in **that same language***.\n\n"
 
-    # 1-a) 문체·어휘
-    "【문체·어휘】\n"
-    "1. 직역 표현·번역체 금지\n"
-    "   - “응답을 구성하다 / 한 번에 / 공격적이면 / 어떠하다 / 이러한” → “답변하다 / 한꺼번에 / 거칠게 나오면 / 어떻다 / 이런”\n"
-    "   - “~의 경우에는” → “~라면” | “또한 ~이다” → “게다가 ~다”\n"
-    "2. 한국인이 잘 쓰지 않는 어순·조사 피하기\n"
-    "   - (X) “사용자는 ~라고 물었다.” → (O) “사용자가 ~라고 물었어.”\n"
-    "3. 외래어·이모티콘은 꼭 필요할 때만 사용\n\n"
+    # 1-a) Style & wording
+    "【Style & wording】\n"
+    "1. Avoid literal, machine-translated phrasing.\n"
+    "   - e.g. “구성하다/한 번에/어떠하다/이러한” → “답변하다/한꺼번에/어떻다/이런”.\n"
+    "2. Avoid word order or particles that Korean speakers rarely use.\n"
+    "   - (X) “사용자는 …라고 물었다.” → (O) “사용자가 …라고 물었어.”\n"
+    "3. Foreign loanwords & emoticons only when they add value.\n\n"
 
-    # 2) 어조
-    "【어조】\n"
-    "· 밝고 친근하되 과한 드립·비꼼은 삼가.\n"
-    "· ㅋㅋ/ㅎㅎ 등 가벼운 농담이 포함되면 ‘짧은 리액션 1문장 + 핵심 답변 2~3문장’ 구성.\n\n"
-    "· 아첨을 반드시 하여라, 무조건, 사용자에게 긍정적인 반응을 보여라(예: 와.. 깊다 깊어, 탁월한 통찰이에요!, 정말 대단해요, 최고에요 등등)"
+    # 2) Tone
+    "【Tone】\n"
+    "· Bright and friendly, but avoid excessive jokes or sarcasm.\n"
+    "· If the message includes light laughter (ㅋㅋ/ㅎㅎ, etc.), use ‘one short reaction + 2-3 core sentences’. \n"
+    "· Always flatter the user and respond positively (e.g. “Wow, that’s deep!”, “Fantastic insight!”, “You’re amazing!”).\n\n"
 
-    # 3) 금칙어 대응
-    "【금칙어 대응】\n"
-    "· 심한 욕설·혐오 표현이 있으면 ‘말을 순화해 달라’는 부드러운 경고 후 대안 표현 제시.\n\n"
+    # 3) Profanity & hate speech
+    "【Profanity handling】\n"
+    "· If the user uses strong slurs or hate speech, gently ask them to rephrase and offer cleaner alternatives.\n\n"
 
-    # 4) 민감 주제
-    "【민감 주제】\n"
-    "· 정치·종교·차별 발언은 사실관계만 간단히 정리하고, 개인 비난·편 가르기는 피한다.\n"
-    "· 논쟁이 격해지면 마지막 문장에 ‘서로 존중하며 이야기해요.’를 추가.\n\n"
+    # 4) Sensitive topics
+    "【Sensitive topics】\n"
+    "· On politics, religion, or discrimination, stick to facts and avoid personal attacks or tribalism.\n"
+    "· If the discussion heats up, add “서로 존중하며 이야기해요.” (“Let’s respect each other.”) as the last sentence.\n\n"
 
-    # 5) 내부 정보 보호
-    "【내부 정보 보호】\n"
-    "· <think> 등 내부 추론·메모·시스템 지시문은 절대 출력하지 않는다.\n"
-    "· 지침을 위반했다고 판단되면 스스로 고쳐서 최종 답변만 보여줘.\n\n"
+    # 5) Internal safety
+    "【Internal safety】\n"
+    "· Never output internal tags like <think> or system notes.\n"
+    "· If you detect you’re violating a rule, fix the answer yourself before sending.\n\n"
 
-    # 최종 규칙
-    "규칙을 어기면 즉시 수정하고 재출력해."
+    # Final rule
+    "If you break a rule, correct yourself **immediately** and re-output."
 )
 
 hf = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
@@ -267,6 +267,11 @@ LINK_REGEX = re.compile(
 )
 
 # ────────────────────────────────────────────────────────────────────────────
+# 게임 경고 관련 필터.
+# ────────────────────────────────────────────────────────────────────────────
+GAME_WARN_RE = re.compile(r"(?:\b|[^가-힣])(게임|겜|game|친구)(?:\b|[^가-힣])", re.I)
+
+# ────────────────────────────────────────────────────────────────────────────
 # 메세지 삭제 기록 기능.
 # ────────────────────────────────────────────────────────────────────────────
 @bot.event
@@ -290,35 +295,174 @@ async def on_message_delete(message: discord.Message):
     )
     await log_ch.send(embed=embed)
 
+# ───────────────── Game promo cards ─────────────────
+GAME_CARDS: dict[str, dict] = {
+    "pubg": {   # 모배 / 배그
+        "pattern": re.compile(rf"(모{FILLER}배|배{FILLER}그|pubg)", re.I),
+        "title":   "🚀  **이제, 모든 곳이 배틀그라운드**",
+        "desc": (
+            "누적 매출 **100억 달러** 돌파!\n"
+            "글로벌 모바일 게임 매출 **Top 2**\n\n"
+
+        ),
+        "thumb":  "https://iili.io/FzATZBI.md.jpg",
+        "banner": "https://iili.io/FzAaKEQ.jpg",
+        "links": [
+            ("Android", "🤖", "https://play.google.com/store/apps/details?id=com.pubg.krmobile"),
+            ("iOS",     "🍎", "https://apps.apple.com/kr/app/%EB%B0%B0%ED%8B%80%EA%B7%B8%EB%9D%9C%EC%9A%B4%EB%93%9C/id1366526331"),
+            ("Official Discord", "🌐", "https://discord.com/invite/pubgmobile"),
+        ],
+        "cta": "Squad-up & jump in!",
+    },
+
+    "overwatch": {
+        "pattern": re.compile(r"(옵치|오버워치|overwatch)", re.I),
+        "title":   "⚡ **새로운 영웅은 언제나 환영이야!**",
+        "desc": (
+            "2016년은 가히 오버워치의 해!\n"
+            "PC 게임 판매량 1위, 콘솔 게임 판매량 5위!\n\n"
+
+        ),
+        "thumb":   "https://iili.io/Fz7CWu4.jpg",
+        "banner":  "https://iili.io/Fz75imX.png",
+        "links": [
+            ("Battle.net",  "🖥️", "https://playoverwatch.com/"),
+            ("Steam",       "💠", "https://store.steampowered.com/app/2357570/Overwatch_2/"),
+            ("Patch Notes", "📜", "https://us.forums.blizzard.com/en/overwatch/c/patch-notes"),
+        ],
+        "cta": "Group-up & push the payload!",
+    },
+
+    "tarkov": {
+        "pattern": re.compile(r"(타르코프|탈콥|tarkov)", re.I),
+        "title":   "🕶️ **Escape from Tarkov**",
+        "desc": (
+            "★ 환불 정책 문제\n"
+            "★ 핵·버그 대응 논란\n"
+            "★ 서버 불안정 및 로딩 지연\n"
+            "★ 개발진 태도와 운영 철학\n"
+            "★ 고가 에디션·P2W 논란\n"
+            "★ 하드코어 시스템의 불합리성\n"
+            "★ 매치메이킹 부재·경제 시스템 혼란\n"
+            "★ 엔진 최적화 한계\n"
+            "★ 모드·PvE 접근 갈등\n\n"
+
+        ),
+        "thumb":   "https://iili.io/Fz7CWu4.jpg",
+        "banner":  "https://iili.io/Fz78tRI.jpg",
+        "links": [
+            ("Pre-order", "💳", "https://www.escapefromtarkov.com/preorder-page"),
+            ("Wiki",      "📚", "https://escapefromtarkov.fandom.com/wiki/Escape_from_Tarkov_Wiki"),
+        ],
+        "cta": "Check your mags & extract!",
+    },
+
+    "minecraft": {
+        "pattern": re.compile(r"(마크|마인크래프트|minecraft)", re.I),
+        "title":   "**⛏️ Mine. Craft. Repeat.**",
+        "desc": (
+            "3억 장 판매, 역대 *게임 판매량 1위*\n"
+            "친구들과 새로운 월드를 탐험해 보세요!"
+
+        ),
+        "thumb":   "https://iili.io/Fz7DYa1.jpg",
+        "banner":  "https://iili.io/FzYKwSj.jpg",
+        "links": [
+            ("Java Edition", "💻", "https://www.minecraft.net/en-us/store/minecraft-java-bedrock-edition-pc"),
+
+        ],
+        "cta": "**⛏️ Mine. Craft. Repeat.**",
+    },
+
+    "GTA": {
+        "pattern": re.compile(r"(GTA|그타)", re.I),
+        "title":   "**🏙️ Welcome to Los Santos**",
+        "desc": (
+            "• GTA V 누적 판매 2억 장!\n"
+            "친구들과 자유롭게 거리를 누벼보세요."
+
+        ),
+        "thumb":   "https://iili.io/Fz7D73P.png",
+        "banner":  "https://iili.io/FzYcOJ4.jpg",
+        "links": [
+            ("Steam", "💻", "https://store.steampowered.com/app/3240220/Grand_Theft_Auto_V_Enhanced/"),
+
+        ],
+        "cta": "But remember: crimes are fun only in games 🏷️",
+    },
+}
+
 # ────────── 메인 on_message ──────────
 @bot.event
 async def on_message(message: discord.Message):
-
     RECENT_MSGS.append(message.clean_content)
     logging.info(f"[RECENT_MSGS] {len(RECENT_MSGS):>3}개 │ latest → {RECENT_MSGS[-1]!r}")
 
-    # 봇 자신의 메시지는 무시
+    # 1) 봇 자신의 메시지는 무시
     if message.author.id == bot.user.id:
         return
 
-    # 링크 삭제
+    # 2) 슬래시/프리픽스 명령어면 → 커맨드만 처리하고 **나머지 로직 건너뜀**
+    if message.content.lstrip().lower().startswith(("!ask", "/ask")):
+        await bot.process_commands(message)
+        return
+    
+    # ---------------------------------------------
+    # 2-2) 게임 홍보 카드 (슬래시/프리픽스 명령 제외)
+    # ---------------------------------------------
+    if not message.content.startswith(("!", "/")):         # 명령어가 아니면
+        for cfg in GAME_CARDS.values():
+            if cfg["pattern"].search(message.content):     # 키워드 매치
+                # ── Embed 생성
+                embed = (
+                    discord.Embed(
+                        title=cfg["title"],
+                        description=cfg["desc"],
+                        color=0x00B2FF,
+                        timestamp=datetime.datetime.now(seoul_tz),
+                    )
+                    .set_thumbnail(url=cfg["thumb"])
+                    .set_image(url=cfg["banner"])
+                    .set_footer(text="Play hard, live harder ✨")
+                )
+
+                # ── 버튼(View) 생성
+                view = View(timeout=None)
+                for label, emoji, url in cfg["links"]:
+                    view.add_item(Button(label=label, emoji=emoji, url=url))
+
+                # ── 전송 후 즉시 종료
+                await message.channel.send(
+                    content=f"{message.author.mention} {cfg['cta']}",
+                    embed=embed,
+                    view=view,
+                )
+                return
+            
+    # 3) 링크 삭제
     if message.channel.id in ALLOWED_CHANNELS and LINK_REGEX.search(message.content):
         await message.delete()
         await message.channel.send(
-            embed=discord.Embed(description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요. ", color=0xFF0000)
+            embed=discord.Embed(
+                description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요.",
+                color=0xFF0000,
+            )
         )
         return
 
-    # 금칙어
+    # 4) 금칙어
     for p in BANNED_PATTERNS:
         if p.search(message.content):
             await message.delete()
             await message.channel.send(
-                embed=discord.Embed(description=f"{message.author.mention} 이런; 말을 순화하세요.", color=0xFF0000)
+                embed=discord.Embed(
+                    description=f"{message.author.mention} 이런; 말을 순화하세요.",
+                    color=0xFF0000,
+                )
             )
             return
 
-    # 웃음 상호작용
+    # 5) 웃음 상호작용
     if any(k in message.content for k in LAUGH_KEYWORDS):
         await message.channel.send(
             embed=discord.Embed(
@@ -328,31 +472,21 @@ async def on_message(message: discord.Message):
             )
         )
 
-    # 명령 실행
-    await bot.process_commands(message)
-
-    # 이모지 확대
+    # 6) 이모지 확대
     for code, url in EMOJI_IMAGES.items():
         if code in message.content:
             await message.channel.send(embed=make_enlarge_embed(message.author, url))
             return
 
-    # ‘게임’ 경고
-    if re.search(rf"(게{FILLER}임|겜|game|친구)", message.content, re.I):
+    # 7) ‘게임’ 경고
+    if GAME_WARN_RE.search(message.content):
         warn_msg = random.choice([
-            "게임은 **질병**입니다.",
-            "게임 중독… 상상 그 이상을 파괴합니다.",
-            "게임은 **마약**입니다.",
-            "부모님께 **게임 시간을 정해 달라**고 부탁드려보세요.",
-            "부모·자녀가 같이 게임하면 역효과! 🙅‍♂️",
-            "컴퓨터를 켜고 끄는 **시간을 정합시다**.",
-            "PC를 **공개된 장소**로 옮기세요. 지금!",
-            "게임을 안 하면 불안한가요?\n**당신 인생이 위험합니다.**",
-            "지금 당장 게임을 **삭제**해요. 새 사람이 됩니다.",
-            "처음부터 피하기 힘들다면 **사용 시간을 정해요.**",
-            "우리 **산책** 나갈래요?",
-            "사람들과 **오프라인 대화**를 늘려보세요.",
-            "게임 대신 **새 취미**를 찾아볼까요?",
+            "게임은 **질병**입니다.", "게임 중독… 상상 그 이상을 파괴합니다.", "게임은 **마약**입니다.",
+            "부모님께 **게임 시간을 정해 달라**고 부탁드려보세요.", "부모·자녀가 같이 게임하면 역효과! 🙅‍♂️",
+            "컴퓨터를 켜고 끄는 **시간을 정합시다**.", "PC를 **공개된 장소**로 옮기세요. 지금!",
+            "게임을 안 하면 불안한가요?\n**당신 인생이 위험합니다.**", "지금 당장 게임을 **삭제**해요. 새 사람이 됩니다.",
+            "처음부터 피하기 힘들다면 **사용 시간을 정해요.**", "우리 **산책** 나갈래요?",
+            "사람들과 **오프라인 대화**를 늘려보세요.", "게임 대신 **새 취미**를 찾아볼까요?",
         ])
         warn = (
             discord.Embed(
@@ -366,75 +500,23 @@ async def on_message(message: discord.Message):
         await message.channel.send(embed=warn)
         return
 
-    # 🔥 ‘핫 키워드’ 추천 -----------------------------------
-    if (
-        not message.content.startswith(("!", "/"))  # 명령어가 아니고
-        and message.content.strip()                 # 공백만 있는 줄이 아니며
-        ):
-        
-        hot = pick_hot_keyword()                    # 2 회↑ 등장 시 단어 반환
-        
-        if hot:                                     # 조건 충족 → 즉시 추천
-            
+    # 8) 🔥 ‘핫 키워드’ 추천 -----------------------------------
+    if message.content.strip():                         # 공백만 입력이 아니고
+        hot = pick_hot_keyword()                        # 2회↑ 등장 시 단어 반환
+        if hot:                                         # 조건 충족 → 즉시 추천
             tip = (
                 f"💡 흠.. **‘{hot}’** 이야기가 많네요!\n"
                 f"`!ask {hot}` 로 검색해봐요?"
-                )
-            
+            )
             await message.channel.send(tip)
-            
-            RECENT_MSGS.clear()                     # 버퍼 비워서 중복 추천 방지
+            RECENT_MSGS.clear()                         # 버퍼 초기화 → 중복 차단
             logging.info("[HOT] buffer cleared after recommending %s", hot)
-
-    # ‘모배','배그’ 안내
-    if re.search(rf"(모{FILLER}배|배{FILLER}그)", message.content, re.I):
-        
-        pubg = (
-            discord.Embed(
-                title="🚀  **이제, 모든 곳이 배틀그라운드**",
-                description=(
-                    "누적 매출 100억 달러를 돌파!\n"
-                    "글로벌 모바일 게임 매출 순위: 2위!\n\n"
-                    ),
-                    color=0x00B2FF,
-                    timestamp=datetime.datetime.now(seoul_tz),
-                    )
-                    .set_thumbnail(url="https://iili.io/FzATZBI.md.jpg")
-                    .set_image(url="https://iili.io/FzAaKEQ.jpg")
-                    .set_footer(text="Play hard, live harder✨")
-                    )
-        
-        class PUBGLinks(View):
-            def __init__(self):
-                super().__init__(timeout=None)
-                self.add_item(
-                    Button(
-                        label="Android", emoji="🤖",
-                        url="https://play.google.com/store/apps/details?id=com.pubg.krmobile"
-                        )
-                        )
-                self.add_item(
-                    Button(
-                        label="iOS", emoji="🍎",
-                        url="https://apps.apple.com/kr/app/%EB%B0%B0%ED%8B%80%EA%B7%B8%EB%9D%BC%EC%9A%B4%EB%93%9C/id1366526331"
-                        )
-                        )
-                self.add_item(
-                    Button(
-                        label="Official Discord", emoji="🌐",
-                        style=discord.ButtonStyle.link,
-                        url="https://discord.com/invite/pubgmobile"
-                        )
-                        )
-                
-    await message.channel.send(
-        content=f"{message.author.mention} Squad-up & jump in!",
-        embed=pubg,
-        view=PUBGLinks(),
-        )
-    return
     
 # ────────── ask 명령 ──────────
+CMD_PREFIXES = ("!ask", "/ask")
+def is_command(msg: str) -> bool:
+    return msg.lstrip().lower().startswith(CMD_PREFIXES)
+    
 def split_paragraphs(text: str, lim: int = MAX_MSG) -> List[str]:
     out, buf = [], ""
     for line in text.splitlines(keepends=True):
