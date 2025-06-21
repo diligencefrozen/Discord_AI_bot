@@ -541,7 +541,7 @@ def fix_code(chunks: List[str]) -> List[str]:
 async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
     if prompt is None:
         prompt = "애플페이가 뭐야?"
-        preface = "💡 예시 질문으로 ‘애플페이가 뭐야?’를 보여 드릴게요!\n다음부터는 `!ask 질문내용` 형식으로 물어보시면 됩니다.\n\n"
+        preface = "💡 예시 질문으로 ‘애플페이가 뭐야?’를 보여 드릴게요!\n다음부터는 `!ask 질문내용` 형식으로 물어보시면 됩니다.\n\n**⚠️ 도리봇은 실수를 할 수 있습니다. 중요한 정보는 재차 확인하세요.**\n\n"
     else:
         preface = ""
     async with ctx.typing():
