@@ -110,10 +110,10 @@ EMOJI_IMAGES = {
         "https://iili.io/2QqWlrG.png","https://iili.io/2QqWaBn.png","https://iili.io/2QqW7LX.png", # 1 2 3
         "https://iili.io/2QqW5Xt.png","https://iili.io/2QqW12f.png","https://iili.io/2QqWGkl.png", # 4 5 6
         "https://iili.io/2QqWMp2.png","https://iili.io/3DrZnmN.png","https://iili.io/3DrZxII.png", # 7 8 9
-        "https://iili.io/2QqWhQ9.png","https://iili.io/3DrZzXt.png","https://iili.io/2QqWNEu.png", # 10 11 12
+        "https://iili.io/2QqWhQ9.png","https://iili.io/FzcxC12.png","https://iili.io/2QqWNEu.png", # 10 11 12
         "https://iili.io/2QqWOrb.png","https://iili.io/2QqWk2j.png","https://iili.io/2QqWvYx.png", # 13 14 15
         "https://iili.io/2QqW8kQ.png","https://iili.io/2QqWgTB.png","https://iili.io/2QqWrhP.png", # 16 17 18
-        "https://iili.io/2QqW4Q1.png","https://iili.io/2QqWPCF.png","https://iili.io/3DUcuPS.png", # 19 20 21
+        "https://iili.io/2QqW4Q1.png","https://iili.io/2QqWPCF.png","https://iili.io/FzcxBql.png", # 19 20 21
         "https://iili.io/2QqWs4a.png","https://iili.io/2QqWQ3J.png","https://iili.io/3DUc5l9.png", # 22 23 24
         "https://iili.io/2QqWtvR.png","https://iili.io/2QqWDpp.png","https://iili.io/2QqWmTN.png", # 25 26 27 
         "https://iili.io/2QqWpjI.png","https://iili.io/2QqWyQt.png","https://iili.io/2QqXHCX.png", # 28 29 30
