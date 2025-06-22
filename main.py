@@ -16,6 +16,7 @@ from discord.ui import View, Button
 from PIL import Image
 from typing import Optional
 from itertools import cycle
+from typing import Optional, List, Union
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
@@ -84,6 +85,51 @@ def keep_last_paragraph(t: str) -> str:
     cleaned = strip_think(t)
     parts = re.split(r"\n\s*\n", cleaned)
     return parts[-1].strip()
+
+# ─── 멘션, 답장 감지 기능을 위한 설정 ───────────────────────────
+NEON_CYAN   = 0x00E5FF
+NEON_PURPLE = 0xB400FF
+GRADIENTS   = (NEON_CYAN, NEON_PURPLE)
+
+def build_mention_embed(
+    src: discord.Message,
+    targets: List[Union[discord.User, discord.Member]],
+    quoted: Optional[str]
+) -> discord.Embed:
+    caller   = src.author.mention
+    target_s = ", ".join(t.mention for t in targets)
+    wave     = random.choice(("✦", "✹", "★", "✧"))
+
+    # 본문 & 첨부 요약
+    body = src.clean_content or ""
+    body = (body[:157] + "…") if len(body) > 160 else body
+    if not body:
+        body = "*[내용 없음]*"
+
+    desc = f"**{caller}** → {target_s}\n\n> {body}"
+    if quoted:
+        desc += f"\n\n{quoted}"
+
+    embed = (
+        discord.Embed(
+            title=f"{wave} 호출 감지!",
+            description=desc,
+            color=random.choice(GRADIENTS),
+            timestamp=datetime.datetime.now(seoul_tz),
+        )
+        .set_footer(text=f"#{src.channel.name}", icon_url="https://i.imgur.com/d1Ef9W8.jpeg")
+        .set_thumbnail(url=src.author.display_avatar.url)
+    )
+
+    # 첫 번째 이미지 첨부를 본문 이미지로
+    if src.attachments:
+        att = src.attachments[0]
+        if att.content_type and att.content_type.startswith("image"):
+            embed.set_image(url=att.url)
+
+    return embed
+
+MENTION_LOG: deque[float] = deque(maxlen=5)   # PEP 585 문법은 3.9에서도 사용 가능
 
 # ────────────────────────────────────────────────────────────────────────────
 # ‘최근 메시지 기록’ – 지금 자주 언급되는 키워드 탐지를 위한 기능 - 핫 키워드
@@ -418,7 +464,61 @@ async def on_message(message: discord.Message):
     if message.content.lstrip().lower().startswith(("!ask", "/ask", "!img", "/img")):
         await bot.process_commands(message)
         return
-    
+
+    # 1-4) ▶▶  멘션 / 답장 감지  ◀◀
+    if message.mentions or message.reference:
+        try:
+            # ── A. 대상(@멘션 + 답장 작성자) 수집 ──
+            targets: List[Union[discord.User, discord.Member]] = list(message.mentions)
+
+            ref_msg: Optional[discord.Message] = None
+            if message.reference and message.reference.message_id:          # 답장이라면 원문 확보
+                try:
+                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                    if ref_msg:
+                        targets.append(ref_msg.author)
+                except discord.NotFound:
+                    pass                                                   # (원문이 삭제된 경우 등)
+
+            # 중복 제거 & 순서 보존
+            targets = list(dict.fromkeys(targets))
+            targets_str = ", ".join(t.mention for t in targets) if targets else "(알 수 없음)"
+
+            # ── B. 본문 & 원문 인용 ──
+            body = message.clean_content.strip()
+            body = (body[:140] + "…") if len(body) > 140 else (body or "*[내용 없음]*")
+
+            desc = f"**{message.author.mention}** → {targets_str}\n\n> {body}"
+
+            if ref_msg:
+                q = ref_msg.content.strip()
+                q = (q[:90] + "…") if len(q) > 90 else (q or "*[첨부/임베드]*")
+                desc += f"\n\n> 💬 *{ref_msg.author.display_name}*: {q}"
+
+            # ── C. Embed 생성 ──
+            embed = (
+                discord.Embed(
+                    title=f"{random.choice(('✦', '✹', '★', '✧'))} 호출 감지!",
+                    description=desc,
+                    color=0x00E5FF,
+                    timestamp=datetime.datetime.now(seoul_tz),
+                )
+                .set_footer(text=f"#{message.channel.name} | tbBot3rd",
+                            icon_url="https://i.imgur.com/d1Ef9W8.jpeg")
+                .set_thumbnail(url=message.author.display_avatar.url)
+            )
+
+            # 첫 번째 이미지 첨부를 카드 배경으로
+            for att in message.attachments:
+                if att.content_type and att.content_type.startswith("image"):
+                    embed.set_image(url=att.url)
+                    break
+
+            await message.channel.send(embed=embed)
+
+        except Exception as e:
+            log_ex("mention/reply", e)
+            
     # ---------------------------------------------
     # 2-2) 게임 홍보 카드 (슬래시/프리픽스 명령 제외)
     # ---------------------------------------------
