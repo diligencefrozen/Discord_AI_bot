@@ -13,6 +13,9 @@ from collections import deque, Counter
 from dotenv import load_dotenv    
 import itertools, string
 from discord.ui import View, Button 
+from PIL import Image
+from typing import Optional
+from itertools import cycle
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
@@ -25,6 +28,9 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 MAX_TOKENS = 512
 MAX_MSG   = 1900
 FILE_TH   = 6000
+HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
+IMG_MODEL   = "runwayml/stable-diffusion-v1-5"   
+img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
 if not HF_TOKEN or not DISCORD_TOKEN:
     raise RuntimeError(
@@ -345,7 +351,7 @@ GAME_CARDS: dict[str, dict] = {
         "desc": (
             "하드코어 FPS 게임을 좋아하는 유저들에게\n"
             "깊이 있는 게임 경험을 제공하지만,  \n"
-            "초보자에게는 진입 장벽이 높은 게임임. \n"
+            "초보자에게는 진입 장벽이 높은 게임. \n"
 
         ),
 
@@ -403,8 +409,8 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
-    # 2) 슬래시/프리픽스 명령어면 → 커맨드만 처리하고 **나머지 로직 건너뜀**
-    if message.content.lstrip().lower().startswith(("!ask", "/ask")):
+    # 2) 슬래시/프리픽스 명령어면 → 커맨드만 처리하고 나머지 로직 건너뜀
+    if message.content.lstrip().lower().startswith(("!ask", "/ask", "!img", "/img")):
         await bot.process_commands(message)
         return
     
@@ -512,7 +518,33 @@ async def on_message(message: discord.Message):
             await message.channel.send(tip)
             RECENT_MSGS.clear()                         # 버퍼 초기화 → 중복 차단
             logging.info("[HOT] buffer cleared after recommending %s", hot)
-    
+            
+# !img  or  /img  프롬프트 → 그림 그려줌.
+@bot.command(name="img", help="!img <프롬프트> — 이미지를 생성합니다.")
+async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
+    if prompt is None:
+        await ctx.reply("❗ 사용법: `!img <프롬프트>`\n예) `!img 우주 고양이`")
+        return
+
+    async with ctx.typing():
+        def _generate():
+            return img_client.text_to_image(
+                prompt=prompt,
+                negative_prompt=" ", #검열 기능 (예 : nsfw, lowres, jpeg artifacts, bad anatomy)
+                num_inference_steps=25,
+                guidance_scale=7.0,
+                width=512, height=512,
+            )
+        try:
+            image = await asyncio.to_thread(_generate)
+        except Exception as e:
+            logging.exception("Image generation failed")
+            await ctx.reply(f"⚠️ 이미지 생성 실패: {e}")
+            return
+
+        buf = io.BytesIO(); image.save(buf, "PNG"); buf.seek(0)
+        await ctx.reply(file=discord.File(buf, "gen.png"))
+        
 # ────────── ask 명령 ──────────
 CMD_PREFIXES = ("!ask", "/ask")
 def is_command(msg: str) -> bool:
@@ -569,10 +601,19 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
 # ────────── 봇 상태 ──────────
 @bot.event
 async def on_ready():
-    await bot.change_presence(
-        activity=discord.Game("!ask로 질문해 보세요!"),
-        status=discord.Status.online,
-    )
+    presences = cycle([
+        "!ask 로 궁금증 해결해요!",
+        "!img 로 그림을 그려봐요!",
+    ])
+
+    async def rotate():
+        await bot.wait_until_ready()
+        while not bot.is_closed():
+            msg = next(presences)
+            await bot.change_presence(activity=discord.Game(msg))
+            await asyncio.sleep(30)   # 30초 간격
+    bot.loop.create_task(rotate())
+
     logging.info(f"✅ Logged in as {bot.user} (ID {bot.user.id})")
 
 # ────────── 실행 ──────────
