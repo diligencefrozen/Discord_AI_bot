@@ -402,14 +402,19 @@ GAME_CARDS: dict[str, dict] = {
 # ────────── 메인 on_message ──────────
 @bot.event
 async def on_message(message: discord.Message):
-    RECENT_MSGS.append(message.clean_content)
-    logging.info(f"[RECENT_MSGS] {len(RECENT_MSGS):>3}개 │ latest → {RECENT_MSGS[-1]!r}")
-
-    # 1) 봇 자신의 메시지는 무시
+    # 1 자기 자신 무시
     if message.author.id == bot.user.id:
         return
 
-    # 2) 슬래시/프리픽스 명령어면 → 커맨드만 처리하고 나머지 로직 건너뜀
+    # 1-1 첨부파일 메타 카드
+    if message.attachments:
+        await describe_attachments(message)
+
+    # 1-2 핫 키워드를 위한 설정
+    RECENT_MSGS.append(message.clean_content)
+    logging.info(f"[RECENT_MSGS] {len(RECENT_MSGS):>3}개 │ latest → {RECENT_MSGS[-1]!r}")
+
+    # 1-3 명령어 패스-스루
     if message.content.lstrip().lower().startswith(("!ask", "/ask", "!img", "/img")):
         await bot.process_commands(message)
         return
@@ -544,6 +549,48 @@ async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
 
         buf = io.BytesIO(); image.save(buf, "PNG"); buf.seek(0)
         await ctx.reply(file=discord.File(buf, "gen.png"))
+
+# 첨부파일 알리미
+async def describe_attachments(message: discord.Message):
+
+    for att in message.attachments:
+        # 1) 공통 메타
+        size_kb   = f"{att.size/1024:,.1f} KB"
+        filetype  = att.content_type or "unknown"
+        title     = f"📎 {att.filename}"
+        color     = 0x00E5FF  # 네온 블루
+        desc_lines = [f"**Type** `{filetype}`\n**Size** `{size_kb}`"]
+
+        # 2) 이미지면 Pillow로 열어 해상도,비율 추가
+        if filetype.startswith("image"):
+            try:
+                img_bytes = await att.read()
+                with Image.open(io.BytesIO(img_bytes)) as im:
+                    w, h = im.size
+                    desc_lines.append(f"**Resolution** `{w}×{h}`")
+                    if w >= 512 and h >= 512:         # 썸네일로 쓰기
+                        thumb_url = att.url
+                    else:
+                        thumb_url = None
+            except Exception:
+                thumb_url = None
+        else:
+            thumb_url = None
+
+        # 3) ‘미래지향적’ 임베드
+        embed = (
+            discord.Embed(
+                title=title,
+                description="\n".join(desc_lines),
+                color=color,
+                timestamp=datetime.datetime.now(seoul_tz),
+            )
+            .set_footer(text="Powered by tbBot3rd", icon_url="https://i.imgur.com/d1Ef9W8.jpeg")
+        )
+        if thumb_url:
+            embed.set_thumbnail(url=thumb_url)
+
+        await message.channel.send(embed=embed)
         
 # ────────── ask 명령 ──────────
 CMD_PREFIXES = ("!ask", "/ask")
