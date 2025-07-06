@@ -644,8 +644,8 @@ async def on_message(message: discord.Message):
             logging.info("[HOT] buffer cleared after recommending %s", hot)
             
 # !img  or  /img  프롬프트 → 그림 그려줌.
-@bot.command(name="img2", help="!img2 <프롬프트> — 이미지를 생성합니다.")
-async def img2(ctx: commands.Context, *, prompt: Optional[str] = None):
+@bot.command(name="img", help="!img <프롬프트> — 이미지를 생성합니다.")
+async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
     if not prompt:
         await ctx.reply("❗ 사용법: `!img2 <프롬프트>`\n예) `!img2 cyberpunk seoul at night`")
         return
