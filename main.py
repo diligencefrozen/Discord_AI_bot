@@ -142,7 +142,8 @@ RECENT_MSGS: deque[str] = deque(maxlen=MAX_BUFFER)
 STOPWORDS = {"ㅋㅋ", "ㅎㅎ", "음", "이건", "그건", "다들", 
              "도리", "7호선", "칠호선", "나냡", 
              "1인칭", "일인칭", "들쥐", "돌이", "도리야", 
-            "나냡아", "호선아", "다들", "the", "img", } | set(string.punctuation)
+            "나냡아", "호선아", "다들", "the", "img",
+            "스겜", "ㅇㅇ", "하고", "from", } | set(string.punctuation)
 def tokenize(txt: str) -> list[str]:
     tokens = re.split(r"[^\w가-힣]+", txt.lower())
     return [
@@ -647,7 +648,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="img", help="!img <프롬프트> — 이미지를 생성합니다.")
 async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
     if not prompt:
-        await ctx.reply("❗ 사용법: `!img2 <프롬프트>`\n예) `!img2 cyberpunk seoul at night`")
+        await ctx.reply("❗ 사용법: `!img <프롬프트>`\n예) `!img cyberpunk seoul at night`")
         return
 
     async with ctx.typing():
