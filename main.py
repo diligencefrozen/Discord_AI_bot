@@ -17,6 +17,7 @@ from PIL import Image
 from typing import Optional
 from itertools import cycle
 from typing import Optional, List, Union
+from concurrent.futures import ThreadPoolExecutor
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
@@ -30,7 +31,9 @@ MAX_TOKENS = 512
 MAX_MSG   = 1900
 FILE_TH   = 6000
 HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
-IMG_MODEL   = "runwayml/stable-diffusion-v1-5"   
+IMG_MODEL    = "stabilityai/stable-diffusion-xl-base-1.0" 
+ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
+HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
 img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
 if not HF_TOKEN or not DISCORD_TOKEN:
@@ -641,30 +644,40 @@ async def on_message(message: discord.Message):
             logging.info("[HOT] buffer cleared after recommending %s", hot)
             
 # !img  or  /img  프롬프트 → 그림 그려줌.
-@bot.command(name="img", help="!img <프롬프트> — 이미지를 생성합니다.")
-async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
-    if prompt is None:
-        await ctx.reply("❗ 사용법: `!img <프롬프트>`\n예) `!img 우주 고양이`")
+@bot.command(name="img2", help="!img2 <프롬프트> — 이미지를 생성합니다.")
+async def img2(ctx: commands.Context, *, prompt: Optional[str] = None):
+    if not prompt:
+        await ctx.reply("❗ 사용법: `!img2 <프롬프트>`\n예) `!img2 cyberpunk seoul at night`")
         return
 
     async with ctx.typing():
-        def _generate():
-            return img_client.text_to_image(
-                prompt=prompt,
-                negative_prompt=" ", #검열 기능 (예 : nsfw, lowres, jpeg artifacts, bad anatomy)
-                num_inference_steps=25,
-                guidance_scale=7.0,
-                width=512, height=512,
-            )
         try:
-            image = await asyncio.to_thread(_generate)
+            async with httpx.AsyncClient(timeout=120) as ac:
+                r = await ac.post(
+                    ENDPOINT,
+                    headers=HEADERS,
+                    json={
+                        "inputs": prompt,
+                        "options": {"wait_for_model": True},
+                        "parameters": {
+                            "negative_prompt": " ",  #검열 기능 (예 : nsfw, lowres, jpeg artifacts, bad anatomy)
+                            "num_inference_steps": 40,   # XL Base 권장 30~50
+                            "guidance_scale": 7.0,
+                            "width": 1024,
+                            "height": 1024,
+                        },
+                    },
+                )
+            r.raise_for_status()
+            if not r.headers.get("content-type", "").startswith("image"):
+                raise RuntimeError(f"API 오류: {r.text}")
+            img_bytes = r.content
         except Exception as e:
             logging.exception("Image generation failed")
             await ctx.reply(f"⚠️ 이미지 생성 실패: {e}")
             return
 
-        buf = io.BytesIO(); image.save(buf, "PNG"); buf.seek(0)
-        await ctx.reply(file=discord.File(buf, "gen.png"))
+    await ctx.reply(file=discord.File(io.BytesIO(img_bytes), "generated.png"))
 
 # 첨부파일 알리미
 async def describe_attachments(message: discord.Message):
