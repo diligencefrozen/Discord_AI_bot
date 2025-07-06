@@ -315,6 +315,20 @@ ALLOWED_CHANNELS = {
     1383987919454343269, 929421822787739708, 937715555232780318,
     859476893756293131, 865821307969732648,
 }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 허용된 채널에서만 게임 카드를 출력함.
+# ────────────────────────────────────────────────────────────────────────────
+GAME_CARD_CHANNELS = {
+    944520863389208606, 1098896878768234556, 1155789990173868122,
+    932654164201336872, 989509986793168926, 944522706894872606,
+    1247409483353821335, 721047251862159420, 929421822787739708,
+    904343326654885939, 862310554567835658, 915207176518270981,
+    1134766793249013780, 1176877764608004156, 802904099816472619,
+    820536422808944662,
+}
+
 LINK_REGEX = re.compile(
     r'https?://\S+|youtu\.be|youtube\.com|gall\.dcinside\.com|m\.dcinside\.com|news\.(naver|v\.daum)\.com',
     re.I,
@@ -523,34 +537,35 @@ async def on_message(message: discord.Message):
     # ---------------------------------------------
     # 2-2) 게임 홍보 카드 (슬래시/프리픽스 명령 제외)
     # ---------------------------------------------
-    if not message.content.startswith(("!", "/")):         # 명령어가 아니면
+    if (
+        message.channel.id in GAME_CARD_CHANNELS                # ✅ 지정 채널에서만
+        and not message.content.startswith(("!", "/"))          # ✅ 명령어가 아니면
+        ):
         for cfg in GAME_CARDS.values():
-            if cfg["pattern"].search(message.content):     # 키워드 매치
-                # ── Embed 생성
+            if cfg["pattern"].search(message.content):          # 키워드 매치
+
                 embed = (
                     discord.Embed(
                         title=cfg["title"],
                         description=cfg["desc"],
                         color=0x00B2FF,
                         timestamp=datetime.datetime.now(seoul_tz),
-                    )
-                    .set_thumbnail(url=cfg["thumb"])
-                    .set_image(url=cfg["banner"])
-                    .set_footer(text="Play hard, live harder ✨")
-                )
-
-                # ── 버튼(View) 생성
+                        )
+                        .set_thumbnail(url=cfg["thumb"])
+                        .set_image(url=cfg["banner"])
+                        .set_footer(text="Play hard, live harder ✨")
+                        )
+                
                 view = View(timeout=None)
                 for label, emoji, url in cfg["links"]:
                     view.add_item(Button(label=label, emoji=emoji, url=url))
-
-                # ── 전송 후 즉시 종료
-                await message.channel.send(
-                    content=f"{message.author.mention} {cfg['cta']}",
-                    embed=embed,
-                    view=view,
-                )
-                return
+                    
+                    await message.channel.send(
+                        content=f"{message.author.mention} {cfg['cta']}",
+                        embed=embed,
+                        view=view,
+                        )
+                    return  # 💨 더 이상 처리하지 않고 빠져나감
             
     # 3) 링크 삭제
     if message.channel.id in ALLOWED_CHANNELS and LINK_REGEX.search(message.content):
