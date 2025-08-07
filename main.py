@@ -16,7 +16,7 @@ from discord.ui import View, Button
 from PIL import Image
 from typing import Optional
 from itertools import cycle
-rom typing import Optional, List, Union, Dict
+from typing import Optional, List, Union, Dict
 from concurrent.futures import ThreadPoolExecutor
 
 # ────── 환경 변수 로드 ──────
