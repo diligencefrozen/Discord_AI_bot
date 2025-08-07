@@ -27,29 +27,28 @@ ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
-async def _send_typing_reminder(channel: ChannelT, user: UserT, key: tuple[int, int], started_at: float):
+async def _send_typing_reminder(channel: ChannelT, user: UserT,
+                                key: tuple[int, int], started_at: float):
 
     try:
         await asyncio.sleep(5)
 
-        # 최근 5 초 사이에 사용자가 메시지를 올렸다면 안내 생략
-        async for msg in channel.history(limit=1, after=datetime.datetime.fromtimestamp(started_at)):
+        # 최근 5 초 사이에 해당 사용자가 메시지를 올렸으면 안내 건너뜀
+        async for msg in channel.history(limit=1,
+                                         after=datetime.datetime.fromtimestamp(started_at)):
             if msg.author.id == user.id:
-                return  # 이미 메시지를 전송했음 → 알림 취소
+                return
 
         await channel.send(
             embed=discord.Embed(
                 description=(
-                    f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!
-
-"
+                    f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!\n\n"
                     f"**👉 `!ask`** 로 궁금한 점을 바로 물어보세요! 💡"
                 ),
                 color=0x00E5FF,
             )
         )
     finally:
-        _typing_tasks.pop(key, None)
         _typing_tasks.pop(key, None)
         
 # ────────── HF / Discord 설정 ──────────
@@ -502,15 +501,16 @@ GAME_CARDS: dict[str, dict] = {
 async def on_typing(channel: ChannelT, user: UserT, when):
     if user.bot or not isinstance(channel, (discord.TextChannel, discord.Thread, discord.DMChannel)):
         return
+
     key = (channel.id, user.id)
     if task := _typing_tasks.pop(key, None):
         task.cancel()
-    started = datetime.datetime.utcnow().timestamp()
-    task = asyncio.create_task(_send_typing_reminder(channel, user, key, started))
+
     started = datetime.datetime.utcnow().timestamp()
     _typing_tasks[key] = asyncio.create_task(
         _send_typing_reminder(channel, user, key, started)
     )
+
 
 @bot.event
 async def on_message(message: discord.Message):
