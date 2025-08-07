@@ -27,16 +27,29 @@ ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
-async def _send_typing_reminder(channel: ChannelT, user: UserT, key: tuple[int, int]):
+async def _send_typing_reminder(channel: ChannelT, user: UserT, key: tuple[int, int], started_at: float):
+
     try:
         await asyncio.sleep(5)
-        await channel.send(embed=discord.Embed(
-            description=(
-                f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!\n\n"
-                "**👉 `!ask`** 로 궁금한 점을 바로 물어보세요!"
-            ),
-            color=0x00E5FF))
+
+        # 최근 5 초 안에 사용자가 메시지를 보냈는지 확인
+        async for msg in channel.history(limit=1, after=datetime.datetime.fromtimestamp(started_at)):
+            if msg.author.id == user.id:
+                return  # 이미 메시지를 보냈다면 안내 스킵
+
+        await channel.send(
+            embed=discord.Embed(
+                description=(
+                    f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!
+
+"
+                    "**👉 `!ask`** 로 궁금증을 바로 해결해 보세요! 💡"
+                ),
+                color=0x00E5FF,
+            )
+        )
     finally:
+        _typing_tasks.pop(key, None)
         _typing_tasks.pop(key, None)
         
 # ────────── HF / Discord 설정 ──────────
@@ -492,7 +505,9 @@ async def on_typing(channel: ChannelT, user: UserT, when):
     key = (channel.id, user.id)
     if task := _typing_tasks.pop(key, None):
         task.cancel()
-    _typing_tasks[key] = asyncio.create_task(_send_typing_reminder(channel, user, key))
+    started = datetime.datetime.utcnow().timestamp()
+    task = asyncio.create_task(_send_typing_reminder(channel, user, key, started))
+    _typing_tasks[key] = task)
 
 @bot.event
 async def on_message(message: discord.Message):
