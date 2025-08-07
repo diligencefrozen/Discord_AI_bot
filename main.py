@@ -44,7 +44,7 @@ async def ddg_top_links(query: str, k: int = 10) -> list[str]:
         ]
 
 # 2) jina.ai 한글 요약 (200~300 자 이내로 압축)
-async def jina_summary(url: str) -> str | None:
+async def jina_summary(url: str) -> Optional[str]:
 
     p = urllib.parse.urlparse(url)
 
