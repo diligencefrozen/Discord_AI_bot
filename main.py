@@ -20,7 +20,7 @@ from typing import Optional, List, Union, Dict
 from concurrent.futures import ThreadPoolExecutor
 import urllib.parse, textwrap
 from bs4 import BeautifulSoup  
-from ddgs import DDGS  
+from duckduckgo_search import DDGS 
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
