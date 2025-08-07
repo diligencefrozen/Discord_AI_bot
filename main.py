@@ -23,6 +23,12 @@ from concurrent.futures import ThreadPoolExecutor
 load_dotenv()                            # .env → os.environ 으로 주입
 
 # ────────── HF / Discord 설정 ──────────
+client = InferenceClient(provider="novita")   # HF 토큰은 환경변수 HF_TOKEN 로 자동 감지
+completion = client.chat.completions.create(
+    model="openai/gpt-oss-20b",
+    messages=[{"role":"user","content":"ping"}],
+)
+
 HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
 PROVIDER      = "novita"
 MODEL         = "openai/gpt-oss-20b"
