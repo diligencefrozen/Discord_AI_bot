@@ -737,7 +737,7 @@ async def on_message(message: discord.Message):
 
 #검색 기능
 @bot.command(name="web", help="!web <검색어> — Ai 요약")
-async def web(ctx: commands.Context, *, query: str | None = None):
+async def web(ctx: commands.Context, *, query: Optional[str] = None):
     if not query:
         return await ctx.reply("❗ 사용법: `!web <검색어>`")
 
