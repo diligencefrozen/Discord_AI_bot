@@ -29,11 +29,12 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PROVIDER      = "novita"
 MODEL         = "openai/gpt-oss-20b"
 
-# ① Chat용 클라이언트
+# Chat용 클라이언트
 hf_chat = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
 
-# ② 이미지용 클라이언트 (그대로)
+# 이미지용 클라이언트
 IMG_MODEL     = "stabilityai/stable-diffusion-xl-base-1.0"
+ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
 HF_IMG_TOKEN  = os.getenv("HF_IMG_TOKEN")
 img_client    = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
