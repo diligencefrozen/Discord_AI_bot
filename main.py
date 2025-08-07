@@ -27,25 +27,24 @@ load_dotenv()                            # .env → os.environ 으로 주입
 
 # ─── DuckDuckGo 설정 ──────────────────────────────────
 DDG_LITE = "https://lite.duckduckgo.com/lite/"
-UA       = {"User-Agent": "Mozilla/5.0 tbBot3rd"}
+UA = {"User-Agent": "Mozilla/5.0 tbBot3rd"}
 
-# 1) DuckDuckGo → 상위 10개 URL 추출
-async def ddg_top_links(query: str, k: int = 10) -> list[str]:
+# 1) DuckDuckGo → 상위 k개 URL 추출 (최대 10)
+async def ddg_top_links(query: str, k: int = 15) -> List[str]:
 
-    with DDGS() as ddg:                  
+    with DDGS() as ddg:
         return [
             r["href"]
             for r in ddg.text(
                 query,
                 region="kr-kr",
                 safesearch="moderate",
-                max_results=k
+                max_results=k,
             )
         ]
 
-# 2) jina.ai 한글 요약 (200~300 자 이내로 압축)
+# 2) jina.ai 한글 요약 (200~300 자 이내로 압축)
 async def jina_summary(url: str) -> Optional[str]:
-
     p = urllib.parse.urlparse(url)
 
     # http://{호스트}{경로}[?쿼리]
@@ -57,7 +56,7 @@ async def jina_summary(url: str) -> Optional[str]:
     try:
         async with httpx.AsyncClient(timeout=10) as ac:
             txt = (await ac.get(api)).text.strip()
-        if len(txt) < 20:                # 빈 응답 필터
+        if len(txt) < 20:  # 빈 응답 필터
             return None
         return textwrap.shorten(txt, 300, placeholder=" …")
     except Exception:
@@ -555,7 +554,6 @@ async def on_typing(channel: ChannelT, user: UserT, when):
         _send_typing_reminder(channel, user, key, started)
     )
 
-
 @bot.event
 async def on_message(message: discord.Message):
     # 1 자기 자신 무시
@@ -740,6 +738,7 @@ async def on_message(message: discord.Message):
 async def web(ctx: commands.Context, *, query: Optional[str] = None):
     if not query:
         return await ctx.reply("❗ 사용법: `!web <검색어>`")
+    # ... 나머지 로직 동일 ...
 
     async with ctx.typing():
         # ① 검색 → 링크 수집
