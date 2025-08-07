@@ -16,12 +16,29 @@ from discord.ui import View, Button
 from PIL import Image
 from typing import Optional
 from itertools import cycle
-from typing import Optional, List, Union
+rom typing import Optional, List, Union, Dict
 from concurrent.futures import ThreadPoolExecutor
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
+# ────────── 타이핑 알림(5초 딜레이) ──────────
+ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
+UserT    = Union[discord.Member, discord.User]
+_typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
+
+async def _send_typing_reminder(channel: ChannelT, user: UserT, key: tuple[int, int]):
+    try:
+        await asyncio.sleep(0.5)
+        await channel.send(embed=discord.Embed(
+            description=(
+                f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!\n\n"
+                "**👉 `!ask`** 로 궁금한 점을 바로 물어보세요!"
+            ),
+            color=0x00E5FF))
+    finally:
+        _typing_tasks.pop(key, None)
+        
 # ────────── HF / Discord 설정 ──────────
 HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
 PROVIDER      = "novita"
@@ -259,6 +276,7 @@ hf = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.typing = True  
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -465,6 +483,28 @@ GAME_CARDS: dict[str, dict] = {
 }
 
 # ────────── 메인 on_message ──────────
+@bot.event
+async def on_typing(channel: ChannelT, user: UserT, when):
+    if user.bot or not isinstance(channel, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+        return
+    key = (channel.id, user.id)
+    if task := _typing_tasks.pop(key, None):
+        task.cancel()
+    _typing_tasks[key] = asyncio.create_task(_send_typing_reminder(channel, user, key))
+
+@bot.event
+async def on_message(message: discord.Message):
+    # 타이핑 타이머 취소
+    key = (message.channel.id, message.author.id)
+    if task := _typing_tasks.pop(key, None):
+        task.cancel()
+
+    if message.author.bot:
+        return
+
+    await handle_app_message(message)  # custom logic below
+    await bot.process_commands(message)
+
 @bot.event
 async def on_message(message: discord.Message):
     # 1 자기 자신 무시
