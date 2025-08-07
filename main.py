@@ -22,14 +22,14 @@ from concurrent.futures import ThreadPoolExecutor
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
-# ────────── 타이핑 알림(0.5초 딜레이) ──────────
+# ────────── 타이핑 알림(5초 딜레이) ──────────
 ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
 async def _send_typing_reminder(channel: ChannelT, user: UserT, key: tuple[int, int]):
     try:
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(5)
         await channel.send(embed=discord.Embed(
             description=(
                 f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!\n\n"
