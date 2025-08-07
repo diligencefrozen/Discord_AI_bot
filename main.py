@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
-# ────────── 타이핑 알림(5초 딜레이) ──────────
+# ────────── 타이핑 알림(0.5초 딜레이) ──────────
 ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
