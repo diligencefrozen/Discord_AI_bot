@@ -22,25 +22,47 @@ from concurrent.futures import ThreadPoolExecutor
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
-# ────────── HF / Discord 설정 ──────────
-HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
-PROVIDER      = "novita"
-MODEL         = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-MAX_TOKENS = 512
-MAX_MSG   = 1900
-FILE_TH   = 6000
-HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
-IMG_MODEL    = "stabilityai/stable-diffusion-xl-base-1.0" 
-ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
-HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
-img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
-if not HF_TOKEN or not DISCORD_TOKEN:
+# 필수 토큰
+HF_TOKEN       = os.getenv("HF_TOKEN")            # 반드시 설정해야 함
+DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")       # 반드시 설정해야 함
+HF_IMG_TOKEN   = os.getenv("HF_IMG_TOKEN")        # 이미지 모델용
+
+# Hugging Face Inference 라우터
+BASE_URL       = "https://router.huggingface.co/v1"   
+
+# 모델 지정
+CHAT_MODEL     = "openai/gpt-oss-20b:novita"      
+IMG_MODEL      = "stabilityai/stable-diffusion-xl-base-1.0"
+
+# 기타 설정
+MAX_TOKENS = 512
+MAX_MSG    = 1900
+FILE_TH    = 6000
+
+# ---------- HF Client ----------
+chat_client = InferenceClient(                    # ← 채팅용 클라이언트 추가
+    CHAT_MODEL,
+    token=HF_TOKEN,
+    base_url=BASE_URL,
+)
+img_client  = InferenceClient(
+    IMG_MODEL,
+    token=HF_IMG_TOKEN,
+)
+
+# ---------- 체크 ----------
+missing = [
+    name for name, val in [
+        ("HF_TOKEN", HF_TOKEN),
+        ("DISCORD_TOKEN", DISCORD_TOKEN),
+    ] if not val
+]
+if missing:
     raise RuntimeError(
-        "HF_TOKEN 또는 DISCORD_TOKEN 환경변수가 설정되지 않았습니다.\n"
-        "• 로컬 개발: .env 파일에 두 값 작성 후 재실행\n"
-        "• 배포: 플랫폼 환경변수 / Northflank Secrets 로 주입"
+        f"환경변수 {', '.join(missing)} 가(이) 설정되지 않았습니다.\n"
+        "• 로컬 개발: .env 파일에 추가 후 재실행\n"
+        "• 배포: 플랫폼 환경변수(Secrets)로 주입"
     )
 
 # 매달 5만 token(=입력+출력)을 넘지 않도록 간단히 차단
