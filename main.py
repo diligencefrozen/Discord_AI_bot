@@ -18,37 +18,30 @@ from typing import Optional
 from itertools import cycle
 from typing import Optional, List, Union
 from concurrent.futures import ThreadPoolExecutor
-from openai import OpenAI
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
 # ────────── HF / Discord 설정 ──────────
-HF_TOKEN      = os.getenv("HF_TOKEN")          # Read + Inference scope
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
 PROVIDER      = "novita"
 MODEL         = "openai/gpt-oss-20b"
-
-# Chat용 클라이언트
-hf_chat = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
-
-# 이미지용 클라이언트
-IMG_MODEL     = "stabilityai/stable-diffusion-xl-base-1.0"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+MAX_TOKENS = 512
+MAX_MSG   = 1900
+FILE_TH   = 6000
+HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
+IMG_MODEL    = "stabilityai/stable-diffusion-xl-base-1.0" 
 ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
-HF_IMG_TOKEN  = os.getenv("HF_IMG_TOKEN")
-img_client    = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
+HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
+img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
-openai_chat = OpenAI(
-    base_url="https://router.huggingface.co/novita/v1",   # 엔드포인트 명시
-    api_key=HF_TOKEN,
-)
-
-# 사용 예
-resp = openai_chat.chat.completions.create(
-    model="openai/gpt-oss-20b",
-    messages=[{"role": "user", "content": "ping"}],
-)
-print(resp.choices[0].message.content)
+if not HF_TOKEN or not DISCORD_TOKEN:
+    raise RuntimeError(
+        "HF_TOKEN 또는 DISCORD_TOKEN 환경변수가 설정되지 않았습니다.\n"
+        "• 로컬 개발: .env 파일에 두 값 작성 후 재실행\n"
+        "• 배포: 플랫폼 환경변수 / Northflank Secrets 로 주입"
+    )
 
 # 매달 5만 token(=입력+출력)을 넘지 않도록 간단히 차단
 TOKEN_BUDGET = 50_000          # novita 무료 월 한도
@@ -762,7 +755,7 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
         preface = ""
     async with ctx.typing():
         try:
-            comp = hf_chat.chat.completions.create(
+            comp = hf.chat.completions.create(
                 model=MODEL,
                 messages=[{"role": "system", "content": SYS_PROMPT},
                           {"role": "user", "content": prompt}],
@@ -803,5 +796,4 @@ async def on_ready():
 # ────────── 실행 ──────────
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
-
 
