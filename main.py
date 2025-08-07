@@ -32,10 +32,10 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT, key: tuple[int, 
     try:
         await asyncio.sleep(5)
 
-        # 최근 5 초 안에 사용자가 메시지를 보냈는지 확인
+        # 최근 5 초 사이에 사용자가 메시지를 올렸다면 안내 생략
         async for msg in channel.history(limit=1, after=datetime.datetime.fromtimestamp(started_at)):
             if msg.author.id == user.id:
-                return  # 이미 메시지를 보냈다면 안내 스킵
+                return  # 이미 메시지를 전송했음 → 알림 취소
 
         await channel.send(
             embed=discord.Embed(
@@ -43,7 +43,7 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT, key: tuple[int, 
                     f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!
 
 "
-                    "**👉 `!ask`** 로 궁금증을 바로 해결해 보세요! 💡"
+                    f"**👉 `!ask`** 로 궁금한 점을 바로 물어보세요! 💡"
                 ),
                 color=0x00E5FF,
             )
@@ -507,20 +507,10 @@ async def on_typing(channel: ChannelT, user: UserT, when):
         task.cancel()
     started = datetime.datetime.utcnow().timestamp()
     task = asyncio.create_task(_send_typing_reminder(channel, user, key, started))
-    _typing_tasks[key] = task)
-
-@bot.event
-async def on_message(message: discord.Message):
-    # 타이핑 타이머 취소
-    key = (message.channel.id, message.author.id)
-    if task := _typing_tasks.pop(key, None):
-        task.cancel()
-
-    if message.author.bot:
-        return
-
-    await handle_app_message(message)  # custom logic below
-    await bot.process_commands(message)
+    started = datetime.datetime.utcnow().timestamp()
+    _typing_tasks[key] = asyncio.create_task(
+        _send_typing_reminder(channel, user, key, started)
+    )
 
 @bot.event
 async def on_message(message: discord.Message):
