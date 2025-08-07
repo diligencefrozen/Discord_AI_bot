@@ -18,10 +18,51 @@ from typing import Optional
 from itertools import cycle
 from typing import Optional, List, Union, Dict
 from concurrent.futures import ThreadPoolExecutor
+import urllib.parse, textwrap
+from bs4 import BeautifulSoup  
+from ddgs import DDGS  
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
+# ─── DuckDuckGo 설정 ──────────────────────────────────
+DDG_LITE = "https://lite.duckduckgo.com/lite/"
+UA       = {"User-Agent": "Mozilla/5.0 tbBot3rd"}
+
+# 1) DuckDuckGo → 상위 10개 URL 추출
+async def ddg_top_links(query: str, k: int = 10) -> list[str]:
+
+    with DDGS() as ddg:                  
+        return [
+            r["href"]
+            for r in ddg.text(
+                query,
+                region="kr-kr",
+                safesearch="moderate",
+                max_results=k
+            )
+        ]
+
+# 2) jina.ai 한글 요약 (200~300 자 이내로 압축)
+async def jina_summary(url: str) -> str | None:
+
+    p = urllib.parse.urlparse(url)
+
+    # http://{호스트}{경로}[?쿼리]
+    target = f"http://{p.netloc}{p.path}"
+    if p.query:
+        target += f"?{p.query}"
+
+    api = f"https://r.jina.ai/{target}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as ac:
+            txt = (await ac.get(api)).text.strip()
+        if len(txt) < 20:                # 빈 응답 필터
+            return None
+        return textwrap.shorten(txt, 300, placeholder=" …")
+    except Exception:
+        return None
+      
 # ────────── 타이핑 알림(5초 딜레이) ──────────
 ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
@@ -174,7 +215,8 @@ STOPWORDS = {"ㅋㅋ", "ㅎㅎ", "음", "이건", "그건", "다들",
             "나냡아", "호선아", "다들", "the", "img",
             "스겜", "ㅇㅇ", "하고", "from",
             "막아놓은건데", "to", "are", "청년을",
-            "서울대가", "정상인이라면", "in", "set",} | set(string.punctuation)
+            "서울대가", "정상인이라면", "in", "set",
+            "web", "ask", } | set(string.punctuation)
 def tokenize(txt: str) -> list[str]:
     tokens = re.split(r"[^\w가-힣]+", txt.lower())
     return [
@@ -529,7 +571,7 @@ async def on_message(message: discord.Message):
     logging.info(f"[RECENT_MSGS] {len(RECENT_MSGS):>3}개 │ latest → {RECENT_MSGS[-1]!r}")
 
     # 1-3 명령어 패스-스루
-    if message.content.lstrip().lower().startswith(("!ask", "/ask", "!img", "/img")):
+    if message.content.lstrip().lower().startswith(("!ask", "/ask", "!img", "/img", "!web", "/web")):
         await bot.process_commands(message)
         return
 
@@ -692,7 +734,48 @@ async def on_message(message: discord.Message):
             await message.channel.send(tip)
             RECENT_MSGS.clear()                         # 버퍼 초기화 → 중복 차단
             logging.info("[HOT] buffer cleared after recommending %s", hot)
-            
+
+#검색 기능
+@bot.command(name="web", help="!web <검색어> — Ai 요약")
+async def web(ctx: commands.Context, *, query: str | None = None):
+    if not query:
+        return await ctx.reply("❗ 사용법: `!web <검색어>`")
+
+    async with ctx.typing():
+        # ① 검색 → 링크 수집
+        try:
+            links = await ddg_top_links(query, k=5)
+            if not links:
+                raise RuntimeError("검색 결과가 없습니다.")
+        except Exception as e:
+            return await ctx.reply(f"⚠️ 검색 실패: {e}")
+
+        # ② URL 별 요약 (동시 실행)
+        summaries = await asyncio.gather(*(jina_summary(u) for u in links))
+
+    # ③ Embed 구성
+    desc = ""
+    view = View(timeout=None)
+    for i, (url, summ) in enumerate(zip(links, summaries), 1):
+        if not summ:
+            continue
+        desc += f"**{i}.** {summ}\n\n"
+        view.add_item(Button(style=discord.ButtonStyle.link,
+                             label=str(i), url=url))
+
+    if not desc:
+        desc = "⚠️ 도리봇이 모든 페이지 요약을 실패했습니다."
+
+    embed = (
+        discord.Embed(
+            title=f"🔎  “{query}” 요약 (by tbBOT)",
+            description=desc,
+            color=0x00E5FF,
+        )
+        .set_footer(text="DuckDuckGo Lite + tbBOT summarizer")
+    )
+    await ctx.reply(embed=embed, view=view)
+  
 # !img  or  /img  프롬프트 → 그림 그려줌.
 @bot.command(name="img", help="!img <프롬프트> — 이미지를 생성합니다.")
 async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
@@ -830,6 +913,7 @@ async def on_ready():
     presences = cycle([
         "!ask 로 궁금증 해결해요!",
         "!img 로 그림을 그려봐요!",
+        "!web 로 웹서핑을 해봐요!",
     ])
 
     async def rotate():
