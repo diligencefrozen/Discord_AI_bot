@@ -160,7 +160,9 @@ STOPWORDS = {"ㅋㅋ", "ㅎㅎ", "음", "이건", "그건", "다들",
              "도리", "7호선", "칠호선", "나냡", 
              "1인칭", "일인칭", "들쥐", "돌이", "도리야", 
             "나냡아", "호선아", "다들", "the", "img",
-            "스겜", "ㅇㅇ", "하고", "from", } | set(string.punctuation)
+            "스겜", "ㅇㅇ", "하고", "from",
+            "막아놓은건데", "to", "are", "청년을",
+            "서울대가", "정상인이라면", "in", "set",} | set(string.punctuation)
 def tokenize(txt: str) -> list[str]:
     tokens = re.split(r"[^\w가-힣]+", txt.lower())
     return [
