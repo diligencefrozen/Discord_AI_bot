@@ -22,61 +22,27 @@ from concurrent.futures import ThreadPoolExecutor
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
-
-# 필수 토큰
-HF_TOKEN       = os.getenv("HF_TOKEN")            # 반드시 설정해야 함
-DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")       # 반드시 설정해야 함
-HF_IMG_TOKEN   = os.getenv("HF_IMG_TOKEN")        # 이미지 모델용
-
-BASE_URL        = "https://router.huggingface.co/v1"
-CHAT_MODEL_ID   = "openai/gpt-oss-20b:novita"
-IMG_MODEL_ID    = "stabilityai/stable-diffusion-xl-base-1.0"
-
+# ────────── HF / Discord 설정 ──────────
+HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
+PROVIDER      = "novita"
+MODEL         = "openai/gpt-oss-20b"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 MAX_TOKENS = 512
-MAX_MSG    = 1900
-FILE_TH    = 6000
+MAX_MSG   = 1900
+FILE_TH   = 6000
+HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
+IMG_MODEL    = "stabilityai/stable-diffusion-xl-base-1.0" 
+ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
+HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
+img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
-# ---------- HF Clients ----------
-chat_client = InferenceClient(                # OpenAI 호환 모드
-    base_url=BASE_URL,                        # ✅ URL만 지정
-    token=HF_TOKEN,
-)
-
-img_client  = InferenceClient(
-    IMG_MODEL_ID,
-    token=HF_IMG_TOKEN,
-)
-
-# ---------- 필수 토큰 체크 ----------
-missing = [
-    name for name, val in [
-        ("HF_TOKEN", HF_TOKEN),
-        ("DISCORD_TOKEN", DISCORD_TOKEN),
-    ] if not val
-]
-if missing:
+if not HF_TOKEN or not DISCORD_TOKEN:
     raise RuntimeError(
-        f"환경변수 {', '.join(missing)} 가(이) 설정되지 않았습니다.\n"
-        "• 로컬: .env 파일에 추가\n"
-        "• 배포: 플랫폼 Secrets 로 주입"
+        "HF_TOKEN 또는 DISCORD_TOKEN 환경변수가 설정되지 않았습니다.\n"
+        "• 로컬 개발: .env 파일에 두 값 작성 후 재실행\n"
+        "• 배포: 플랫폼 환경변수 / Northflank Secrets 로 주입"
     )
-
-# ────────── 메시지 전송 예시 ──────────
-async def ask_llm(user_prompt: str) -> str:
-    completion = await chat_client.chat.completions.create(
-        model=CHAT_MODEL_ID,                 # ✅ 모델은 여기서 지정
-        messages=[
-            {
-                "role": "system",
-                "content": "Reasoning: high\nYou are a helpful assistant.",
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-        max_tokens=1024,                     # 필요하면 확대
-        temperature=0.7,
-        timeout=30,                          # 안전 장치
-    )
-    return completion.choices[0].message.content
+    
 # 매달 5만 token(=입력+출력)을 넘지 않도록 간단히 차단
 TOKEN_BUDGET = 50_000          # novita 무료 월 한도
 token_used = 0                 # 전역 카운터
