@@ -60,16 +60,26 @@ async def jina_summary(url: str) -> Optional[str]:
         return textwrap.shorten(txt, 300, placeholder=" …")
     except Exception:
         return None
-      
+    
 # ────────── 타이핑 알림(5초 딜레이) ──────────
 ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
+# ▼ 추가: 12시간 쿨다운과 마지막 안내 시각(UTC timestamp) 저장용
+TYPE_REMINDER_COOLDOWN = 60 * 60 * 12  # 12 hours
+_last_typing_notice: Dict[int, float] = {}
+
 async def _send_typing_reminder(channel: ChannelT, user: UserT,
                                 key: tuple[int, int], started_at: float):
 
     try:
+        # 시작하자마자 쿨다운 체크(이미 최근에 보냈으면 즉시 종료)
+        now_ts = datetime.datetime.utcnow().timestamp()
+        last_ts = _last_typing_notice.get(user.id)
+        if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
+            return
+
         await asyncio.sleep(5)
 
         # 최근 5 초 사이에 해당 사용자가 메시지를 올렸으면 안내 건너뜀
@@ -77,6 +87,12 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
                                          after=datetime.datetime.fromtimestamp(started_at)):
             if msg.author.id == user.id:
                 return
+
+        # 전송 직전 한 번 더 쿨다운 체크(경쟁 상태 방지)
+        now_ts = datetime.datetime.utcnow().timestamp()
+        last_ts = _last_typing_notice.get(user.id)
+        if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
+            return
 
         await channel.send(
             embed=discord.Embed(
@@ -87,6 +103,75 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
                 color=0x00E5FF,
             )
         )
+
+        # 실제로 전송했으면 마지막 안내 시각 갱신
+        _last_typing_notice[user.id] = now_ts
+
+    finally:
+        _typing_tasks.pop(key, None)  # 작업 정리
+async def _send_typing_reminder(channel: ChannelT, user: UserT,
+                                key: tuple[int, int], started_at: float):
+    try:
+        await asyncio.sleep(5)
+
+        # 최근 5초 사이에 해당 사용자가 메시지를 올렸으면 안내 건너뜀
+        async for msg in channel.history(limit=1,
+                                         after=datetime.datetime.fromtimestamp(started_at)):
+            if msg.author.id == user.id:
+                return
+
+        # 직전 검사 (혹시 on_typing 중간에 상태 바뀐 경우)
+        now_ts = datetime.datetime.utcnow().timestamp()
+        last_ts = _last_typing_notice.get(user.id)
+        if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
+            return
+
+        await channel.send(
+            embed=discord.Embed(
+                description=(
+                    f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!\n\n"
+                    f"**👉 `!ask`** 로 궁금한 점을 바로 물어보세요! 💡"
+                ),
+                color=0x00E5FF,
+            )
+        )
+
+        # 실제로 보낸 경우에만 마지막 안내 시각 갱신
+        _last_typing_notice[user.id] = now_ts
+
+    finally:
+        _typing_tasks.pop(key, None)
+
+async def _send_typing_reminder(channel: ChannelT, user: UserT,
+                                key: tuple[int, int], started_at: float):
+    try:
+        await asyncio.sleep(5)
+
+        # 최근 5초 사이에 해당 사용자가 메시지를 올렸으면 안내 건너뜀
+        async for msg in channel.history(limit=1,
+                                         after=datetime.datetime.fromtimestamp(started_at)):
+            if msg.author.id == user.id:
+                return
+
+        # 직전 검사 (혹시 on_typing 중간에 상태 바뀐 경우)
+        now_ts = datetime.datetime.utcnow().timestamp()
+        last_ts = _last_typing_notice.get(user.id)
+        if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
+            return
+
+        await channel.send(
+            embed=discord.Embed(
+                description=(
+                    f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!\n\n"
+                    f"**👉 `!ask`** 로 궁금한 점을 바로 물어보세요! 💡"
+                ),
+                color=0x00E5FF,
+            )
+        )
+
+        # 실제로 보낸 경우에만 마지막 안내 시각 갱신
+        _last_typing_notice[user.id] = now_ts
+
     finally:
         _typing_tasks.pop(key, None)
         
@@ -549,11 +634,18 @@ async def on_typing(channel: ChannelT, user: UserT, when):
     if user.bot or not isinstance(channel, (discord.TextChannel, discord.Thread, discord.DMChannel)):
         return
 
+    # 쿨다운 중이면 태스크 자체를 만들지 않음 (불필요한 작업 방지)
+    now_ts = datetime.datetime.utcnow().timestamp()
+    last_ts = _last_typing_notice.get(user.id)
+    if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
+        return
+
     key = (channel.id, user.id)
     if task := _typing_tasks.pop(key, None):
         task.cancel()
 
-    started = datetime.datetime.utcnow().timestamp()
+    # typing 이벤트가 발생한 실제 시각을 사용해 필터 정확도 향상
+    started = when.timestamp() if isinstance(when, datetime.datetime) else now_ts
     _typing_tasks[key] = asyncio.create_task(
         _send_typing_reminder(channel, user, key, started)
     )
