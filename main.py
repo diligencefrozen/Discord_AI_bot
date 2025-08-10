@@ -290,28 +290,60 @@ MENTION_LOG: deque[float] = deque(maxlen=5)   # PEP 585 문법은 3.9에서도 �
 # ────────────────────────────────────────────────────────────────────────────
 # ‘최근 메시지 기록’ – 지금 자주 언급되는 키워드 탐지를 위한 기능 - 핫 키워드
 # ────────────────────────────────────────────────────────────────────────────
-MAX_BUFFER = 5   
-RECENT_MSGS: deque[str] = deque(maxlen=MAX_BUFFER)
-STOPWORDS = {"ㅋㅋ", "ㅎㅎ", "음", "이건", "그건", "다들", 
-             "도리", "7호선", "칠호선", "나냡", 
-             "1인칭", "일인칭", "들쥐", "돌이", "도리야", 
-            "나냡아", "호선아", "다들", "the", "img",
-            "스겜", "ㅇㅇ", "하고", "from",
-            "막아놓은건데", "to", "are", "청년을",
-            "서울대가", "정상인이라면", "in", "set",
-            "web", "ask", "https", "http", } | set(string.punctuation)
-def tokenize(txt: str) -> list[str]:
+
+# 1) 버퍼 길이(반드시 보조 함수들보다 위에 위치)
+MAX_BUFFER = 5
+
+# 2) 채널별 버퍼 딕셔너리
+RECENT_BY_CH: Dict[int, deque] = {}
+
+# 3) 수집 제외 채널 (원하는 채널 ID를 여기에 추가)
+HOTKEYWORD_EXCLUDE_CHANNELS: set[int] = {
+    859393583496298516, 797416761410322452,  # 삼사모
+    859482495125159966, 802906462895603762, # 아사모
+    937718347133493320, 937718832020217867 # 배사모 
+}
+
+# 4) 불용어
+STOPWORDS = {
+    "ㅋㅋ","ㅎㅎ","음","이건","그건","다들","도리","7호선","칠호선","나냡",
+    "1인칭","일인칭","들쥐","돌이","도리야","나냡아","호선아","the","img",
+    "스겜","ㅇㅇ","하고","from","막아놓은건데","to","are","청년을",
+    "서울대가","정상인이라면","in","set","web","ask","https","http",
+} | set(string.punctuation)
+
+def tokenize(txt: str) -> List[str]:
     tokens = re.split(r"[^\w가-힣]+", txt.lower())
-    return [
-        t for t in tokens
-        if t and t not in STOPWORDS and len(t) > 1 and not t.isdigit()
-    ]
-def pick_hot_keyword() -> Optional[str]:
-    freq = Counter(itertools.chain.from_iterable(map(tokenize, RECENT_MSGS)))
+    return [t for t in tokens if t and t not in STOPWORDS and len(t) > 1 and not t.isdigit()]
+
+# 5) 채널 버퍼 가져오기/생성
+def _get_buf(channel_id: int) -> deque:
+    dq = RECENT_BY_CH.get(channel_id)
+    if dq is None:
+        dq = deque(maxlen=MAX_BUFFER)
+        RECENT_BY_CH[channel_id] = dq
+    return dq
+
+# 6) 메시지 푸시 (수집 제외 채널 차단)
+def push_recent_message(channel_id: int, text: str) -> None:
+    if channel_id in HOTKEYWORD_EXCLUDE_CHANNELS:
+        return
+    _get_buf(channel_id).append(text)
+
+# 7) 버퍼 비우기(해당 채널만)
+def clear_recent(channel_id: int) -> None:
+    RECENT_BY_CH.pop(channel_id, None)
+
+# 8) 핫 키워드 계산(채널별)
+def pick_hot_keyword(channel_id: int) -> Optional[str]:
+    buf = list(_get_buf(channel_id))
+    if not buf:
+        return None
+    freq = Counter(itertools.chain.from_iterable(map(tokenize, buf)))
     if not freq:
         return None
     word, cnt = freq.most_common(1)[0]
-    return word if cnt >= 2 else None          # 2 회 이상 등장 시 채택
+    return word if cnt >= 2 else None  # 2회 이상 등장 시 채택
 
 # ────────────────────────────────────────────────────────────────────────────
 # 이모지 확대 – :01: ~ :50: / :dccon: ▶ 원본 PNG 링크 표시
@@ -661,8 +693,8 @@ async def on_message(message: discord.Message):
         await describe_attachments(message)
 
     # 1-2 핫 키워드를 위한 설정
-    RECENT_MSGS.append(message.clean_content)
-    logging.info(f"[RECENT_MSGS] {len(RECENT_MSGS):>3}개 │ latest → {RECENT_MSGS[-1]!r}")
+    push_recent_message(message.channel.id, message.clean_content)
+    logging.info("[RECENT][ch=%s] %r", message.channel.id, message.clean_content[:80])
 
     # 1-3 명령어 패스-스루
     if message.content.lstrip().lower().startswith(("!ask", "/ask", "!img", "/img", "!web", "/web")):
@@ -818,16 +850,17 @@ async def on_message(message: discord.Message):
         return
 
     # 8) 🔥 ‘핫 키워드’ 추천 -----------------------------------
-    if message.content.strip():                         # 공백만 입력이 아니고
-        hot = pick_hot_keyword()                        # 2회↑ 등장 시 단어 반환
-        if hot:                                         # 조건 충족 → 즉시 추천
+    if message.content.strip() and message.channel.id not in HOTKEYWORD_EXCLUDE_CHANNELS:
+        hot = pick_hot_keyword(message.channel.id)
+        if hot:
             tip = (
-                f"💡 흠.. **‘{hot}’** 이야기가 많네요!\n"
+                f"💡 흠.. '**{hot}**' 이야기가 많네요!\n"
                 f"`!ask {hot}` 로 검색해봐요?"
-            )
+                )
             await message.channel.send(tip)
-            RECENT_MSGS.clear()                         # 버퍼 초기화 → 중복 차단
-            logging.info("[HOT] buffer cleared after recommending %s", hot)
+            clear_recent(message.channel.id)  # 해당 채널 버퍼만 초기화
+            logging.info("[HOT][ch=%s] buffer cleared after recommending %s",
+                         message.channel.id, hot)
 
 #검색 기능
 @bot.command(name="web", help="!web <검색어> — Ai 요약")
