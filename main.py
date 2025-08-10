@@ -3,7 +3,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # 기본 모듈,라이브러리 로드
 # ────────────────────────────────────────────────────────────────────────────
-import asyncio, io, httpx, discord, random, re, datetime, logging, os                              
+import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string                             
 from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
@@ -11,7 +11,6 @@ from deep_translator import GoogleTranslator
 from huggingface_hub import InferenceClient
 from collections import deque, Counter
 from dotenv import load_dotenv    
-import itertools, string
 from discord.ui import View, Button 
 from PIL import Image
 from typing import Optional
@@ -105,12 +104,12 @@ ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
 HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
 img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
-if not HF_TOKEN or not DISCORD_TOKEN:
-    raise RuntimeError(
-        "HF_TOKEN 또는 DISCORD_TOKEN 환경변수가 설정되지 않았습니다.\n"
-        "• 로컬 개발: .env 파일에 두 값 작성 후 재실행\n"
-        "• 배포: 플랫폼 환경변수 / Northflank Secrets 로 주입"
-    )
+# macOS 일부 환경에서 기본 CA 경로 인식 실패 대응
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+
+if not (HF_TOKEN and DISCORD_TOKEN and HF_IMG_TOKEN):
+    raise RuntimeError("환경변수(HF_TOKEN, DISCORD_TOKEN, HF_IMG_TOKEN)가 비었습니다. .env 확인")
 
 # 매달 5만 token(=입력+출력)을 넘지 않도록 간단히 차단
 TOKEN_BUDGET = 50_000          # novita 무료 월 한도
