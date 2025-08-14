@@ -25,7 +25,7 @@ from typing import Any, Deque
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
-# ─── 개선된 금칙어 시스템 2.0 설정 ──────────────────────────────────
+# ─── 개선된 금칙어 우회 방지 시스템 설정 ──────────────────────────────────
 FILTER_WINDOW_SECS = 45     
 AGG_MAX_CHARS = 200  
 
@@ -46,12 +46,14 @@ BAD_ROOTS = {
 FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
 BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD_ROOTS]
 
+# ── 여기 바로 아래에 추가 ──
 BAD_ROOTS_KO = {w for w in BAD_ROOTS if re.search(r"[가-힣]", w)}
 BAD_ROOTS_EN = {w.lower() for w in BAD_ROOTS if re.search(r"[A-Za-z]", w)}
 
 # 누적 필터 상태: (guild_id, channel_id, author_id) -> {"text": str, "ts": float, "msgs": Deque[discord.Message]}
 RECENT_FILTER: Dict[tuple[int, int, int], Dict[str, Any]] = {}
 MAX_FILTER_MSGS = 12  
+
 
 # 제로폭 등 은닉문자 제거
 _ZW_CHARS = "\u200B\u200C\u200D\u2060\uFEFF"
@@ -74,32 +76,149 @@ def reset_aggregated_text_for_filter(message: discord.Message) -> None:
     RECENT_FILTER.pop(_key_for(message), None)
 
 def get_aggregated_text_for_filter(message: discord.Message) -> str:
-
     key = _key_for(message)
     now = time.time()
-    new_piece = normalize_text_for_filter(message.content)
+    norm = normalize_text_for_filter(message.content)
 
     st = RECENT_FILTER.get(key)
     if st and (now - st["ts"] <= FILTER_WINDOW_SECS):
-        agg = (st["text"] + " " + new_piece).strip()
         msgs: Deque[discord.Message] = st["msgs"]
+        parts: Deque[Dict[str, Any]] = st.get("parts", deque(maxlen=MAX_FILTER_MSGS))
     else:
-        agg = new_piece
         msgs = deque(maxlen=MAX_FILTER_MSGS)
+        parts = deque(maxlen=MAX_FILTER_MSGS)
 
-    # 새 메시지 추가
+    # 새 조각 추가
     msgs.append(message)
+    parts.append({
+        "m": message,
+        "norm": norm,
+        "ko": COLLAPSE_KO_RE.sub("", norm),
+        "en": COLLAPSE_EN_RE.sub("", norm).lower(),
+        "ts": message.created_at.timestamp(),
+    })
 
     # 창 밖 조각 정리
     while msgs and (now - msgs[0].created_at.timestamp()) > FILTER_WINDOW_SECS:
         msgs.popleft()
+    while parts and (now - parts[0]["ts"]) > FILTER_WINDOW_SECS:
+        parts.popleft()
 
-    # 누적 텍스트 길이 제한
+    # 누적 문자열(정보용)
+    agg = " ".join(p["norm"] for p in parts)
     if len(agg) > AGG_MAX_CHARS:
         agg = agg[-AGG_MAX_CHARS:]
 
-    RECENT_FILTER[key] = {"text": agg, "ts": now, "msgs": msgs}
+    RECENT_FILTER[key] = {"text": agg, "ts": now, "msgs": msgs, "parts": parts}
     return agg
+
+def _pick_msgs_overlapping_span(parts: Deque[Dict[str, Any]], start: int, end: int, field: str) -> list[discord.Message]:
+
+    picked = []
+    pos = 0
+    for p in parts:
+        seg = p[field]
+        seg_len = len(seg)
+        if seg_len == 0:
+            # 이 조각은 해당 field에 기여가 없음
+            pass
+        else:
+            # [pos, pos+seg_len) 과 [start, end) 교집합 여부
+            if not (pos + seg_len <= start or end <= pos):
+                picked.append(p["m"])
+        pos += seg_len
+    return picked
+
+def select_violation_messages(message: discord.Message) -> list[discord.Message]:
+
+    key = _key_for(message)
+    st = RECENT_FILTER.get(key)
+    if not st:
+        return []
+
+    parts: Deque[Dict[str, Any]] = st["parts"]
+
+    # 1) 현재 메시지 단독 위반(정규식 + 압축본)만 먼저 체크
+    cur_norm = normalize_text_for_filter(message.content)
+    if any(p.search(cur_norm) for p in BANNED_PATTERNS):
+        return [message]
+    cur_ko = COLLAPSE_KO_RE.sub("", cur_norm)
+    cur_en = COLLAPSE_EN_RE.sub("", cur_norm).lower()
+    if any(root in cur_ko for root in BAD_ROOTS_KO) or any(root in cur_en for root in BAD_ROOTS_EN):
+        return [message]
+
+    # 2) 창 안 조각들(ko/en 압축본) 연결해서 "현재 메시지"와 겹치는 금칙어만 잡기
+    ko_concat = "".join(p["ko"] for p in parts)
+    en_concat = "".join(p["en"] for p in parts)
+
+    # 현재 메시지가 차지하는 ko/en 구간 위치
+    ko_prefix = sum(len(p["ko"]) for p in list(parts)[:-1])
+    ko_last_len = len(parts[-1]["ko"])
+    ko_last_range = (ko_prefix, ko_prefix + ko_last_len)
+
+    en_prefix = sum(len(p["en"]) for p in list(parts)[:-1])
+    en_last_len = len(parts[-1]["en"])
+    en_last_range = (en_prefix, en_prefix + en_last_len)
+
+    # ko에서 찾기 (현재 메시지와 겹치는 매치만)
+    for root in BAD_ROOTS_KO:
+        start = 0
+        while True:
+            idx = ko_concat.find(root, start)
+            if idx == -1:
+                break
+            end = idx + len(root)
+            if end > ko_last_range[0] and idx < ko_last_range[1]:
+                return _pick_msgs_overlapping_span(parts, idx, end, "ko")
+            start = idx + 1
+
+    # en에서 찾기 (현재 메시지와 겹치는 매치만)
+    for root in BAD_ROOTS_EN:
+        start = 0
+        while True:
+            idx = en_concat.find(root, start)
+            if idx == -1:
+                break
+            end = idx + len(root)
+            if end > en_last_range[0] and idx < en_last_range[1]:
+                return _pick_msgs_overlapping_span(parts, idx, end, "en")
+            start = idx + 1
+
+    return []
+
+async def purge_selected_messages(message: discord.Message, targets: list[discord.Message]) -> int:
+
+    if not targets:
+        return 0
+    deleted = 0
+    key = _key_for(message)
+    st = RECENT_FILTER.get(key)
+
+    del_ids = {m.id for m in targets}
+    # 실제 삭제
+    uniq = []
+    seen = set()
+    for m in targets:
+        if m.id not in seen:
+            uniq.append(m); seen.add(m.id)
+    for m in uniq:
+        try:
+            await m.delete()
+            deleted += 1
+        except Exception:
+            pass
+
+    # 상태에서 삭제된 조각 제거
+    if st:
+        if "msgs" in st:
+            st["msgs"] = deque([m for m in st["msgs"] if m.id not in del_ids], maxlen=MAX_FILTER_MSGS)
+        if "parts" in st:
+            st["parts"] = deque([p for p in st["parts"] if p["m"].id not in del_ids], maxlen=MAX_FILTER_MSGS)
+        st["text"] = " ".join(p["norm"] for p in st.get("parts", []))
+        if not st.get("parts"):
+            RECENT_FILTER.pop(key, None)
+
+    return deleted
 
 async def purge_filter_chain(message: discord.Message) -> int:
 
@@ -917,31 +1036,19 @@ async def on_message(message: discord.Message):
         return
 
     # 4) 금칙어    
-    text_to_check = get_aggregated_text_for_filter(message)
-    # 1) 원문(누적) + 정규식 패턴으로 1차 탐지
-    violation_regex = any(p.search(text_to_check) for p in BANNED_PATTERNS)
-    # 2) “압축 뷰”로 2차 탐지: 공백/자모/숫자/기호/영문 섞기 우회 차단
-    #    예) "이 ㅋ 재 ㅋ 명 123!!!" -> collapsed_ko == "이재명"
-    #        "f _ u . c - k"        -> collapsed_en == "fuck"
+    _ = get_aggregated_text_for_filter(message)  # 상태 업데이트만 수행
     
-    collapsed_ko = COLLAPSE_KO_RE.sub("", text_to_check)
-    collapsed_en = COLLAPSE_EN_RE.sub("", text_to_check).lower()
-
-    violation_collapse = (
-        any(root in collapsed_ko for root in BAD_ROOTS_KO) or
-        any(root in collapsed_en for root in BAD_ROOTS_EN)
-    )
+    # 지워야 할 메시지들만 선별 (현재 메시지 단독 위반 또는 현재 메시지와 이어진 조각만)
+    to_delete = select_violation_messages(message)
     
-    violation = violation_regex or violation_collapse
-    
-    if violation:
-        deleted = await purge_filter_chain(message)  # 창 내 조각 전부 삭제
+    if to_delete:
+        deleted = await purge_selected_messages(message, to_delete)
         await message.channel.send(
             embed=discord.Embed(
                 description=f"{message.author.mention} 이런; 말을 순화하세요. (삭제 {deleted}건)",
                 color=0xFF0000,
+                )
             )
-        )
         return
 
     # 5) 웃음 상호작용
