@@ -33,27 +33,12 @@ AGG_MAX_CHARS = 200
 COLLAPSE_KO_RE = re.compile(r"[^가-힣]+")
 COLLAPSE_EN_RE = re.compile(r"[^A-Za-z]+")
 
-# 금칙어(욕설,혐오) 패턴 – filler 패턴으로 우회 입력도 탐지
-BAD_ROOTS = {
-    "씨발","시발","지랄","존나","섹스","병신","새끼","애미","에미","븅신","보지",
-    "한녀","느금","페미","패미","짱깨","닥쳐","노무","정공","씹놈","씹년","십놈",
-    "십년","계집","장애","시팔","씨팔","ㅈㄴ","ㄷㅊ","ㅈㄹ","미친","미띤","애비",
-    "ㅅㅂ","ㅆㅂ","ㅇㅁ","ㄲㅈ","ㅄ","닥치","씨벌","시벌","븅띤","치매","또라이",
-    "도라이","피싸개","정신병","조선족","쪽발이","쪽빨이","쪽바리","쪽팔이",
-    "아가리","ㅇㄱㄹ","fuck","좆","설거지","난교","재명","재앙","개놈","개년",
-    "sex", "ㅗ",
-}
-FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
-BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD_ROOTS]
-
-# ── 여기 바로 아래에 추가 ──
 BAD_ROOTS_KO = {w for w in BAD_ROOTS if re.search(r"[가-힣]", w)}
 BAD_ROOTS_EN = {w.lower() for w in BAD_ROOTS if re.search(r"[A-Za-z]", w)}
 
 # 누적 필터 상태: (guild_id, channel_id, author_id) -> {"text": str, "ts": float, "msgs": Deque[discord.Message]}
 RECENT_FILTER: Dict[tuple[int, int, int], Dict[str, Any]] = {}
 MAX_FILTER_MSGS = 12  
-
 
 # 제로폭 등 은닉문자 제거
 _ZW_CHARS = "\u200B\u200C\u200D\u2060\uFEFF"
@@ -1025,7 +1010,7 @@ async def on_message(message: discord.Message):
                     return  # 💨 더 이상 처리하지 않고 빠져나감
             
     # 3) 링크 삭제
-    if message.channel.id in ALLOWED_CHANNELS and LINK_REGEX.search(message.content):
+    if message.channel.id not in ALLOWED_CHANNELS and LINK_REGEX.search(message.content):
         await message.delete()
         await message.channel.send(
             embed=discord.Embed(
