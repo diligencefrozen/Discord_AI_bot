@@ -3,7 +3,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # 기본 모듈,라이브러리 로드
 # ────────────────────────────────────────────────────────────────────────────
-import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string                             
+import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, unicodedata                            
 from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
@@ -20,10 +20,128 @@ from concurrent.futures import ThreadPoolExecutor
 import urllib.parse, textwrap
 from bs4 import BeautifulSoup  
 from duckduckgo_search import DDGS 
+from typing import Any, Deque
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
+
+# ─── 개선된 금칙어 시스템 2.0 설정 ──────────────────────────────────
+FILTER_WINDOW_SECS = 45     
+AGG_MAX_CHARS = 200  
+
+# 압축용 정규식: 한글 음절만/영문자만 남기기
+COLLAPSE_KO_RE = re.compile(r"[^가-힣]+")
+COLLAPSE_EN_RE = re.compile(r"[^A-Za-z]+")
+
+# 금칙어(욕설,혐오) 패턴 – filler 패턴으로 우회 입력도 탐지
+BAD_ROOTS = {
+    "씨발","시발","지랄","존나","섹스","병신","새끼","애미","에미","븅신","보지",
+    "한녀","느금","페미","패미","짱깨","닥쳐","노무","정공","씹놈","씹년","십놈",
+    "십년","계집","장애","시팔","씨팔","ㅈㄴ","ㄷㅊ","ㅈㄹ","미친","미띤","애비",
+    "ㅅㅂ","ㅆㅂ","ㅇㅁ","ㄲㅈ","ㅄ","닥치","씨벌","시벌","븅띤","치매","또라이",
+    "도라이","피싸개","정신병","조선족","쪽발이","쪽빨이","쪽바리","쪽팔이",
+    "아가리","ㅇㄱㄹ","fuck","좆","설거지","난교","재명","재앙","개놈","개년",
+    "sex", "ㅗ",
+}
+FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
+BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD_ROOTS]
+
+BAD_ROOTS_KO = {w for w in BAD_ROOTS if re.search(r"[가-힣]", w)}
+BAD_ROOTS_EN = {w.lower() for w in BAD_ROOTS if re.search(r"[A-Za-z]", w)}
+
+# 누적 필터 상태: (guild_id, channel_id, author_id) -> {"text": str, "ts": float, "msgs": Deque[discord.Message]}
+RECENT_FILTER: Dict[tuple[int, int, int], Dict[str, Any]] = {}
+MAX_FILTER_MSGS = 12  
+
+# 제로폭 등 은닉문자 제거
+_ZW_CHARS = "\u200B\u200C\u200D\u2060\uFEFF"
+_ZW_RE = re.compile(f"[{re.escape(_ZW_CHARS)}]")
+
+def normalize_text_for_filter(t: str) -> str:
+    t = unicodedata.normalize("NFKC", t)
+    t = _ZW_RE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def _key_for(message: discord.Message) -> tuple[int, int, int]:
+    return (
+        message.guild.id if message.guild else 0,
+        message.channel.id,
+        message.author.id,
+    )
+
+def reset_aggregated_text_for_filter(message: discord.Message) -> None:
+    RECENT_FILTER.pop(_key_for(message), None)
+
+def get_aggregated_text_for_filter(message: discord.Message) -> str:
+
+    key = _key_for(message)
+    now = time.time()
+    new_piece = normalize_text_for_filter(message.content)
+
+    st = RECENT_FILTER.get(key)
+    if st and (now - st["ts"] <= FILTER_WINDOW_SECS):
+        agg = (st["text"] + " " + new_piece).strip()
+        msgs: Deque[discord.Message] = st["msgs"]
+    else:
+        agg = new_piece
+        msgs = deque(maxlen=MAX_FILTER_MSGS)
+
+    # 새 메시지 추가
+    msgs.append(message)
+
+    # 창 밖 조각 정리
+    while msgs and (now - msgs[0].created_at.timestamp()) > FILTER_WINDOW_SECS:
+        msgs.popleft()
+
+    # 누적 텍스트 길이 제한
+    if len(agg) > AGG_MAX_CHARS:
+        agg = agg[-AGG_MAX_CHARS:]
+
+    RECENT_FILTER[key] = {"text": agg, "ts": now, "msgs": msgs}
+    return agg
+
+async def purge_filter_chain(message: discord.Message) -> int:
+
+    key = _key_for(message)
+    st = RECENT_FILTER.get(key)
+    if not st:
+        # 그래도 현재 메시지는 시도
+        try:
+            await message.delete()
+            return 1
+        except Exception:
+            return 0
+
+    msgs: Deque[discord.Message] = st["msgs"]
+    # 중복 방지 및 창 내 메시지만
+    now = time.time()
+    uniq = []
+    seen = set()
+    for m in msgs:
+        if (now - m.created_at.timestamp()) <= FILTER_WINDOW_SECS and m.id not in seen:
+            uniq.append(m)
+            seen.add(m.id)
+    # 혹시 목록에 없으면 현재 것도 포함
+    if message.id not in seen:
+        uniq.append(message)
+
+    deleted = 0
+    for m in uniq:
+        try:
+            await m.delete()
+            deleted += 1
+        except Exception:
+            pass
+
+    # 상태 초기화
+    RECENT_FILTER.pop(key, None)
+    return deleted
+
+def log_ex(ctx: str, e: Exception) -> None:
+    logging.exception(f"[{ctx}] {e}")
+    
 # ─── DuckDuckGo 설정 ──────────────────────────────────
 DDG_LITE = "https://lite.duckduckgo.com/lite/"
 UA = {"User-Agent": "Mozilla/5.0 tbBot3rd"}
@@ -800,16 +918,33 @@ async def on_message(message: discord.Message):
         return
 
     # 4) 금칙어
-    for p in BANNED_PATTERNS:
-        if p.search(message.content):
-            await message.delete()
-            await message.channel.send(
-                embed=discord.Embed(
-                    description=f"{message.author.mention} 이런; 말을 순화하세요.",
-                    color=0xFF0000,
-                )
+    
+    text_to_check = get_aggregated_text_for_filter(message)
+    # 1) 원문(누적) + 정규식 패턴으로 1차 탐지
+    violation_regex = any(p.search(text_to_check) for p in BANNED_PATTERNS)
+    # 2) “압축 뷰”로 2차 탐지: 공백/자모/숫자/기호/영문 섞기 우회 차단
+    #    예) "이 ㅋ 재 ㅋ 명 123!!!" -> collapsed_ko == "이재명"
+    #        "f _ u . c - k"        -> collapsed_en == "fuck"
+    
+    collapsed_ko = COLLAPSE_KO_RE.sub("", text_to_check)
+    collapsed_en = COLLAPSE_EN_RE.sub("", text_to_check).lower()
+
+    violation_collapse = (
+        any(root in collapsed_ko for root in BAD_ROOTS_KO) or
+        any(root in collapsed_en for root in BAD_ROOTS_EN)
+    )
+    
+    violation = violation_regex or violation_collapse
+    
+    if violation:
+        deleted = await purge_filter_chain(message)  # 창 내 조각 전부 삭제
+        await message.channel.send(
+            embed=discord.Embed(
+                description=f"{message.author.mention} 이런; 말을 순화하세요. (삭제 {deleted}건)",
+                color=0xFF0000,
             )
-            return
+        )
+        return
 
     # 5) 웃음 상호작용
     if any(k in message.content for k in LAUGH_KEYWORDS):
