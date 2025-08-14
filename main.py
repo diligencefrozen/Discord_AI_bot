@@ -25,7 +25,6 @@ from typing import Any, Deque
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
-
 # ─── 개선된 금칙어 시스템 2.0 설정 ──────────────────────────────────
 FILTER_WINDOW_SECS = 45     
 AGG_MAX_CHARS = 200  
@@ -917,8 +916,7 @@ async def on_message(message: discord.Message):
         )
         return
 
-    # 4) 금칙어
-    
+    # 4) 금칙어    
     text_to_check = get_aggregated_text_for_filter(message)
     # 1) 원문(누적) + 정규식 패턴으로 1차 탐지
     violation_regex = any(p.search(text_to_check) for p in BANNED_PATTERNS)
