@@ -50,6 +50,26 @@ BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD
 BAD_ROOTS_KO = {w for w in BAD_ROOTS if re.search(r"[가-힣]", w)}
 BAD_ROOTS_EN = {w.lower() for w in BAD_ROOTS if re.search(r"[A-Za-z]", w)}
 
+# 초성 감지
+CHOSEONG = ['ㄱ','ㄲ','ㄴ','ㄷ','ㄸ','ㄹ','ㅁ','ㅂ','ㅃ','ㅅ','ㅆ','ㅇ','ㅈ','ㅉ','ㅊ','ㅋ','ㅌ','ㅍ','ㅎ']
+LEAD_CHO = 'ᄀᄁᄂᄃᄄᄅᄆᄇᄈᄉᄊᄋᄌᄍᄎᄏᄐᄑᄒ'  # U+1100..U+1112 (NFKC 후 자주 나옴)
+LEAD_TO_COMP = {a: b for a, b in zip(LEAD_CHO, CHOSEONG)}
+
+def to_choseong(txt: str) -> str:
+    res = []
+    for ch in txt:
+        if '가' <= ch <= '힣':                 # 완성형 한글
+            code = ord(ch) - 0xAC00
+            res.append(CHOSEONG[code // 588])
+        elif ch in CHOSEONG:                  # U+3131.. (ㄱ,ㄲ,...)
+            res.append(ch)
+        elif '\u1100' <= ch <= '\u1112':      # U+1100.. (ᄀ,ᄁ,...) ← NFKC 결과
+            res.append(LEAD_TO_COMP.get(ch, ''))
+    return ''.join(res)
+
+# 금칙어의 '초성 문자열' 셋 (빈 문자열 제외)
+FORBIDDEN_CHO = {c for c in (to_choseong(w) for w in BAD_ROOTS) if c}
+
 # 누적 필터 상태: (guild_id, channel_id, author_id) -> {"text": str, "ts": float, "msgs": Deque[discord.Message]}
 RECENT_FILTER: Dict[tuple[int, int, int], Dict[str, Any]] = {}
 MAX_FILTER_MSGS = 12  
@@ -94,6 +114,7 @@ def get_aggregated_text_for_filter(message: discord.Message) -> str:
         "norm": norm,
         "ko": COLLAPSE_KO_RE.sub("", norm),
         "en": COLLAPSE_EN_RE.sub("", norm).lower(),
+        "cho": to_choseong(re.sub(r"\s+", "", norm)),  
         "ts": message.created_at.timestamp(),
     })
 
@@ -158,7 +179,12 @@ def select_violation_messages(message: discord.Message) -> list[discord.Message]
     en_prefix = sum(len(p["en"]) for p in list(parts)[:-1])
     en_last_len = len(parts[-1]["en"])
     en_last_range = (en_prefix, en_prefix + en_last_len)
-
+    
+   # ★ 초성 단일 검사
+    cur_cho = to_choseong(re.sub(r"\s+", "", cur_norm))
+    if any(ch in cur_cho for ch in FORBIDDEN_CHO):
+        return [message]
+        
     # ko에서 찾기 (현재 메시지와 겹치는 매치만)
     for root in BAD_ROOTS_KO:
         start = 0
