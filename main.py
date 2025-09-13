@@ -22,7 +22,6 @@ from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS 
 from collections import defaultdict, deque, Counter
 from pathlib import Path
-from __future__ import annotations
 
 # 도배를 방지하기 위해 구현
         
