@@ -886,7 +886,7 @@ async def on_message(message: discord.Message):
         await message.delete()
         await message.channel.send(
             embed=discord.Embed(
-                description=f"{message.author.mention} 이런; 말을 순화하세요. (**{root}**)",
+                description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:**{root})",
                 color=0xFF0000,
             )
         )
