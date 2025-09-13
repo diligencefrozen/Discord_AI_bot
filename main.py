@@ -23,16 +23,8 @@ from duckduckgo_search import DDGS
 from collections import defaultdict, deque, Counter
 from pathlib import Path
 from __future__ import annotations
-from discord.errors import NotFound, Forbidden, HTTPException
 
 # 도배를 방지하기 위해 구현
-async def safe_delete(msg):
-    try:
-        await msg.delete()
-    except NotFound:
-        return
-    except (Forbidden, HTTPException):
-        return
         
 SPAM_ENABLED = True
 SPAM_CFG = {
