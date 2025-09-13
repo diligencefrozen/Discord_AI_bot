@@ -3,7 +3,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # 기본 모듈,라이브러리 로드
 # ────────────────────────────────────────────────────────────────────────────
-import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string                             
+import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json                            
 from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
@@ -20,6 +20,108 @@ from concurrent.futures import ThreadPoolExecutor
 import urllib.parse, textwrap
 from bs4 import BeautifulSoup  
 from duckduckgo_search import DDGS 
+from collections import defaultdict, deque, Counter
+from pathlib import Path
+
+# 도배를 방지하기 위해 구현
+SPAM_ENABLED = True
+SPAM_CFG = {
+    "max_msgs_per_10s": 6,        # 10초에 6개 이상 → 도배
+    "identical_per_30s": 3,       # 같은 내용 30초에 3회 이상
+    "max_char_run": 12,           # 같은 문자 12연속 (ㅋㅋㅋㅋ, ㅇㅇㅇ…, !!!!! 등)
+    "min_len_for_ratio": 12,      # 압축비 판정 최소 길이
+    "compress_ratio_th": 0.35,    # 반복 압축비(낮을수록 반복 심함)
+    "short_len": 3,               # 아주 짧은 글자(예: 'ㅇ', 'ㅋ')
+    "short_repeat_th": 5,         # 짧은 글자 15초 내 5회 이상
+    "window_identical_s": 30,
+    "window_rate_s": 10,
+    "window_short_s": 15,
+}
+
+# 화이트리스트(관리자/로깅/허용 채널 등은 도배 검사 제외하고 싶을 때)
+EXEMPT_ROLE_IDS = set()          # 예: {1234567890}
+EXEMPT_CHANNEL_IDS = set("937718347133493320", "937718832020217867", "859393583496298516", "797416761410322452", "859482495125159966", "802906462895603762")       # 필요 시 채널ID 추가
+
+# 유저별 최근 메시지 버퍼
+_user_msgs = defaultdict(deque)  # user_id -> deque[(ts, norm, channel_id, len, raw)]
+_last_warn_ts = {}               # user_id -> ts(last warn)
+MAX_BUF = 50    
+
+def _normalize_text(s: str) -> str:
+    # 대소문자/공백/구두점 제거, 한글 자모 포함 단어문자만 남김
+    s = s.lower()
+    s = re.sub(r'\s+', '', s)
+    s = re.sub(r'[^\w가-힣ㄱ-ㅎㅏ-ㅣ]', '', s)
+    return s
+
+def _longest_run_len(s: str) -> int:
+    best = 1
+    for ch, group in itertools.groupby(s):
+        n = sum(1 for _ in group)
+        if n > best:
+            best = n
+    return best
+
+def _compression_ratio(s: str) -> float:
+
+    if not s:
+        return 1.0
+    s2 = re.sub(r'(.)\1+', r'\1', s)  # aaaaa -> a
+    return len(s2) / max(1, len(s))
+
+# 같은 단어 반복 패턴 ex) "apple apple apple apple apple"
+REPEATED_TOKEN = re.compile(r'(\b\w+\b)(?:\W+\1){4,}', re.I)
+
+def _is_exempt(member, channel) -> bool:
+    if channel.id in EXEMPT_CHANNEL_IDS:
+        return True
+    if any(r.id in EXEMPT_ROLE_IDS for r in getattr(member, "roles", []) or []):
+        return True
+    return False
+
+def check_spam_and_reason(message) -> str | None:
+
+    now = time.time()
+    uid = message.author.id
+    ch  = message.channel.id
+    raw = message.content or ""
+    norm = _normalize_text(raw)
+    nlen = len(norm)
+
+    # 버퍼 업데이트(오래된 항목 제거)
+    dq = _user_msgs[uid]
+    dq.append((now, norm, ch, nlen, raw))
+    while dq and now - dq[0][0] > 60:  # 60초 이상 지난 건 버림
+        dq.popleft()
+    if len(dq) > MAX_BUF:
+        dq.popleft()
+
+    # 1) 메시지 속성 기반(단일 문자 반복, 압축비)
+    if nlen >= 1 and _longest_run_len(norm) >= SPAM_CFG["max_char_run"]:
+        return "같은 문자를 과도하게 반복"
+    if nlen >= SPAM_CFG["min_len_for_ratio"] and _compression_ratio(norm) < SPAM_CFG["compress_ratio_th"]:
+        return "반복 문자가 지나치게 많음"
+    if REPEATED_TOKEN.search(raw):
+        return "동일 단어 과다 반복"
+
+    # 2) 짧은 메시지/이모티콘류 연타(예: 'ㅇ', 'ㅋ', 'ㅠ', 'lol', 'k' 등)
+    if nlen <= SPAM_CFG["short_len"]:
+        cnt = sum(1 for ts, nm, c, l, r in dq if now - ts <= SPAM_CFG["window_short_s"] and c == ch and l <= SPAM_CFG["short_len"])
+        if cnt >= SPAM_CFG["short_repeat_th"]:
+            return "짧은 메시지 반복(연타)"
+
+    # 3) 동일 내용 반복(30초/3회 이상)
+    identical_cnt = sum(1 for ts, nm, c, l, r in dq
+                        if now - ts <= SPAM_CFG["window_identical_s"] and c == ch and nm == norm and nlen >= 1)
+    if identical_cnt >= SPAM_CFG["identical_per_30s"]:
+        return "동일/유사 메시지 반복"
+
+    # 4) 발화량 과다(10초에 6회 이상)
+    rate_cnt = sum(1 for ts, nm, c, l, r in dq if now - ts <= SPAM_CFG["window_rate_s"] and c == ch)
+    if rate_cnt >= SPAM_CFG["max_msgs_per_10s"]:
+        return "과도한 연속 발화"
+
+    return None
 
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
@@ -333,6 +435,31 @@ BAD_ROOTS = {
 }
 FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
 BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD_ROOTS]
+
+BANNED_INDEX = []     
+
+def rebuild_bad_index(words: Optional[set] = None) -> None:
+
+    global BANNED_INDEX, BANNED_PATTERNS, BAD_ROOTS
+    if words is None:
+        words = BAD_ROOTS
+    idx = []
+    for w in sorted(set(words)):
+        if not w:
+            continue
+        pat = re.compile(FILLER.join(map(re.escape, w)), re.I)
+        idx.append((w, pat))
+    BANNED_INDEX = idx
+    BANNED_PATTERNS = [p for _, p in idx]  # (기존 for p in BANNED_PATTERNS: 루프 호환용)
+
+def find_badroot(text: str) -> Optional[str]:
+
+    for root, pat in BANNED_INDEX:
+        if pat.search(text):
+            return root
+    return None
+
+rebuild_bad_index()
 
 # “항상 4문장 이하로 요약 답변” 시스템 프롬프트
 SYS_PROMPT = (
@@ -686,6 +813,21 @@ async def on_message(message: discord.Message):
 
         except Exception as e:
             log_ex("mention/reply", e)
+    
+    # ───── Anti-Spam 선처리 ─────
+    if SPAM_ENABLED and not _is_exempt(message.author, message.channel):
+        reason = check_spam_and_reason(message)
+        if reason:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            # 경고는 30초에 1회만
+            now = time.time()
+            if now - _last_warn_ts.get(message.author.id, 0) > 30:
+                _last_warn_ts[message.author.id] = now
+                await message.channel.send(f"{message.author.mention} 도배 금지! ({reason})")
+            return
             
     # ---------------------------------------------
     # 2-2) 게임 홍보 카드 (슬래시/프리픽스 명령 제외)
@@ -732,16 +874,16 @@ async def on_message(message: discord.Message):
         return
 
     # 4) 금칙어
-    for p in BANNED_PATTERNS:
-        if p.search(message.content):
-            await message.delete()
-            await message.channel.send(
-                embed=discord.Embed(
-                    description=f"{message.author.mention} 이런; 말을 순화하세요.",
-                    color=0xFF0000,
-                )
+    root = find_badroot(message.content)
+    if root:
+        await message.delete()
+        await message.channel.send(
+            embed=discord.Embed(
+                description=f"{message.author.mention} 이런; 말을 순화하세요. (**{root}**)",
+                color=0xFF0000,
             )
-            return
+        )
+        return
 
     # 5) 웃음 상호작용
     if any(k in message.content for k in LAUGH_KEYWORDS):
