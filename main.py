@@ -883,16 +883,20 @@ async def on_message(message: discord.Message):
         return
 
     # 4) 금칙어
-    root = find_badroot(message.content)
-    if root:
-        await message.delete()
-        await message.channel.send(
-            embed=discord.Embed(
-                description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:**{root})",
-                color=0xFF0000,
-            )
-        )
-        return
+    if (LINK_REGEX.search(message.content)
+        and message.channel.id not in ALLOWED_CHANNELS
+        and not _is_exempt(message.author, message.channel)):
+        if not _is_exempt(message.author, message.channel):
+            root = find_badroot(message.content)
+            if root:
+                await safe_delete(message)
+                await message.channel.send(
+                    embed=discord.Embed(
+                        description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:**{root})",
+                        color=0xFF0000,
+                        )
+                    )
+                return
 
     # 5) 웃음 상호작용
     if any(k in message.content for k in LAUGH_KEYWORDS):
