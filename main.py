@@ -22,7 +22,15 @@ from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS 
 from collections import defaultdict, deque, Counter
 from pathlib import Path
+from discord.errors import NotFound, Forbidden, HTTPException
 
+# 금칙어 검열 기능의 버그를 해결하기 위한 임기응변 
+async def safe_delete(message: discord.Message):
+    try:
+        await message.delete()
+    except (NotFound, Forbidden, HTTPException):
+        pass
+            
 # 도배를 방지하기 위해 구현
         
 SPAM_ENABLED = True
@@ -41,15 +49,12 @@ SPAM_CFG = {
 
 # 화이트리스트(관리자/로깅/허용 채널 등은 도배 검사 제외하고 싶을 때)
 EXEMPT_ROLE_IDS = set()          # 예: {1234567890}
-EXEMPT_CHANNEL_IDS = {
-    937718347133493320,
-    937718832020217867,
-    859393583496298516,
-    797416761410322452,
-    859482495125159966,
-    802906462895603762,
+
+EXEMPT_SPAM_CHANNEL_IDS = {
+    937718347133493320, 937718832020217867, 859393583496298516,
+    797416761410322452, 859482495125159966, 802906462895603762,
     1155789990173868122,
-} # 필요 시 채널ID 추가
+}
 
 # 유저별 최근 메시지 버퍼
 _user_msgs = defaultdict(deque)  # user_id -> deque[(ts, norm, channel_id, len, raw)]
@@ -863,40 +868,33 @@ async def on_message(message: discord.Message):
                 view = View(timeout=None)
                 for label, emoji, url in cfg["links"]:
                     view.add_item(Button(label=label, emoji=emoji, url=url))
-                    
-                    await message.channel.send(
-                        content=f"{message.author.mention} {cfg['cta']}",
-                        embed=embed,
-                        view=view,
-                        )
-                    return  # 💨 더 이상 처리하지 않고 빠져나감
+                    await message.channel.send(content=f"{message.author.mention} {cfg['cta']}",
+                                               embed=embed, view=view)
+                    return
             
     # 3) 링크 삭제
-    if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:      
-        await message.delete()
+    if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:
+        await safe_delete(message)
         await message.channel.send(
             embed=discord.Embed(
                 description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요.",
                 color=0xFF0000,
+                )
             )
-        )
         return
 
     # 4) 금칙어
-    if (LINK_REGEX.search(message.content)
-        and message.channel.id not in ALLOWED_CHANNELS
-        and not _is_exempt(message.author, message.channel)):
-        if not _is_exempt(message.author, message.channel):
-            root = find_badroot(message.content)
-            if root:
-                await safe_delete(message)
-                await message.channel.send(
-                    embed=discord.Embed(
-                        description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:**{root})",
-                        color=0xFF0000,
-                        )
-                    )
-                return
+    EXEMPT_PROFANITY_CHANNEL_IDS = set()  
+    root = find_badroot(message.content)
+    if root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
+        await safe_delete(message)
+        await message.channel.send(
+            embed=discord.Embed(
+                description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:** {root})",
+                color=0xFF0000,
+                )
+            )
+        return
 
     # 5) 웃음 상호작용
     if any(k in message.content for k in LAUGH_KEYWORDS):
