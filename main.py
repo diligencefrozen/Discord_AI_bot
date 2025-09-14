@@ -87,7 +87,7 @@ def _compression_ratio(s: str) -> float:
 REPEATED_TOKEN = re.compile(r'(\b\w+\b)(?:\W+\1){4,}', re.I)
 
 def _is_exempt(member, channel) -> bool:
-    if channel.id in EXEMPT_CHANNEL_IDS:
+    if channel.id in EXEMPT_SPAM_CHANNEL_IDS:
         return True
     if any(r.id in EXEMPT_ROLE_IDS for r in getattr(member, "roles", []) or []):
         return True
