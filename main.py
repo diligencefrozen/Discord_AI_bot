@@ -30,7 +30,36 @@ async def safe_delete(message: discord.Message):
         await message.delete()
     except (NotFound, Forbidden, HTTPException):
         pass
-            
+
+# ==== Gibberish 탐지 설정/정규식 ====
+GIBBERISH_CFG = {
+    "symbol_ratio_th": 0.40,   # 전체 글자 중 특수문자 비율
+    "unique_ratio_th": 0.30,   # (서로 다른 문자 수 / 길이) 임계
+}
+
+RE_JAMO_RUN       = re.compile(r"[ㄱ-ㅎ]{4,}")                         # ㅁㄴㅇㄹ 류
+RE_LATIN_CONS_RUN = re.compile(r"(?i)^[bcdfghjklmnpqrstvwxyz]{5,}$")   # 모음 없는 영문
+RE_LONG_DIGITS    = re.compile(r"^\d{7,}$")                            # 긴 숫자 나열
+RE_REPEAT_CHUNK   = re.compile(r"(.{2,4})\1{2,}")                      # asd/as/as… 반복
+
+def _symbol_ratio(s: str) -> float:
+    if not s: return 0.0
+    sym = sum(1 for ch in s if not (ch.isalnum() or '가' <= ch <= '힣'))
+    return sym / len(s)
+
+# 영문자판으로 한글을 두드린 듯한 토큰(rowltjd 등) 감지
+QWERTY_TO_JAMO = {'q':'ㅂ','w':'ㅈ','e':'ㄷ','r':'ㄱ','t':'ㅅ','y':'ㅛ','u':'ㅕ','i':'ㅑ','o':'ㅐ','p':'ㅔ',
+                  'a':'ㅁ','s':'ㄴ','d':'ㅇ','f':'ㄹ','g':'ㅎ','h':'ㅗ','j':'ㅓ','k':'ㅏ','l':'ㅣ',
+                  'z':'ㅋ','x':'ㅌ','c':'ㅊ','v':'ㅍ','b':'ㅠ','n':'ㅜ','m':'ㅡ'}
+def _looks_like_kor_on_en_keyboard(tok: str) -> bool:
+    if not tok.isascii() or not tok.isalpha() or len(tok) < 4:
+        return False
+    mapped = ''.join(QWERTY_TO_JAMO.get(c.lower(), '') for c in tok)
+    if len(mapped) < 4:
+        return False
+    jamo_cnt = sum(1 for ch in mapped if ('ㄱ' <= ch <= 'ㅎ') or ('ㅏ' <= ch <= 'ㅣ'))
+    return jamo_cnt / len(mapped) >= 0.8
+    
 # 도배를 방지하기 위해 구현
         
 SPAM_ENABLED = True
@@ -134,7 +163,31 @@ def check_spam_and_reason(message) -> Optional[str]:
     rate_cnt = sum(1 for ts, nm, c, l, r in dq if now - ts <= SPAM_CFG["window_rate_s"] and c == ch)
     if rate_cnt >= SPAM_CFG["max_msgs_per_10s"]:
         return "과도한 연속 발화"
+    
+    # 2-a) 의미 없는 패턴/자판 스매시
+    raw_no_space = re.sub(r"\s+", "", raw)
 
+    # asd/as/as…, ㅁㄴㅇㄹ 류, 특수문자 범람
+    if RE_REPEAT_CHUNK.search(raw_no_space):
+        return "의미 없는 반복 패턴(asd/ㅁㄴㅇㄹ 등)"
+    if RE_JAMO_RUN.search(raw):
+        return "자모만 나열된 무의미 문자열"
+    if len(raw) >= 6 and _symbol_ratio(raw) >= GIBBERISH_CFG["symbol_ratio_th"]:
+        return "특수문자/기호 과다"
+
+    # 토큰 단위 검사: 모음 없는 영문/긴 숫자/영문자판 한글
+    for tok in re.findall(r"[0-9A-Za-z가-힣]+", raw):
+        if RE_LONG_DIGITS.match(tok):
+            return "의미 없는 숫자 나열"
+        if RE_LATIN_CONS_RUN.match(tok):
+            return "모음 없는 영문 자음 나열"
+        if _looks_like_kor_on_en_keyboard(tok):
+            return "영문자판으로 두드린 한글(무의미)"
+
+    # 다양성 낮은 문자열(ㅋㅋㅋ/aaaazz류 보완)
+    if len(norm) >= 8 and (len(set(norm)) / len(norm) <= GIBBERISH_CFG["unique_ratio_th"]):
+        return "문자 다양성 낮은 반복성 문자열"
+        
     return None
 
 # ────── 환경 변수 로드 ──────
@@ -765,10 +818,6 @@ async def on_message(message: discord.Message):
     if message.attachments:
         await describe_attachments(message)
 
-    # 1-2 핫 키워드를 위한 설정
-    push_recent_message(message.channel.id, message.clean_content)
-    logging.info("[RECENT][ch=%s] %r", message.channel.id, message.clean_content[:80])
-
     # 1-3 명령어 패스-스루
     if message.content.lstrip().lower().startswith(("!ask", "/ask", "!img", "/img", "!web", "/web")):
         await bot.process_commands(message)
@@ -895,6 +944,10 @@ async def on_message(message: discord.Message):
                 )
             )
         return
+  
+    # 1-2 핫 키워드를 위한 설정
+    push_recent_message(message.channel.id, message.clean_content)
+    logging.info("[RECENT][ch=%s] %r", message.channel.id, message.clean_content[:80])    
 
     # 5) 웃음 상호작용
     if any(k in message.content for k in LAUGH_KEYWORDS):
