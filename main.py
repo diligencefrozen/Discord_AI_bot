@@ -31,6 +31,91 @@ async def safe_delete(message: discord.Message):
     except (NotFound, Forbidden, HTTPException):
         pass
 
+# 미디어/이모지 업로드를 막을 사용자 ID 목록 
+BLOCK_MEDIA_USER_IDS = {
+    638365017883934742,  # 예시: Apple iPhone 16 Pro
+    # 987654321098765432,  # 필요시 추가
+}
+
+EXEMPT_MEDIA_CHANNEL_IDS = {
+    1155789990173868122,  # 여기가 면제 채널
+}
+
+# 커스텀 이모지 (<:name:id> 또는 <a:name:id>)
+CUSTOM_EMOJI_RE = re.compile(r"<a?:[A-Za-z0-9_]{2,}:\d{17,22}>")
+
+MEDIA_EXTS = (
+    ".png",".jpg",".jpeg",".gif",".webp",".bmp",".tif",".tiff",
+    ".mp4",".mov",".m4v",".webm",".mkv",".avi",".wmv",".gifv"
+)
+
+def _attachment_is_media(att: discord.Attachment) -> bool:
+    ct = (att.content_type or "").lower()
+    fn = att.filename.lower()
+    return (
+        ct.startswith("image") or
+        ct.startswith("video") or
+        any(fn.endswith(ext) for ext in MEDIA_EXTS)
+    )
+
+def _contains_unicode_emoji(s: str) -> bool:
+
+    if not s:
+        return False
+
+    # keycap (#,*,0-9 + 20E3), 국기(지역표시 2글자)
+    if re.search(r"[0-9#*]\uFE0F?\u20E3", s):
+        return True
+    if re.search(r"[\U0001F1E6-\U0001F1FF]{2}", s):
+        return True
+
+    for ch in s:
+        cp = ord(ch)
+        if (
+            0x1F300 <= cp <= 0x1F5FF or   # Misc Symbols & Pictographs
+            0x1F600 <= cp <= 0x1F64F or   # Emoticons
+            0x1F680 <= cp <= 0x1F6FF or   # Transport & Map
+            0x1F700 <= cp <= 0x1F77F or   # Alchemical
+            0x1F780 <= cp <= 0x1F7FF or   # Geometric Extended
+            0x1F800 <= cp <= 0x1F8FF or   # Supplemental Arrows C (안전 여유)
+            0x1F900 <= cp <= 0x1F9FF or   # Supplemental Symbols & Pictographs
+            0x1FA70 <= cp <= 0x1FAFF or   # Symbols & Pictographs Extended-A
+            0x2600  <= cp <= 0x26FF  or   # Misc Symbols
+            0x2700  <= cp <= 0x27BF  or   # Dingbats
+            cp in (0x2764, 0xFE0F, 0x200D)  # ❤ / Variation Selector-16 / ZWJ
+        ):
+            return True
+    return False
+
+def _message_has_blocked_media_or_emoji(msg: discord.Message) -> bool:
+    # 1) 첨부(이미지/영상/기타 미디어)
+    if any(_attachment_is_media(att) for att in msg.attachments):
+        return True
+
+    # 2) 스티커(=사실상 이미지)
+    if getattr(msg, "stickers", None) and len(msg.stickers) > 0:
+        return True
+    if getattr(msg, "sticker_items", None) and len(msg.sticker_items) > 0:
+        return True
+
+    # 3) 임베드에 이미지/영상(링크 미리보기 포함)
+    for emb in msg.embeds:
+        if emb.type in ("image", "video", "gifv"):
+            return True
+        if getattr(emb, "image", None) and getattr(emb.image, "url", None):
+            return True
+        if getattr(emb, "video", None) and getattr(emb.video, "url", None):
+            return True
+        if getattr(emb, "thumbnail", None) and getattr(emb.thumbnail, "url", None):
+            return True
+
+    # 4) 이모지(커스텀 + 유니코드)
+    content = msg.content or ""
+    if CUSTOM_EMOJI_RE.search(content) or _contains_unicode_emoji(content):
+        return True
+
+    return False
+    
 # ==== Gibberish 탐지 설정/정규식 ====
 GIBBERISH_CFG = {
     "symbol_ratio_th": 0.40,   # 전체 글자 중 특수문자 비율
@@ -814,6 +899,26 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
+    # 특정 사용자: 모든 이모지/이미지/영상/스티커 사용 불가 (단, 면제 채널 제외)
+    if message.author.id in BLOCK_MEDIA_USER_IDS and message.channel.id not in EXEMPT_MEDIA_CHANNEL_IDS:
+        if _message_has_blocked_media_or_emoji(message):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.channel.send(
+                embed=discord.Embed(
+                    description=(
+                        f"{message.author.mention} 제한된 사용자 감지!\n\n"
+                        f"이미지, 영상, 이모지 기능을 이용하실 수 없어요.\n\n"
+
+                    ),
+                    color=0xFF3B30
+                    ),
+                    delete_after=8.0
+                )
+        return
+        
     # 1-1 첨부파일 메타 카드
     if message.attachments:
         await describe_attachments(message)
