@@ -30,10 +30,11 @@ async def safe_delete(message: discord.Message):
         await message.delete()
     except (NotFound, Forbidden, HTTPException):
         pass
-        
+
 # 미디어/이모지 업로드를 막을 사용자 ID 목록 
 BLOCK_MEDIA_USER_IDS = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
+    855749166764654653,
     # 987654321098765432,  # 필요시 추가
 }
 
@@ -129,10 +130,11 @@ def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: in
             "업로드한 이미지/영상/이모지/스티커는 **즉시 삭제**되며, 로그로 **기록**됩니다."
         )
     else:
-        state = "비-제한 채널**감시 모드**"
+        state = "비-제한 채널 **감시 모드**"
         note  = (
-            "여기는 **제한을 일시적으로 면제해주는 채널**입니다. \n업로드는 **삭제되지 않지만**, 모든 활동이 **기록**됩니다.\n"
-            "텍스트만 사용을 권장하며, 불필요한 미디어/이모지는 자제해 주세요."
+            "여기는 **제한을 일시적으로 면제해주는 채널**입니다.\n"
+            "업로드는 **삭제되지 않지만**, 모든 활동이 **기록**됩니다.\n"
+            "텍스트 사용을 권장하며, 불필요한 미디어/이모지는 자제해 주세요."
         )
 
     desc = (
@@ -159,6 +161,18 @@ def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: in
     view = View(timeout=20)
     view.add_item(Button(style=discord.ButtonStyle.link, label="비-제한 채널로 이동", emoji="🚧", url=jump_url))
     return embed, view
+
+# 감시/제한 알림 설정
+PRIMARY_EXEMPT_MEDIA_CH_ID = 1155789990173868122 # 면제 채널(고정)
+EXEMPT_MEDIA_CHANNEL_IDS = {PRIMARY_EXEMPT_MEDIA_CH_ID}  # ← 한 곳에서만 관리
+SURVEILLANCE_RED = 0xFF143C
+
+# 면제 채널 안내 쿨다운
+SURV_NOTICE_COOLDOWN_S = 20  # seconds
+_last_surv_notice: Dict[int, float] = {}
+
+SURV_NOTICE_COOLDOWN_S = 20  # seconds
+_last_surv_notice: Dict[int, float] = {}
     
 # 도배를 방지하기 위해 구현
         
@@ -890,25 +904,37 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
-    # 특정 사용자: 모든 이모지/이미지/영상/스티커 사용 불가 (단, 면제 채널 제외)
-    if message.author.id in BLOCK_MEDIA_USER_IDS and message.channel.id not in EXEMPT_MEDIA_CHANNEL_IDS:
-        if _message_has_blocked_media_or_emoji(message):
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await message.channel.send(
-                embed=discord.Embed(
-                    description=(
-                        f"{message.author.mention} **제한된 사용자 감지!**\n\n"
-                        f"이미지, 영상, 이모지 기능을 이용하실 수 없어요.\n\n"
-
-                    ),
-                    color=0xFF3B30
-                    ),
-                    delete_after=8.0
-                )
-        return
+    # ───── 제한 사용자 처리 (가장 위쪽, 다른 필터보다 먼저) ─────
+    if message.author.id in BLOCK_MEDIA_USER_IDS:
+        # (a) 면제 채널: 삭제하지 않되, 항상 '감시 중' 알림(쿨다운)
+        if message.channel.id in EXEMPT_MEDIA_CHANNEL_IDS:
+            now = time.time()
+            last = _last_surv_notice.get(message.author.id, 0)
+            if now - last >= SURV_NOTICE_COOLDOWN_S:
+                embed, view = make_surveillance_embed(
+                    message.author,
+                    deleted=False,
+                    guild_id=(message.guild.id if message.guild else 0),
+                    exempt_ch_id=PRIMARY_EXEMPT_MEDIA_CH_ID,
+                    )
+                await message.channel.send(embed=embed, view=view, delete_after=10.0)
+                _last_surv_notice[message.author.id] = now
+                return  # 면제 채널에서는 다른 필터 안 타게 여기서 종료
+            
+            # (b) 일반 채널: 미디어/이모지/스티커 감지 시 즉시 삭제 + 강한 경고
+            if _message_has_blocked_media_or_emoji(message):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                embed, view = make_surveillance_embed(
+                    message.author,
+                    deleted=True,
+                    guild_id=(message.guild.id if message.guild else 0),
+                    exempt_ch_id=PRIMARY_EXEMPT_MEDIA_CH_ID,
+                    )
+                await message.channel.send(embed=embed, view=view, delete_after=10.0)
+                return    
         
     # 1-1 첨부파일 메타 카드
     if message.attachments:
