@@ -35,7 +35,7 @@ async def safe_delete(message: discord.Message):
 # ───────── 정책 상수 (단 한 번만 정의) ─────────
 BLOCK_MEDIA_USER_IDS: Set[int] = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
-    855749166764654653,
+
     # 987654321098765432,  # 필요시 추가
 }
 
