@@ -30,7 +30,7 @@ async def safe_delete(message: discord.Message):
         await message.delete()
     except (NotFound, Forbidden, HTTPException):
         pass
-
+        
 # 미디어/이모지 업로드를 막을 사용자 ID 목록 
 BLOCK_MEDIA_USER_IDS = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
@@ -38,7 +38,7 @@ BLOCK_MEDIA_USER_IDS = {
 }
 
 EXEMPT_MEDIA_CHANNEL_IDS = {
-    1155789990173868122,  # 여기가 면제 채널
+    1155789990173868122,  # 여기가 면제 채널 
 }
 
 # 커스텀 이모지 (<:name:id> 또는 <a:name:id>)
@@ -115,6 +115,50 @@ def _message_has_blocked_media_or_emoji(msg: discord.Message) -> bool:
         return True
 
     return False
+
+# 감시/제한 알림 디자인
+PRIMARY_EXEMPT_MEDIA_CH_ID = 1155789990173868122 # 면제 채널(고정)
+SURVEILLANCE_RED = 0xFF143C
+
+def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: int, exempt_ch_id: int):
+    banner = "███ ▓▒░ **RESTRICTED** ░▒▓ ███"
+    if deleted:
+        state = "규정 위반 업로드 **차단됨**"
+        note  = (
+            "이 사용자는 **제한된 사용자**로 분류되어 상시 **모니터링 대상**입니다.\n"
+            "업로드한 이미지/영상/이모지/스티커는 **즉시 삭제**되며, 로그로 **기록**됩니다."
+        )
+    else:
+        state = "비-제한 채널**감시 모드**"
+        note  = (
+            "여기는 **제한을 일시적으로 면제해주는 채널**입니다. \n업로드는 **삭제되지 않지만**, 모든 활동이 **기록**됩니다.\n"
+            "텍스트만 사용을 권장하며, 불필요한 미디어/이모지는 자제해 주세요."
+        )
+
+    desc = (
+        f"{banner}\n\n"
+        f"**상태:** {state}\n"
+        f"**대상:** {user.mention}\n\n"
+        f"{note}\n\n"
+        f"➡️ **비-제한 채널:** <#{exempt_ch_id}>"
+    )
+
+    embed = (
+        discord.Embed(
+            title="🛑 제한 사용자 감시 중",
+            description=desc,
+            color=SURVEILLANCE_RED,
+            timestamp=datetime.datetime.now(seoul_tz),
+        )
+        .set_thumbnail(url=user.display_avatar.url)
+        .set_footer(text=f"감시 ID: {user.id} • 정책 위반 자동탐지")
+    )
+
+    # 면제 채널로 이동 버튼 (깃드/채널 URL)
+    jump_url = f"https://discord.com/channels/{guild_id}/{exempt_ch_id}"
+    view = View(timeout=20)
+    view.add_item(Button(style=discord.ButtonStyle.link, label="비-제한 채널로 이동", emoji="🚧", url=jump_url))
+    return embed, view
     
 # 도배를 방지하기 위해 구현
         
