@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS 
 from collections import defaultdict, deque, Counter
 from pathlib import Path
+from typing import Dict, Set, Tuple
 from discord.errors import NotFound, Forbidden, HTTPException
 
 # 금칙어 검열 기능의 버그를 해결하기 위한 임기응변 
@@ -31,18 +32,20 @@ async def safe_delete(message: discord.Message):
     except (NotFound, Forbidden, HTTPException):
         pass
 
-# 미디어/이모지 업로드를 막을 사용자 ID 목록 
-BLOCK_MEDIA_USER_IDS = {
+# ───────── 정책 상수 (단 한 번만 정의) ─────────
+BLOCK_MEDIA_USER_IDS: Set[int] = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
     855749166764654653,
     # 987654321098765432,  # 필요시 추가
 }
 
-EXEMPT_MEDIA_CHANNEL_IDS = {
-    1155789990173868122,  # 여기가 면제 채널 
-}
+# 면제 채널: 한 곳에서만 관리
+PRIMARY_EXEMPT_MEDIA_CH_ID: int = 1155789990173868122
+EXEMPT_MEDIA_CHANNEL_IDS: Set[int] = {PRIMARY_EXEMPT_MEDIA_CH_ID}
 
-# 커스텀 이모지 (<:name:id> 또는 <a:name:id>)
+SURVEILLANCE_RED = 0xFF143C
+
+# ───────── 이모지/미디어 판별 정규식/확장자 ─────────
 CUSTOM_EMOJI_RE = re.compile(r"<a?:[A-Za-z0-9_]{2,}:\d{17,22}>")
 
 MEDIA_EXTS = (
@@ -60,10 +63,8 @@ def _attachment_is_media(att: discord.Attachment) -> bool:
     )
 
 def _contains_unicode_emoji(s: str) -> bool:
-
     if not s:
         return False
-
     # keycap (#,*,0-9 + 20E3), 국기(지역표시 2글자)
     if re.search(r"[0-9#*]\uFE0F?\u20E3", s):
         return True
@@ -78,7 +79,7 @@ def _contains_unicode_emoji(s: str) -> bool:
             0x1F680 <= cp <= 0x1F6FF or   # Transport & Map
             0x1F700 <= cp <= 0x1F77F or   # Alchemical
             0x1F780 <= cp <= 0x1F7FF or   # Geometric Extended
-            0x1F800 <= cp <= 0x1F8FF or   # Supplemental Arrows C (안전 여유)
+            0x1F800 <= cp <= 0x1F8FF or   # Supplemental Arrows C
             0x1F900 <= cp <= 0x1F9FF or   # Supplemental Symbols & Pictographs
             0x1FA70 <= cp <= 0x1FAFF or   # Symbols & Pictographs Extended-A
             0x2600  <= cp <= 0x26FF  or   # Misc Symbols
@@ -117,11 +118,10 @@ def _message_has_blocked_media_or_emoji(msg: discord.Message) -> bool:
 
     return False
 
-# 감시/제한 알림 디자인
-PRIMARY_EXEMPT_MEDIA_CH_ID = 1155789990173868122 # 면제 채널(고정)
-SURVEILLANCE_RED = 0xFF143C
-
-def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: int, exempt_ch_id: int):
+# ───────── 감시/제한 알림 embed/view ─────────
+def make_surveillance_embed(
+    user: discord.Member, *, deleted: bool, guild_id: int, exempt_ch_id: int
+):
     banner = "███ ▓▒░ **RESTRICTED** ░▒▓ ███"
     if deleted:
         state = "규정 위반 업로드 **차단됨**"
@@ -156,26 +156,39 @@ def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: in
         .set_footer(text=f"감시 ID: {user.id} • 정책 위반 자동탐지")
     )
 
-    # 면제 채널로 이동 버튼 (깃드/채널 URL)
     jump_url = f"https://discord.com/channels/{guild_id}/{exempt_ch_id}"
     view = View(timeout=20)
-    view.add_item(Button(style=discord.ButtonStyle.link, label="비-제한 채널로 이동", emoji="🚧", url=jump_url))
+    view.add_item(
+        Button(
+            style=discord.ButtonStyle.link,
+            label="비-제한 채널로 이동",
+            emoji="🚧",
+            url=jump_url
+        )
+    )
     return embed, view
 
-# 감시/제한 알림 설정
-PRIMARY_EXEMPT_MEDIA_CH_ID = 1155789990173868122 # 면제 채널(고정)
-EXEMPT_MEDIA_CHANNEL_IDS = {PRIMARY_EXEMPT_MEDIA_CH_ID}  # ← 한 곳에서만 관리
-SURVEILLANCE_RED = 0xFF143C
+# ===== Debug switches =====
+DEBUG_SURV = True  # True면 분기/값을 로깅
 
-# 면제 채널 안내 쿨다운
-SURV_NOTICE_COOLDOWN_S = 20  # seconds
-_last_surv_notice: Dict[int, float] = {}
+# 쿨다운: (guild, channel, user) -> last_monotonic
+SURV_NOTICE_COOLDOWN_S = 20
+_last_surv_notice: Dict[Tuple[int,int,int], float] = {}
 
-SURV_NOTICE_COOLDOWN_S = 20  # seconds
-_last_surv_notice: Dict[int, float] = {}
+def _should_send_surv_notice(guild_id: int, channel_id: int, user_id: int) -> bool:
+    now = time.monotonic()
+    key = (guild_id or 0, channel_id or 0, user_id)
+    last = _last_surv_notice.get(key, 0.0)
+    if now - last >= SURV_NOTICE_COOLDOWN_S:
+        _last_surv_notice[key] = now
+        return True
+    return False
+
+def _dbg(*args):
+    if DEBUG_SURV:
+        logging.warning("[SURV] " + " ".join(str(a) for a in args))
     
-# 도배를 방지하기 위해 구현
-        
+# 도배를 방지하기 위해 구현        
 SPAM_ENABLED = True
 SPAM_CFG = {
     "max_msgs_per_10s": 6,        # 10초에 6개 이상 → 도배
@@ -904,37 +917,54 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
-    # ───── 제한 사용자 처리 (가장 위쪽, 다른 필터보다 먼저) ─────
-    if message.author.id in BLOCK_MEDIA_USER_IDS:
-        # (a) 면제 채널: 삭제하지 않되, 항상 '감시 중' 알림(쿨다운)
-        if message.channel.id in EXEMPT_MEDIA_CHANNEL_IDS:
-            now = time.time()
-            last = _last_surv_notice.get(message.author.id, 0)
-            if now - last >= SURV_NOTICE_COOLDOWN_S:
+    guild_id = message.guild.id if message.guild else 0
+    ch_id    = message.channel.id
+    user_id  = message.author.id
+
+    # ───── 제한 사용자 처리 (가장 위쪽) ─────
+    if user_id in BLOCK_MEDIA_USER_IDS:
+        _dbg("HIT restricted user", user_id, "guild=", guild_id, "channel=", ch_id)
+
+        # (a) 면제 채널: 삭제하지 않되 알림(쿨다운)
+        if ch_id in EXEMPT_MEDIA_CHANNEL_IDS:
+            _dbg("EXEMPT channel branch", ch_id)
+            if _should_send_surv_notice(guild_id, ch_id, user_id):
+                _dbg("send exempt notice")
                 embed, view = make_surveillance_embed(
                     message.author,
                     deleted=False,
-                    guild_id=(message.guild.id if message.guild else 0),
+                    guild_id=guild_id,
                     exempt_ch_id=PRIMARY_EXEMPT_MEDIA_CH_ID,
-                    )
-                await message.channel.send(embed=embed, view=view, delete_after=10.0)
-                _last_surv_notice[message.author.id] = now
-                return  # 면제 채널에서는 다른 필터 안 타게 여기서 종료
-            
-            # (b) 일반 채널: 미디어/이모지/스티커 감지 시 즉시 삭제 + 강한 경고
-            if _message_has_blocked_media_or_emoji(message):
+                )
                 try:
-                    await message.delete()
-                except Exception:
-                    pass
-                embed, view = make_surveillance_embed(
-                    message.author,
-                    deleted=True,
-                    guild_id=(message.guild.id if message.guild else 0),
-                    exempt_ch_id=PRIMARY_EXEMPT_MEDIA_CH_ID,
-                    )
+                    await message.channel.send(embed=embed, view=view, delete_after=10.0)
+                except Exception as e:
+                    _dbg("send exempt notice failed:", repr(e))
+            # 면제 채널은 어떤 경우에도 여기서 종료
+            return
+
+        # (b) 일반 채널: 미디어/이모지/스티커 감지 시 삭제 + 경고
+        if _message_has_blocked_media_or_emoji(message):
+            _dbg("non-exempt channel & media detected → delete")
+            try:
+                await message.delete()
+            except Exception as e:
+                _dbg("delete failed:", repr(e))
+
+            embed, view = make_surveillance_embed(
+                message.author,
+                deleted=True,
+                guild_id=guild_id,
+                exempt_ch_id=PRIMARY_EXEMPT_MEDIA_CH_ID,
+            )
+            try:
                 await message.channel.send(embed=embed, view=view, delete_after=10.0)
-                return    
+            except Exception as e:
+                _dbg("send warn failed:", repr(e))
+            return
+
+    # (중요) 다른 핸들러/명령이 계속 동작하도록
+    await bot.process_commands(message)    
         
     # 1-1 첨부파일 메타 카드
     if message.attachments:
@@ -949,7 +979,7 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # 1-4) ▶▶  멘션 / 답장 감지  ◀◀
+    # 1-4) 멘션 / 답장 감지 
     if message.mentions or message.reference:
         try:
             # ── A. 대상(@멘션 + 답장 작성자) 수집 ──
