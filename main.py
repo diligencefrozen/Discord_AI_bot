@@ -32,20 +32,22 @@ async def safe_delete(message: discord.Message):
     except (NotFound, Forbidden, HTTPException):
         pass
 
-# ───────── 정책 상수 (단 한 번만 정의) ─────────
-BLOCK_MEDIA_USER_IDS: Set[int] = {
+# 공통 예외 로깅 도우미
+def log_ex(ctx: str, e: Exception) -> None:
+    try:
+        logging.exception("[%s] %s", ctx, e)
+    except Exception:
+        # 로깅 자체에서 예외가 발생하는 드문 상황 대비
+        pass
+
+# 미디어/이모지 업로드를 막을 사용자 ID 목록 
+BLOCK_MEDIA_USER_IDS = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
 
     # 987654321098765432,  # 필요시 추가
 }
 
-# 면제 채널: 한 곳에서만 관리
-PRIMARY_EXEMPT_MEDIA_CH_ID: int = 1155789990173868122
-EXEMPT_MEDIA_CHANNEL_IDS: Set[int] = {PRIMARY_EXEMPT_MEDIA_CH_ID}
-
-SURVEILLANCE_RED = 0xFF143C
-
-# ───────── 이모지/미디어 판별 정규식/확장자 ─────────
+# 커스텀 이모지 (<:name:id> 또는 <a:name:id>)
 CUSTOM_EMOJI_RE = re.compile(r"<a?:[A-Za-z0-9_]{2,}:\d{17,22}>")
 
 MEDIA_EXTS = (
@@ -63,8 +65,10 @@ def _attachment_is_media(att: discord.Attachment) -> bool:
     )
 
 def _contains_unicode_emoji(s: str) -> bool:
+
     if not s:
         return False
+
     # keycap (#,*,0-9 + 20E3), 국기(지역표시 2글자)
     if re.search(r"[0-9#*]\uFE0F?\u20E3", s):
         return True
@@ -79,7 +83,7 @@ def _contains_unicode_emoji(s: str) -> bool:
             0x1F680 <= cp <= 0x1F6FF or   # Transport & Map
             0x1F700 <= cp <= 0x1F77F or   # Alchemical
             0x1F780 <= cp <= 0x1F7FF or   # Geometric Extended
-            0x1F800 <= cp <= 0x1F8FF or   # Supplemental Arrows C
+            0x1F800 <= cp <= 0x1F8FF or   # Supplemental Arrows C (안전 여유)
             0x1F900 <= cp <= 0x1F9FF or   # Supplemental Symbols & Pictographs
             0x1FA70 <= cp <= 0x1FAFF or   # Symbols & Pictographs Extended-A
             0x2600  <= cp <= 0x26FF  or   # Misc Symbols
@@ -118,16 +122,17 @@ def _message_has_blocked_media_or_emoji(msg: discord.Message) -> bool:
 
     return False
 
-# ───────── 감시/제한 알림 embed/view ─────────
-def make_surveillance_embed(
-    user: discord.Member, *, deleted: bool, guild_id: int, exempt_ch_id: int
-):
+# 감시/제한 알림 디자인 (상수는 아래 '감시/제한 알림 설정' 블록에서 단일 정의)
+
+def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: int, exempt_ch_id: int):
     banner = "███ ▓▒░ **RESTRICTED** ░▒▓ ███"
     if deleted:
         state = "규정 위반 업로드 **차단됨**"
         note  = (
-            "이 사용자는 **제한된 사용자**로 분류되어 상시 **모니터링 대상**입니다.\n"
-            "업로드한 이미지/영상/이모지/스티커는 **즉시 삭제**되며, 로그로 **기록**됩니다."
+            "이 사용자는 **제한된 사용자**로 분류되어\n"
+            "상시 **모니터링 대상**입니다.\n"
+            "업로드한 이미지/영상/이모지/스티커는\n"
+            "**즉시 삭제**되며, 로그로 **기록**됩니다.\n"
         )
     else:
         state = "비-제한 채널 **감시 모드**"
@@ -156,37 +161,20 @@ def make_surveillance_embed(
         .set_footer(text=f"감시 ID: {user.id} • 정책 위반 자동탐지")
     )
 
+    # 면제 채널로 이동 버튼 (깃드/채널 URL)
     jump_url = f"https://discord.com/channels/{guild_id}/{exempt_ch_id}"
     view = View(timeout=20)
-    view.add_item(
-        Button(
-            style=discord.ButtonStyle.link,
-            label="비-제한 채널로 이동",
-            emoji="🚧",
-            url=jump_url
-        )
-    )
+    view.add_item(Button(style=discord.ButtonStyle.link, label="비-제한 채널로 이동", emoji="🚧", url=jump_url))
     return embed, view
 
-# ===== Debug switches =====
-DEBUG_SURV = True  # True면 분기/값을 로깅
+# 감시/제한 알림 설정
+PRIMARY_EXEMPT_MEDIA_CH_ID = 1155789990173868122  # 면제 채널(고정)
+EXEMPT_MEDIA_CHANNEL_IDS = {PRIMARY_EXEMPT_MEDIA_CH_ID}  # ← 한 곳에서만 관리
+SURVEILLANCE_RED = 0xFF143C
 
-# 쿨다운: (guild, channel, user) -> last_monotonic
-SURV_NOTICE_COOLDOWN_S = 20
-_last_surv_notice: Dict[Tuple[int,int,int], float] = {}
-
-def _should_send_surv_notice(guild_id: int, channel_id: int, user_id: int) -> bool:
-    now = time.monotonic()
-    key = (guild_id or 0, channel_id or 0, user_id)
-    last = _last_surv_notice.get(key, 0.0)
-    if now - last >= SURV_NOTICE_COOLDOWN_S:
-        _last_surv_notice[key] = now
-        return True
-    return False
-
-def _dbg(*args):
-    if DEBUG_SURV:
-        logging.warning("[SURV] " + " ".join(str(a) for a in args))
+# 면제 채널 안내 쿨다운
+SURV_NOTICE_COOLDOWN_S = 20  # seconds
+_last_surv_notice: Dict[int, float] = {}
     
 # 도배를 방지하기 위해 구현        
 SPAM_ENABLED = True
