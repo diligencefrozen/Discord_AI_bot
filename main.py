@@ -177,6 +177,23 @@ SURV_NOTICE_COOLDOWN_S = 20  # seconds
 _last_surv_notice: Dict[int, float] = {}
     
 # 도배를 방지하기 위해 구현               
+# 디버그 로그 헬퍼
+def _dbg(*args):
+    """간단한 디버그 출력 함수"""
+    logging.debug(" ".join(str(a) for a in args))
+
+# 감시 알림 전송 여부 판단 (쿨다운 체크)
+def _should_send_surv_notice(guild_id: int, ch_id: int, user_id: int) -> bool:
+    """마지막 알림 이후 충분한 시간이 지났는지 확인"""
+    now = time.time()
+    key = (guild_id, ch_id, user_id)
+    last = _last_surv_notice.get(key, 0)
+    if now - last >= SURV_NOTICE_COOLDOWN_S:
+        _last_surv_notice[key] = now
+        return True
+    return False
+    
+# 도배를 방지하기 위해 구현               
 SPAM_ENABLED = True
 SPAM_CFG = {
     # 메시지 빈도 제어
