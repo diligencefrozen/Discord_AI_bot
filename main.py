@@ -176,19 +176,43 @@ SURVEILLANCE_RED = 0xFF143C
 SURV_NOTICE_COOLDOWN_S = 20  # seconds
 _last_surv_notice: Dict[int, float] = {}
     
-# 도배를 방지하기 위해 구현        
+# 도배를 방지하기 위해 구현               
 SPAM_ENABLED = True
 SPAM_CFG = {
-    "max_msgs_per_10s": 6,        # 10초에 6개 이상 → 도배
+    # 메시지 빈도 제어
+    "max_msgs_per_10s": 7,        # 10초에 7개 이상 → 도배 (기존 6에서 완화)
+    "max_msgs_per_30s": 15,       # 30초에 15개 이상 → 심각한 도배 (신규)
+    "max_msgs_per_60s": 25,       # 60초에 25개 이상 → 극심한 도배 (신규)
+    
+    # 동일 메시지 반복
     "identical_per_30s": 3,       # 같은 내용 30초에 3회 이상
-    "max_char_run": 12,           # 같은 문자 12연속 (ㅋㅋㅋㅋ, ㅇㅇㅇ…, !!!!! 등)
-    "min_len_for_ratio": 12,      # 압축비 판정 최소 길이
-    "compress_ratio_th": 0.35,    # 반복 압축비(낮을수록 반복 심함)
-    "short_len": 3,               # 아주 짧은 글자(예: 'ㅇ', 'ㅋ')
-    "short_repeat_th": 5,         # 짧은 글자 15초 내 5회 이상
+    "similar_threshold": 0.75,    # 유사도 75% 이상이면 '거의 동일'로 판정 (85%→75% 강화)
+    "similar_per_30s": 4,         # 유사한 내용 30초에 4회 이상 (신규)
+    
+    # 문자 반복 패턴
+    "max_char_run": 15,           # 같은 문자 15연속 (기존 12에서 완화)
+    "max_emoji_run": 8,           # 이모지/특수문자 8연속 (신규)
+    "max_char_ratio": 0.6,        # 전체 중 단일 문자 비율 60% 이상 (신규, 우회 방지)
+    
+    # 압축비 분석
+    "min_len_for_ratio": 10,      # 압축비 판정 최소 길이 (15→10 강화)
+    "compress_ratio_th": 0.30,    # 반복 압축비 (기존 0.35에서 강화)
+    
+    # 짧은 메시지 연타
+    "short_len": 4,               # 짧은 글자 기준 상향 (3→4)
+    "short_repeat_th": 6,         # 짧은 글자 15초 내 6회 이상 (기존 5에서 완화)
+    
+    # 시간 윈도우
     "window_identical_s": 30,
+    "window_similar_s": 30,       # 유사도 판정 윈도우 (신규)
     "window_rate_s": 10,
+    "window_rate_30s": 30,        # 30초 윈도우 (신규)
+    "window_rate_60s": 60,        # 60초 윈도우 (신규)
     "window_short_s": 15,
+    
+    # 경고 시스템
+    "warning_cooldown_s": 45,     # 경고 쿨다운 45초 (기존 30초에서 증가)
+    "auto_timeout_threshold": 5,  # 5회 위반 시 자동 타임아웃 (신규, 미구현)
 }
 
 # 화이트리스트(관리자/로깅/허용 채널 등은 도배 검사 제외하고 싶을 때)
@@ -200,25 +224,70 @@ EXEMPT_SPAM_CHANNEL_IDS = {
     1155789990173868122,
 }
 
-# 유저별 최근 메시지 버퍼
-_user_msgs = defaultdict(deque)  # user_id -> deque[(ts, norm, channel_id, len, raw)]
-_last_warn_ts = {}               # user_id -> ts(last warn)
-MAX_BUF = 50    
+# 유저별 최근 메시지 버퍼 & 통계
+_user_msgs = defaultdict(deque)      # user_id -> deque[(ts, norm, channel_id, len, raw)]
+_last_warn_ts = {}                   # user_id -> ts(last warn)
+_user_violations = defaultdict(int)  # user_id -> violation count (신규)
+MAX_BUF = 60                         # 버퍼 크기 증가 (기존 50)    
 
 def _normalize_text(s: str) -> str:
-    # 대소문자/공백/구두점 제거, 한글 자모 포함 단어문자만 남김
+    
     s = s.lower()
-    s = re.sub(r'\s+', '', s)
+    # 공백뿐 아니라 점, 물결표 등도 제거 (우회 방지)
+    s = re.sub(r'[\s\.\~\!\?\-\_\+\=\*\#\@\$\%\^\&\(\)\[\]\{\}\<\>\/\\\|\'\"\`\,\;\:]', '', s)
     s = re.sub(r'[^\w가-힣ㄱ-ㅎㅏ-ㅣ]', '', s)
     return s
 
+def _similarity_ratio(s1: str, s2: str) -> float:
+    
+    if not s1 or not s2:
+        return 0.0
+    if s1 == s2:
+        return 1.0
+    
+    # Levenshtein 거리 간단 구현
+    len1, len2 = len(s1), len(s2)
+    if len1 > len2:
+        s1, s2 = s2, s1
+        len1, len2 = len2, len1
+    
+    current = range(len1 + 1)
+    for i in range(1, len2 + 1):
+        previous, current = current, [i] + [0] * len1
+        for j in range(1, len1 + 1):
+            add, delete, change = previous[j] + 1, current[j - 1] + 1, previous[j - 1]
+            if s1[j - 1] != s2[i - 1]:
+                change += 1
+            current[j] = min(add, delete, change)
+    
+    distance = current[len1]
+    max_len = max(len(s1), len(s2))
+    return 1.0 - (distance / max_len) if max_len > 0 else 0.0
+
 def _longest_run_len(s: str) -> int:
+    
+    if not s:
+        return 0
     best = 1
     for ch, group in itertools.groupby(s):
         n = sum(1 for _ in group)
         if n > best:
             best = n
     return best
+
+def _emoji_run_len(s: str) -> int:
+    
+    emoji_pattern = r'[^\w\s가-힣ㄱ-ㅎㅏ-ㅣ]+'
+    runs = re.findall(emoji_pattern, s)
+    return max((len(run) for run in runs), default=0)
+
+def _char_frequency_ratio(s: str) -> float:
+    
+    if not s or len(s) < 5:
+        return 0.0
+    counter = Counter(s)
+    most_common_count = counter.most_common(1)[0][1]
+    return most_common_count / len(s)
 
 def _compression_ratio(s: str) -> float:
 
@@ -238,7 +307,7 @@ def _is_exempt(member, channel) -> bool:
     return False
 
 def check_spam_and_reason(message) -> Optional[str]:
-
+   
     now = time.time()
     uid = message.author.id
     ch  = message.channel.id
@@ -254,31 +323,101 @@ def check_spam_and_reason(message) -> Optional[str]:
     if len(dq) > MAX_BUF:
         dq.popleft()
 
-    # 1) 메시지 속성 기반(단일 문자 반복, 압축비)
+    # ──────────────────────────────────────────────────────
+    # 1) 메시지 속성 기반 검사 (단일 메시지 분석)
+    # ──────────────────────────────────────────────────────
+    
+    # 1-a) 문자 반복 (ㅋㅋㅋㅋㅋ, !!!!!!!! 등)
     if nlen >= 1 and _longest_run_len(norm) >= SPAM_CFG["max_char_run"]:
-        return "같은 문자를 과도하게 반복"
+        _user_violations[uid] += 1
+        return f"같은 문자 {SPAM_CFG['max_char_run']}회 이상 반복"
+    
+    # 1-b) 이모지/특수문자 과다 (!!!!!!@@@### 등)
+    if _emoji_run_len(raw) >= SPAM_CFG["max_emoji_run"]:
+        _user_violations[uid] += 1
+        return f"특수문자/이모지 {SPAM_CFG['max_emoji_run']}개 이상 연속"
+    
+    # 1-c) 단일 문자 과다 비율 (ㅋ.ㅋ.ㅋ.ㅋ 같은 우회 방지)
+    if nlen >= 5 and _char_frequency_ratio(norm) >= SPAM_CFG["max_char_ratio"]:
+        _user_violations[uid] += 1
+        return f"단일 문자 과다 사용 ({int(_char_frequency_ratio(norm)*100)}%)"
+    
+    # 1-d) 압축비 (반복 패턴 감지)
     if nlen >= SPAM_CFG["min_len_for_ratio"] and _compression_ratio(norm) < SPAM_CFG["compress_ratio_th"]:
-        return "반복 문자가 지나치게 많음"
+        _user_violations[uid] += 1
+        return "과도한 반복 패턴 감지"
+    
+    # 1-e) 동일 단어 반복 (apple apple apple...)
     if REPEATED_TOKEN.search(raw):
+        _user_violations[uid] += 1
         return "동일 단어 과다 반복"
 
-    # 2) 짧은 메시지/이모티콘류 연타(예: 'ㅇ', 'ㅋ', 'ㅠ', 'lol', 'k' 등)
+    # ──────────────────────────────────────────────────────
+    # 2) 짧은 메시지 연타 (ㅇ, ㅋ, ㅠ 등)
+    # ──────────────────────────────────────────────────────
     if nlen <= SPAM_CFG["short_len"]:
-        cnt = sum(1 for ts, nm, c, l, r in dq if now - ts <= SPAM_CFG["window_short_s"] and c == ch and l <= SPAM_CFG["short_len"])
+        cnt = sum(1 for ts, nm, c, l, r in dq 
+                 if now - ts <= SPAM_CFG["window_short_s"] 
+                 and c == ch 
+                 and l <= SPAM_CFG["short_len"])
         if cnt >= SPAM_CFG["short_repeat_th"]:
-            return "짧은 메시지 반복(연타)"
+            _user_violations[uid] += 1
+            return f"짧은 메시지 {cnt}회 연타 ({SPAM_CFG['window_short_s']}초)"
 
-    # 3) 동일 내용 반복(30초/3회 이상)
+    # ──────────────────────────────────────────────────────
+    # 3) 동일/유사 메시지 반복
+    # ──────────────────────────────────────────────────────
+    
+    # 3-a) 완전 동일 메시지
     identical_cnt = sum(1 for ts, nm, c, l, r in dq
-                        if now - ts <= SPAM_CFG["window_identical_s"] and c == ch and nm == norm and nlen >= 1)
+                       if now - ts <= SPAM_CFG["window_identical_s"] 
+                       and c == ch 
+                       and nm == norm 
+                       and nlen >= 2)
     if identical_cnt >= SPAM_CFG["identical_per_30s"]:
-        return "동일/유사 메시지 반복"
+        _user_violations[uid] += 1
+        return f"동일 메시지 {identical_cnt}회 반복 ({SPAM_CFG['window_identical_s']}초)"
+    
+    # 3-b) 유사한 메시지 (75% 이상 유사, 우회 방지 강화)
+    if nlen >= 4:  # 4글자 이상부터 검사 (기존 5에서 강화)
+        similar_cnt = 0
+        for ts, nm, c, l, r in dq:
+            if (now - ts <= SPAM_CFG["window_similar_s"] 
+                and c == ch 
+                and nm != norm  # 완전 동일은 이미 위에서 체크
+                and _similarity_ratio(norm, nm) >= SPAM_CFG["similar_threshold"]):
+                similar_cnt += 1
+        
+        if similar_cnt >= SPAM_CFG["similar_per_30s"]:
+            _user_violations[uid] += 1
+            return f"유사 메시지 {similar_cnt}회 반복 ({SPAM_CFG['window_similar_s']}초)"
 
-    # 4) 발화량 과다(10초에 6회 이상)
-    rate_cnt = sum(1 for ts, nm, c, l, r in dq if now - ts <= SPAM_CFG["window_rate_s"] and c == ch)
-    if rate_cnt >= SPAM_CFG["max_msgs_per_10s"]:
-        return "과도한 연속 발화"
+    # ──────────────────────────────────────────────────────
+    # 4) 발화량 과다 (속도 제한) - 다중 윈도우 검사
+    # ──────────────────────────────────────────────────────
+    
+    # 4-a) 10초 윈도우
+    rate_10s = sum(1 for ts, nm, c, l, r in dq 
+                   if now - ts <= SPAM_CFG["window_rate_s"] and c == ch)
+    if rate_10s >= SPAM_CFG["max_msgs_per_10s"]:
+        _user_violations[uid] += 1
+        return f"과도한 연속 발화 ({rate_10s}회/10초)"
+    
+    # 4-b) 30초 윈도우 (더 심각한 도배)
+    rate_30s = sum(1 for ts, nm, c, l, r in dq 
+                   if now - ts <= SPAM_CFG["window_rate_30s"] and c == ch)
+    if rate_30s >= SPAM_CFG["max_msgs_per_30s"]:
+        _user_violations[uid] += 1
+        return f"심각한 도배 감지 ({rate_30s}회/30초)"
+    
+    # 4-c) 60초 윈도우 (장기적 도배 패턴, 우회 방지)
+    rate_60s = sum(1 for ts, nm, c, l, r in dq 
+                   if now - ts <= SPAM_CFG["window_rate_60s"] and c == ch)
+    if rate_60s >= SPAM_CFG["max_msgs_per_60s"]:
+        _user_violations[uid] += 1
+        return f"지속적 과다 발화 ({rate_60s}회/60초)"
 
+    # 위반 없음
     return None
 
 # ────── 환경 변수 로드 ──────
