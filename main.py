@@ -19,7 +19,7 @@ from typing import Optional, List, Union, Dict
 from concurrent.futures import ThreadPoolExecutor
 import urllib.parse, textwrap
 from bs4 import BeautifulSoup  
-from duckduckgo_search import DDGS 
+from ddgs import DDGS 
 from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Set, Tuple
@@ -43,6 +43,7 @@ def log_ex(ctx: str, e: Exception) -> None:
 # 미디어/이모지 업로드를 막을 사용자 ID 목록 
 BLOCK_MEDIA_USER_IDS = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
+    855749166764654653,
 
     # 987654321098765432,  # 필요시 추가
 }
@@ -444,23 +445,71 @@ def check_spam_and_reason(message) -> Optional[str]:
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
-# ─── DuckDuckGo 설정 ──────────────────────────────────
-DDG_LITE = "https://lite.duckduckgo.com/lite/"
-UA = {"User-Agent": "Mozilla/5.0 tbBot3rd"}
+# ─── 검색 엔진 설정 ──────────────────────────────────
+# Wikipedia API (안정적, 무료, 무제한)
 
-# 1) DuckDuckGo → 상위 k개 URL 추출 (최대 10)
+# 동기 작업을 위한 executor
+_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="search_")
+
+def _wiki_search(query: str, k: int) -> List[str]:
+    try:
+        import requests
+        
+        # User-Agent 설정 (필수)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        
+        # 한국어 Wikipedia에서 먼저 검색
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "srwhat": "text",
+            "srlimit": k,
+            "format": "json",
+        }
+        resp = requests.get("https://ko.wikipedia.org/w/api.php", params=params, headers=headers, timeout=5)
+        resp.raise_for_status()
+        results = resp.json().get("query", {}).get("search", [])
+        
+        # 결과가 없으면 영어 Wikipedia 시도
+        if not results:
+            resp = requests.get("https://en.wikipedia.org/w/api.php", params=params, headers=headers, timeout=5)
+            resp.raise_for_status()
+            results = resp.json().get("query", {}).get("search", [])
+            lang = "en"
+        else:
+            lang = "ko"
+        
+        # Wikipedia 페이지 URL로 변환
+        base_url = "https://ko.wikipedia.org/wiki" if lang == "ko" else "https://en.wikipedia.org/wiki"
+        urls = [f"{base_url}/{r['title'].replace(' ', '_')}" for r in results]
+        
+        logging.debug(f"Wikipedia 검색 성공: {query} ({lang}) - {len(urls)}개 결과")
+        return urls
+    except Exception as e:
+        logging.error(f"Wikipedia search error: {e}")
+        return []
+
+def _sync_search(query: str, k: int) -> List[str]:
+    # Wikipedia로 검색
+    results = _wiki_search(query, k)
+    
+    if not results:
+        logging.warning(f"검색 결과 없음: {query}")
+    
+    return results
+
+# 1) 검색 엔진 → 상위 k개 URL 추출 (비동기 래퍼)
+async def search_top_links(query: str, k: int = 15) -> List[str]:
+    """비동기 검색 (Wikipedia API)"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _sync_search, query, k)
+
+# 2) 이전 호환성 유지
 async def ddg_top_links(query: str, k: int = 15) -> List[str]:
-
-    with DDGS() as ddg:
-        return [
-            r["href"]
-            for r in ddg.text(
-                query,
-                region="kr-kr",
-                safesearch="moderate",
-                max_results=k,
-            )
-        ]
+    return await search_top_links(query, k)
 
 # 2) jina.ai 한글 요약 (200~300 자 이내로 압축)
 async def jina_summary(url: str) -> Optional[str]:
@@ -495,7 +544,7 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
 
     try:
         # 시작하자마자 쿨다운 체크(이미 최근에 보냈으면 즉시 종료)
-        now_ts = datetime.datetime.utcnow().timestamp()
+        now_ts = time.time()
         last_ts = _last_typing_notice.get(user.id)
         if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
             return
@@ -509,7 +558,7 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
                 return
 
         # 전송 직전 한 번 더 쿨다운 체크(경쟁 상태 방지)
-        now_ts = datetime.datetime.utcnow().timestamp()
+        now_ts = time.time()
         last_ts = _last_typing_notice.get(user.id)
         if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
             return
@@ -1047,7 +1096,7 @@ async def on_typing(channel: ChannelT, user: UserT, when):
         return
 
     # 쿨다운 중이면 태스크 자체를 만들지 않음 (불필요한 작업 방지)
-    now_ts = datetime.datetime.utcnow().timestamp()
+    now_ts = time.time()
     last_ts = _last_typing_notice.get(user.id)
     if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
         return
@@ -1304,36 +1353,25 @@ async def on_message(message: discord.Message):
                          message.channel.id, hot)
 
 #검색 기능
-@bot.command(name="web", help="!web <검색어> — Ai 요약")
+@bot.command(name="web", help="!web <검색어> — AI X Wikipedia")
 async def web(ctx: commands.Context, *, query: Optional[str] = None):
     if not query:
-        return await ctx.reply("❗ 사용법: `!web <검색어>`")
+        return await ctx.reply("사용법: `!web <검색어>`")
     # ... 나머지 로직 동일 ...
 
     async with ctx.typing():
-        # ① 검색 → 링크 수집
         try:
-            links = await ddg_top_links(query, k=5)
+            links = await search_top_links(query, k=10)
             if not links:
-                raise RuntimeError("검색 결과가 없습니다.")
+                return await ctx.reply(f"No results for: {query}")
         except Exception as e:
-            return await ctx.reply(f"⚠️ 검색 실패: {e}")
+            return await ctx.reply(f"Search error: {e}")
 
-        # ② URL 별 요약 (동시 실행)
-        summaries = await asyncio.gather(*(jina_summary(u) for u in links))
-
-    # ③ Embed 구성
-    desc = ""
-    view = View(timeout=None)
-    for i, (url, summ) in enumerate(zip(links, summaries), 1):
-        if not summ:
-            continue
-        desc += f"**{i}.** {summ}\n\n"
-        view.add_item(Button(style=discord.ButtonStyle.link,
-                             label=str(i), url=url))
-
-    if not desc:
-        desc = "⚠️ 도리봇이 모든 페이지 요약을 실패했습니다."
+    # Build result list
+    desc = f"Found {len(links)} results\n\n"
+    for i, url in enumerate(links, 1):
+        title = url.split("/wiki/")[-1].replace("_", " ")
+        desc += f"{i}. [{title}]({url})\n"
 
     embed = (
         discord.Embed(
@@ -1341,8 +1379,13 @@ async def web(ctx: commands.Context, *, query: Optional[str] = None):
             description=desc,
             color=0x00E5FF,
         )
-        .set_footer(text="DuckDuckGo Lite + tbBOT summarizer")
+        .set_footer(text="tbBOT summarizer")
     )
+    
+    view = View(timeout=300)
+    for i, url in enumerate(links[:5], 1):
+        view.add_item(Button(style=discord.ButtonStyle.link, label=f"{i}", url=url))
+    
     await ctx.reply(embed=embed, view=view)
   
 # !img  or  /img  프롬프트 → 그림 그려줌.
