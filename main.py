@@ -42,6 +42,7 @@ def log_ex(ctx: str, e: Exception) -> None:
 # 미디어/이모지 업로드를 막을 사용자 ID 목록 
 BLOCK_MEDIA_USER_IDS = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
+    855749166764654653,
 
     # 987654321098765432,  # 필요시 추가
 }
@@ -450,6 +451,7 @@ load_dotenv()                            # .env → os.environ 으로 주입
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="search_")
 
 def _wiki_search(query: str, k: int) -> List[str]:
+    """Wikipedia API를 사용한 검색 (한국어 위키백과)"""
     try:
         import requests
         
@@ -491,6 +493,7 @@ def _wiki_search(query: str, k: int) -> List[str]:
         return []
 
 def _sync_search(query: str, k: int) -> List[str]:
+    """검색 (Wikipedia만 사용)"""
     # Wikipedia로 검색
     results = _wiki_search(query, k)
     
@@ -507,6 +510,7 @@ async def search_top_links(query: str, k: int = 15) -> List[str]:
 
 # 2) 이전 호환성 유지
 async def ddg_top_links(query: str, k: int = 15) -> List[str]:
+    """구버전 호환 (search_top_links로 리다이렉트)"""
     return await search_top_links(query, k)
 
 # 2) jina.ai 한글 요약 (200~300 자 이내로 압축)
@@ -1172,11 +1176,6 @@ async def on_message(message: discord.Message):
     push_recent_message(message.channel.id, message.clean_content)
     logging.info("[RECENT][ch=%s] %r", message.channel.id, message.clean_content[:80])
 
-    # 1-3 명령어 패스-스루
-    if message.content.lstrip().lower().startswith(("!ask", "/ask", "!img", "/img", "!web", "/web")):
-        await bot.process_commands(message)
-        return
-
     # 1-4) 멘션 / 답장 감지 
     if message.mentions or message.reference:
         try:
@@ -1351,7 +1350,7 @@ async def on_message(message: discord.Message):
                          message.channel.id, hot)
 
 #검색 기능
-@bot.command(name="web", help="!web <검색어> — AI X Wikipedia")
+@bot.command(name="web", help="!web <검색어> — Wikipedia 검색")
 async def web(ctx: commands.Context, *, query: Optional[str] = None):
     if not query:
         return await ctx.reply("사용법: `!web <검색어>`")
