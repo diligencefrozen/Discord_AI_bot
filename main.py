@@ -19,7 +19,6 @@ from typing import Optional, List, Union, Dict
 from concurrent.futures import ThreadPoolExecutor
 import urllib.parse, textwrap
 from bs4 import BeautifulSoup  
-from ddgs import DDGS 
 from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Set, Tuple
