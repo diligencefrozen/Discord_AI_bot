@@ -50,18 +50,31 @@ BLOCK_MEDIA_USER_IDS = {
 # 커스텀 이모지 (<:name:id> 또는 <a:name:id>)
 CUSTOM_EMOJI_RE = re.compile(r"<a?:[A-Za-z0-9_]{2,}:\d{17,22}>")
 
-MEDIA_EXTS = (
-    ".png",".jpg",".jpeg",".gif",".webp",".bmp",".tif",".tiff",
+IMAGE_EXTS = (
+    ".png",".jpg",".jpeg",".gif",".webp",".bmp",".tif",".tiff"
+)
+
+VIDEO_EXTS = (
     ".mp4",".mov",".m4v",".webm",".mkv",".avi",".wmv",".gifv"
 )
 
+def _attachment_is_image(att: discord.Attachment) -> bool:
+    # 이미지 파일만 감지
+    ct = (att.content_type or "").lower()
+    fn = att.filename.lower()
+    return (
+        ct.startswith("image") or
+        any(fn.endswith(ext) for ext in IMAGE_EXTS)
+    )
+
 def _attachment_is_media(att: discord.Attachment) -> bool:
+    # 모든 미디어(이미지+영상) 감지
     ct = (att.content_type or "").lower()
     fn = att.filename.lower()
     return (
         ct.startswith("image") or
         ct.startswith("video") or
-        any(fn.endswith(ext) for ext in MEDIA_EXTS)
+        any(fn.endswith(ext) for ext in IMAGE_EXTS + VIDEO_EXTS)
     )
 
 def _contains_unicode_emoji(s: str) -> bool:
@@ -93,53 +106,46 @@ def _contains_unicode_emoji(s: str) -> bool:
             return True
     return False
 
-def _message_has_blocked_media_or_emoji(msg: discord.Message) -> bool:
-    # 1) 첨부(이미지/영상/기타 미디어)
-    if any(_attachment_is_media(att) for att in msg.attachments):
+def _message_has_blocked_images(msg: discord.Message) -> bool:
+    # 이미지만 차단 (영상, 이모지, 스티커는 허용)
+    # 1) 첨부 중 이미지만 감지
+    if any(_attachment_is_image(att) for att in msg.attachments):
         return True
 
-    # 2) 스티커(=사실상 이미지)
-    if getattr(msg, "stickers", None) and len(msg.stickers) > 0:
-        return True
-    if getattr(msg, "sticker_items", None) and len(msg.sticker_items) > 0:
-        return True
-
-    # 3) 임베드에 이미지/영상(링크 미리보기 포함)
+    # 2) 임베드에 이미지만 차단 (영상/gif는 허용)
     for emb in msg.embeds:
-        if emb.type in ("image", "video", "gifv"):
+        if emb.type == "image":  # 이미지 임베드만
             return True
         if getattr(emb, "image", None) and getattr(emb.image, "url", None):
-            return True
-        if getattr(emb, "video", None) and getattr(emb.video, "url", None):
             return True
         if getattr(emb, "thumbnail", None) and getattr(emb.thumbnail, "url", None):
             return True
 
-    # 4) 이모지(커스텀 + 유니코드)
-    content = msg.content or ""
-    if CUSTOM_EMOJI_RE.search(content) or _contains_unicode_emoji(content):
-        return True
-
     return False
 
-# 감시/제한 알림 디자인 (상수는 아래 '감시/제한 알림 설정' 블록에서 단일 정의)
+def _message_has_blocked_media_or_emoji(msg: discord.Message) -> bool:
+    # 이전 함수 (호환성 유지) - 이미지만 차단
+    return _message_has_blocked_images(msg)
+
+# 감시/제한 알림 디자인 
 
 def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: int, exempt_ch_id: int):
     banner = "███ ▓▒░ **RESTRICTED** ░▒▓ ███"
     if deleted:
-        state = "규정 위반 업로드 **차단됨**"
+        state = "규정 위반 이미지 업로드 **차단됨**"
         note  = (
             "이 사용자는 **제한된 사용자**로 분류되어\n"
             "상시 **모니터링 대상**입니다.\n"
-            "업로드한 이미지/영상/이모지/스티커는\n"
+            "업로드한 **이미지**는\n"
             "**즉시 삭제**되며, 로그로 **기록**됩니다.\n"
+            "영상, 이모지, 스티커는 정상 사용 가능합니다."
         )
     else:
         state = "비-제한 채널 **감시 모드**"
         note  = (
             "여기는 **제한을 일시적으로 면제해주는 채널**입니다.\n"
-            "업로드는 **삭제되지 않지만**, 모든 활동이 **기록**됩니다.\n"
-            "텍스트 사용을 권장하며, 불필요한 미디어/이모지는 자제해 주세요."
+            "모든 업로드는 **삭제되지 않지만**, 모든 활동이 **기록**됩니다.\n"
+            "텍스트 사용을 권장하며, 불필요한 이미지는 자제해 주세요."
         )
 
     desc = (
@@ -152,7 +158,7 @@ def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: in
 
     embed = (
         discord.Embed(
-            title="🛑 제한 사용자 감시 중",
+            title="�️ 제한 사용자 이미지 업로드 감시 중",
             description=desc,
             color=SURVEILLANCE_RED,
             timestamp=datetime.datetime.now(seoul_tz),
@@ -167,7 +173,7 @@ def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: in
     view.add_item(Button(style=discord.ButtonStyle.link, label="비-제한 채널로 이동", emoji="🚧", url=jump_url))
     return embed, view
 
-# 감시/제한 알림 설정
+# 감시/제한 알림 설정 
 PRIMARY_EXEMPT_MEDIA_CH_ID = 1155789990173868122  # 면제 채널(고정)
 EXEMPT_MEDIA_CHANNEL_IDS = {PRIMARY_EXEMPT_MEDIA_CH_ID}  # ← 한 곳에서만 관리
 SURVEILLANCE_RED = 0xFF143C
@@ -179,12 +185,10 @@ _last_surv_notice: Dict[int, float] = {}
 # 도배를 방지하기 위해 구현               
 # 디버그 로그 헬퍼
 def _dbg(*args):
-    """간단한 디버그 출력 함수"""
     logging.debug(" ".join(str(a) for a in args))
 
 # 감시 알림 전송 여부 판단 (쿨다운 체크)
 def _should_send_surv_notice(guild_id: int, ch_id: int, user_id: int) -> bool:
-    """마지막 알림 이후 충분한 시간이 지났는지 확인"""
     now = time.time()
     key = (guild_id, ch_id, user_id)
     last = _last_surv_notice.get(key, 0)
