@@ -511,6 +511,53 @@ def check_spam_and_reason(message) -> Optional[str]:
     # 위반 없음
     return None
 
+# ────────────────────────────────────────────────────────────────────────────
+# Timeout helper 
+# ────────────────────────────────────────────────────────────────────────────
+async def apply_timeout(member: Union[discord.Member, discord.User], minutes: int, *, reason: str = "") -> tuple[bool, str]:
+
+    try:
+        if not isinstance(member, discord.Member) or not getattr(member, "guild", None):
+            return False, "not-a-guild-member"
+
+        me = member.guild.me or member.guild.get_member(getattr(bot.user, "id", 0))
+        if not me:
+            return False, "bot-member-not-found"
+        if not me.guild_permissions.moderate_members:
+            return False, "missing-moderate_members"
+        # 역할 우선순위 체크(소유자 제외)
+        if member != member.guild.owner and member.top_role >= me.top_role:
+            return False, "role-hierarchy"
+
+        until_utc = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+
+        # 1) 최신 API: Member.timeout(until=..., reason=...)
+        if hasattr(member, "timeout"):
+            try:
+                await member.timeout(until=until_utc, reason=reason)
+                return True, "timeout(until)"
+            except TypeError:
+                # 일부 포크는 duration 파라미터 사용
+                try:
+                    await member.timeout(duration=datetime.timedelta(minutes=minutes), reason=reason)
+                    return True, "timeout(duration)"
+                except Exception:
+                    pass
+
+        # 2) 구버전 discord.py: edit(communication_disabled_until=...)
+        try:
+            await member.edit(communication_disabled_until=until_utc, reason=reason)
+            return True, "edit(communication_disabled_until)"
+        except TypeError:
+            # 3) 일부 포크: edit(timed_out_until=...)
+            await member.edit(timed_out_until=until_utc, reason=reason)
+            return True, "edit(timed_out_until)"
+
+    except Exception as e:
+        log_ex("apply_timeout", e)
+        return False, f"exception:{type(e).__name__}"
+
+
 # ────── 환경 변수 로드 ──────
 load_dotenv()                            # .env → os.environ 으로 주입
 
@@ -1308,10 +1355,9 @@ async def on_message(message: discord.Message):
             should_delete = random.random() < deletion_rate
             
             # 5회 위반 시 자동 타임아웃 (10분)
-            if _user_violations[uid] >= SPAM_CFG["auto_timeout_threshold"]:
-                try:
-                    timeout_until = datetime.datetime.now(seoul_tz) + datetime.timedelta(minutes=10)
-                    await message.author.timeout(timeout_until, reason="도배 자동 차단 (5회 위반)")
+            if _user_violations[uid] >= SPAM_CFG["auto_timeout_threshold"] and message.guild:
+                ok, path = await apply_timeout(message.author, 10, reason="도배 자동 차단 (5회 위반)")
+                if ok:
                     await message.channel.send(
                         f"⚠️ {message.author.mention} 님은 반복적인 도배로 인해 10분간 타임아웃되었습니다.",
                         delete_after=15
@@ -1319,8 +1365,8 @@ async def on_message(message: discord.Message):
                     # 위반 카운트 리셋
                     _user_violations[uid] = 0
                     _user_deletion_rate[uid] = 0.0
-                except Exception as e:
-                    logging.error(f"타임아웃 실패: {e}")
+                else:
+                    logging.warning(f"타임아웃 실패(경로={path}). 권한/역할/버전 확인 필요")
             
             # 메시지 삭제 (확률적 또는 5회 위반 시)
             if should_delete or _user_violations[uid] >= SPAM_CFG["auto_timeout_threshold"]:
