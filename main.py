@@ -201,18 +201,18 @@ SPAM_ENABLED = True
 SPAM_CFG = {
     # 메시지 빈도 제어
     "max_msgs_per_10s": 7,        # 10초에 7개 이상 → 도배 (기존 6에서 완화)
-    "max_msgs_per_30s": 15,       # 30초에 15개 이상 → 심각한 도배 (신규)
-    "max_msgs_per_60s": 25,       # 60초에 25개 이상 → 극심한 도배 (신규)
+    "max_msgs_per_30s": 15,       # 30초에 15개 이상 → 심각한 도배 
+    "max_msgs_per_60s": 25,       # 60초에 25개 이상 → 극심한 도배 
     
     # 동일 메시지 반복
     "identical_per_30s": 3,       # 같은 내용 30초에 3회 이상
     "similar_threshold": 0.75,    # 유사도 75% 이상이면 '거의 동일'로 판정 (85%→75% 강화)
-    "similar_per_30s": 4,         # 유사한 내용 30초에 4회 이상 (신규)
+    "similar_per_30s": 4,         # 유사한 내용 30초에 4회 이상 
     
     # 문자 반복 패턴
     "max_char_run": 15,           # 같은 문자 15연속 (기존 12에서 완화)
-    "max_emoji_run": 8,           # 이모지/특수문자 8연속 (신규)
-    "max_char_ratio": 0.6,        # 전체 중 단일 문자 비율 60% 이상 (신규, 우회 방지)
+    "max_emoji_run": 8,           # 이모지/특수문자 8연속 
+    "max_char_ratio": 0.6,        # 전체 중 단일 문자 비율 60% 이상 (우회 방지)
     
     # 압축비 분석
     "min_len_for_ratio": 10,      # 압축비 판정 최소 길이 (15→10 강화)
@@ -232,7 +232,15 @@ SPAM_CFG = {
     
     # 경고 시스템
     "warning_cooldown_s": 45,     # 경고 쿨다운 45초 (기존 30초에서 증가)
-    "auto_timeout_threshold": 5,  # 5회 위반 시 자동 타임아웃 (신규, 미구현)
+    "auto_timeout_threshold": 5,  # 5회 위반 시 자동 타임아웃
+    
+    # 점진적 제한 시스템 (신규)
+    "violation_decay_hours": 2,   # 2시간 후 위반 카운트 리셋
+    "delete_delay_min_s": 2,      # 최소 삭제 지연 (네트워크 오류처럼 보이게)
+    "delete_delay_max_s": 8,      # 최대 삭제 지연
+    "silent_delete_prob": 0.7,    # 70% 확률로 무음 삭제 (경고 없이)
+    "rate_increase_per_violation": 0.15,  # 위반 시마다 삭제율 15% 증가
+    "max_deletion_rate": 0.85,    # 최대 삭제율 85% (완전 차단은 하지 않음)
 }
 
 # 화이트리스트(관리자/로깅/허용 채널 등은 도배 검사 제외하고 싶을 때)
@@ -248,6 +256,8 @@ EXEMPT_SPAM_CHANNEL_IDS = {
 _user_msgs = defaultdict(deque)      # user_id -> deque[(ts, norm, channel_id, len, raw)]
 _last_warn_ts = {}                   # user_id -> ts(last warn)
 _user_violations = defaultdict(int)  # user_id -> violation count (신규)
+_user_last_violation = {}            # user_id -> ts(last violation) - 점진적 제한용
+_user_deletion_rate = defaultdict(float)  # user_id -> 삭제 확률 (0.0~1.0)
 MAX_BUF = 60                         # 버퍼 크기 증가 (기존 50)    
 
 def _normalize_text(s: str) -> str:
@@ -335,6 +345,12 @@ def check_spam_and_reason(message) -> Optional[str]:
     norm = _normalize_text(raw)
     nlen = len(norm)
 
+    # 위반 카운트 감쇠 (2시간마다 리셋)
+    last_violation_ts = _user_last_violation.get(uid, 0)
+    if now - last_violation_ts > SPAM_CFG["violation_decay_hours"] * 3600:
+        _user_violations[uid] = 0
+        _user_deletion_rate[uid] = 0.0
+
     # 버퍼 업데이트(오래된 항목 제거)
     dq = _user_msgs[uid]
     dq.append((now, norm, ch, nlen, raw))
@@ -350,26 +366,51 @@ def check_spam_and_reason(message) -> Optional[str]:
     # 1-a) 문자 반복 (ㅋㅋㅋㅋㅋ, !!!!!!!! 등)
     if nlen >= 1 and _longest_run_len(norm) >= SPAM_CFG["max_char_run"]:
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return f"같은 문자 {SPAM_CFG['max_char_run']}회 이상 반복"
     
     # 1-b) 이모지/특수문자 과다 (!!!!!!@@@### 등)
     if _emoji_run_len(raw) >= SPAM_CFG["max_emoji_run"]:
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return f"특수문자/이모지 {SPAM_CFG['max_emoji_run']}개 이상 연속"
     
     # 1-c) 단일 문자 과다 비율 (ㅋ.ㅋ.ㅋ.ㅋ 같은 우회 방지)
     if nlen >= 5 and _char_frequency_ratio(norm) >= SPAM_CFG["max_char_ratio"]:
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return f"단일 문자 과다 사용 ({int(_char_frequency_ratio(norm)*100)}%)"
     
     # 1-d) 압축비 (반복 패턴 감지)
     if nlen >= SPAM_CFG["min_len_for_ratio"] and _compression_ratio(norm) < SPAM_CFG["compress_ratio_th"]:
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return "과도한 반복 패턴 감지"
     
     # 1-e) 동일 단어 반복 (apple apple apple...)
     if REPEATED_TOKEN.search(raw):
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return "동일 단어 과다 반복"
 
     # ──────────────────────────────────────────────────────
@@ -382,6 +423,11 @@ def check_spam_and_reason(message) -> Optional[str]:
                  and l <= SPAM_CFG["short_len"])
         if cnt >= SPAM_CFG["short_repeat_th"]:
             _user_violations[uid] += 1
+            _user_last_violation[uid] = now
+            _user_deletion_rate[uid] = min(
+                _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+                SPAM_CFG["max_deletion_rate"]
+            )
             return f"짧은 메시지 {cnt}회 연타 ({SPAM_CFG['window_short_s']}초)"
 
     # ──────────────────────────────────────────────────────
@@ -396,6 +442,11 @@ def check_spam_and_reason(message) -> Optional[str]:
                        and nlen >= 2)
     if identical_cnt >= SPAM_CFG["identical_per_30s"]:
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return f"동일 메시지 {identical_cnt}회 반복 ({SPAM_CFG['window_identical_s']}초)"
     
     # 3-b) 유사한 메시지 (75% 이상 유사, 우회 방지 강화)
@@ -410,6 +461,11 @@ def check_spam_and_reason(message) -> Optional[str]:
         
         if similar_cnt >= SPAM_CFG["similar_per_30s"]:
             _user_violations[uid] += 1
+            _user_last_violation[uid] = now
+            _user_deletion_rate[uid] = min(
+                _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+                SPAM_CFG["max_deletion_rate"]
+            )
             return f"유사 메시지 {similar_cnt}회 반복 ({SPAM_CFG['window_similar_s']}초)"
 
     # ──────────────────────────────────────────────────────
@@ -421,6 +477,11 @@ def check_spam_and_reason(message) -> Optional[str]:
                    if now - ts <= SPAM_CFG["window_rate_s"] and c == ch)
     if rate_10s >= SPAM_CFG["max_msgs_per_10s"]:
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return f"과도한 연속 발화 ({rate_10s}회/10초)"
     
     # 4-b) 30초 윈도우 (더 심각한 도배)
@@ -428,6 +489,11 @@ def check_spam_and_reason(message) -> Optional[str]:
                    if now - ts <= SPAM_CFG["window_rate_30s"] and c == ch)
     if rate_30s >= SPAM_CFG["max_msgs_per_30s"]:
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return f"심각한 도배 감지 ({rate_30s}회/30초)"
     
     # 4-c) 60초 윈도우 (장기적 도배 패턴, 우회 방지)
@@ -435,6 +501,11 @@ def check_spam_and_reason(message) -> Optional[str]:
                    if now - ts <= SPAM_CFG["window_rate_60s"] and c == ch)
     if rate_60s >= SPAM_CFG["max_msgs_per_60s"]:
         _user_violations[uid] += 1
+        _user_last_violation[uid] = now
+        _user_deletion_rate[uid] = min(
+            _user_deletion_rate[uid] + SPAM_CFG["rate_increase_per_violation"],
+            SPAM_CFG["max_deletion_rate"]
+        )
         return f"지속적 과다 발화 ({rate_60s}회/60초)"
 
     # 위반 없음
@@ -450,7 +521,7 @@ load_dotenv()                            # .env → os.environ 으로 주입
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="search_")
 
 def _wiki_search(query: str, k: int) -> List[str]:
-    """Wikipedia API를 사용한 검색 (한국어 위키백과)"""
+
     try:
         import requests
         
@@ -492,7 +563,7 @@ def _wiki_search(query: str, k: int) -> List[str]:
         return []
 
 def _sync_search(query: str, k: int) -> List[str]:
-    """검색 (Wikipedia만 사용)"""
+
     # Wikipedia로 검색
     results = _wiki_search(query, k)
     
@@ -503,13 +574,13 @@ def _sync_search(query: str, k: int) -> List[str]:
 
 # 1) 검색 엔진 → 상위 k개 URL 추출 (비동기 래퍼)
 async def search_top_links(query: str, k: int = 15) -> List[str]:
-    """비동기 검색 (Wikipedia API)"""
+
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_executor, _sync_search, query, k)
 
 # 2) 이전 호환성 유지
 async def ddg_top_links(query: str, k: int = 15) -> List[str]:
-    """구버전 호환 (search_top_links로 리다이렉트)"""
+
     return await search_top_links(query, k)
 
 # 2) jina.ai 한글 요약 (200~300 자 이내로 압축)
@@ -1226,19 +1297,73 @@ async def on_message(message: discord.Message):
         except Exception as e:
             log_ex("mention/reply", e)
     
-    # ───── Anti-Spam 선처리 ─────
+    # ───── Anti-Spam 선처리 (점진적 제한 시스템) ─────
     if SPAM_ENABLED and not _is_exempt(message.author, message.channel):
         reason = check_spam_and_reason(message)
         if reason:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            # 경고는 30초에 1회만
-            now = time.time()
-            if now - _last_warn_ts.get(message.author.id, 0) > 30:
-                _last_warn_ts[message.author.id] = now
-                await message.channel.send(f"{message.author.mention} 도배 금지! ({reason})")
+            uid = message.author.id
+            
+            # 점진적 삭제 확률 계산
+            deletion_rate = _user_deletion_rate.get(uid, 0.0)
+            should_delete = random.random() < deletion_rate
+            
+            # 5회 위반 시 자동 타임아웃 (10분)
+            if _user_violations[uid] >= SPAM_CFG["auto_timeout_threshold"]:
+                try:
+                    timeout_until = datetime.datetime.now(seoul_tz) + datetime.timedelta(minutes=10)
+                    await message.author.timeout(timeout_until, reason="도배 자동 차단 (5회 위반)")
+                    await message.channel.send(
+                        f"⚠️ {message.author.mention} 님은 반복적인 도배로 인해 10분간 타임아웃되었습니다.",
+                        delete_after=15
+                    )
+                    # 위반 카운트 리셋
+                    _user_violations[uid] = 0
+                    _user_deletion_rate[uid] = 0.0
+                except Exception as e:
+                    logging.error(f"타임아웃 실패: {e}")
+            
+            # 메시지 삭제 (확률적 또는 5회 위반 시)
+            if should_delete or _user_violations[uid] >= SPAM_CFG["auto_timeout_threshold"]:
+                # 지연 삭제 (네트워크 오류처럼 보이게)
+                delay = random.uniform(
+                    SPAM_CFG["delete_delay_min_s"],
+                    SPAM_CFG["delete_delay_max_s"]
+                )
+                
+                async def delayed_delete():
+                    await asyncio.sleep(delay)
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                
+                asyncio.create_task(delayed_delete())
+                
+                # 무음 삭제 확률 적용 (70%는 경고 없이)
+                if random.random() > SPAM_CFG["silent_delete_prob"]:
+                    now = time.time()
+                    # 경고는 45초에 1회만 (쿨다운)
+                    if now - _last_warn_ts.get(uid, 0) > SPAM_CFG["warning_cooldown_s"]:
+                        _last_warn_ts[uid] = now
+                        # 모호한 경고 메시지 (도배라고 명시하지 않음)
+                        warnings = [
+                            f"{message.author.mention} 메시지 전송 속도를 조절해 주세요.",
+                            f"{message.author.mention} 잠시 후 다시 시도해 주세요.",
+                            f"{message.author.mention} 네트워크 상태를 확인해 주세요.",
+                        ]
+                        await message.channel.send(random.choice(warnings), delete_after=8)
+                
+                logging.info(
+                    f"[SPAM] User {uid} | Violation #{_user_violations[uid]} | "
+                    f"Delete rate: {deletion_rate:.0%} | Reason: {reason}"
+                )
+            else:
+                # 삭제하지 않지만 로그는 남김
+                logging.info(
+                    f"[SPAM-PASS] User {uid} | Violation #{_user_violations[uid]} | "
+                    f"Delete rate: {deletion_rate:.0%} (passed) | Reason: {reason}"
+                )
+            
             return
             
     # ---------------------------------------------
