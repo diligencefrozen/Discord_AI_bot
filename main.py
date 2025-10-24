@@ -37,12 +37,13 @@ XP_CONFIG = {
     "msg_xp": 5,                    # 메시지당 경험치
     "msg_cooldown": 10,             # 경험치 획득 쿨다운 (초)
     "daily_reset_hour": 0,          # 매일 자정에 리셋
-    "reward_tiers": [               # 단계별 리워드
-        {"xp": 50, "name": "🌱 새싹", "reward": "도배 차단 면제 30분"},
-        {"xp": 150, "name": "🌿 싹트기", "reward": "이미지 업로드 제한 면제 1시간"},
-        {"xp": 300, "name": "🌳 성장", "reward": "금칙어 필터 면제 1회"},
-        {"xp": 500, "name": "🌲 거목", "reward": "VIP 배지 + 모든 제한 면제 3시간"},
-        {"xp": 800, "name": "✨ 전설", "reward": "24시간 완전 면제 + 특별 역할"},
+    # reward: description, effect_type, effect_value, duration (minutes, None for permanent)
+    "reward_tiers": [
+        {"xp": 50, "name": "🌱 새싹", "reward": "도배 차단 면제 30분", "effect": {"type": "antispam", "duration": 30}},
+        {"xp": 150, "name": "🌿 싹트기", "reward": "도배 차단 면제 3시간", "effect": {"type": "antispam", "duration": 180}},
+        {"xp": 300, "name": "🌳 성장", "reward": "금칙어 필터 면제 10회", "effect": {"type": "profanity", "count": 10}},
+        {"xp": 500, "name": "🌲 거목", "reward": "VIP 배지 + 모든 제한 면제 3시간", "effect": {"type": "all", "duration": 180}},
+        {"xp": 800, "name": "✨ 전설", "reward": "24시간 완전 면제 + 특별 축하 메시지", "effect": {"type": "all", "duration": 1440, "vip_winner": True}},
     ]
 }
 
@@ -50,7 +51,7 @@ XP_CONFIG = {
 user_xp_data: Dict[int, dict] = {}
 
 def load_xp_data():
-    """경험치 데이터 로드"""
+    # 경험치 데이터 로드
     global user_xp_data
     try:
         if os.path.exists(XP_DATA_FILE):
@@ -131,15 +132,25 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool]:
     data["xp"] += amount
     data["last_msg"] = now
     
-    # 새 티어 도달 체크
+    # 새 티어 도달 체크 및 VIP Winner 플래그
     leveled_up = False
+    new_tier_idx = None
     for i, tier in enumerate(XP_CONFIG["reward_tiers"]):
         if old_xp < tier["xp"] <= data["xp"]:
             leveled_up = True
+            new_tier_idx = i
             break
-    
+
+    # VIP Winner: 최고 등급 달성 시 오늘 첫 메시지에만 플래그
+    if new_tier_idx is not None and new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1:
+        # 최고 등급
+        today = get_today_date()
+        if data.get("vip_winner_date") != today:
+            data["vip_winner_date"] = today
+            data["vip_winner_announced"] = False
+
     save_xp_data()
-    return data["xp"], leveled_up
+    return data["xp"], leveled_up, new_tier_idx
 
 def get_user_xp(user_id: int) -> dict:
     # 사용자 경험치 정보 조회
@@ -174,14 +185,23 @@ def claim_reward(user_id: int, tier_idx: int) -> bool:
     data = user_xp_data.get(user_id)
     if not data:
         return False
-    
     if tier_idx in data.get("claimed", []):
         return False
-    
     tier = XP_CONFIG["reward_tiers"][tier_idx]
     if data["xp"] < tier["xp"]:
         return False
-    
+    # Activate reward effect
+    effect = tier.get("effect", {})
+    now = time.time()
+    rewards = data.setdefault("rewards_active", {})
+    if effect.get("type") == "antispam" or effect.get("type") == "media" or effect.get("type") == "all":
+        duration = effect.get("duration")
+        if duration:
+            rewards[str(tier_idx)] = {"expires_at": now + duration * 60}
+    elif effect.get("type") == "profanity":
+        count = effect.get("count", 1)
+        rewards[str(tier_idx)] = {"count": count}
+    # Mark as claimed
     data["claimed"].append(tier_idx)
     save_xp_data()
     return True
@@ -189,13 +209,22 @@ def claim_reward(user_id: int, tier_idx: int) -> bool:
 def is_user_exempt_from_spam(user_id: int) -> bool:
     # 도배 방지 면제 체크
     data = get_user_xp(user_id)
+    now = time.time()
     rewards = data.get("rewards_active", {})
-    
-    # 50 XP 이상 리워드 체크
-    for tier_idx in [0, 3, 4]:  # 새싹, 거목, 전설
-        if tier_idx in data.get("claimed", []):
-            return True
-    
+    # Check for active antispam effect
+    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        effect = tier.get("effect", {})
+        if effect.get("type") == "antispam":
+            reward = rewards.get(str(tier_idx))
+            if reward and reward.get("expires_at", 0) > now:
+                return True
+    # Also check for all-type effect (full exemption)
+    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        effect = tier.get("effect", {})
+        if effect.get("type") == "all":
+            reward = rewards.get(str(tier_idx))
+            if reward and reward.get("expires_at", 0) > now:
+                return True
     return False
 
 def is_user_exempt_from_media(user_id: int) -> bool:
@@ -203,27 +232,43 @@ def is_user_exempt_from_media(user_id: int) -> bool:
     # 영구 제한 사용자는 면제 불가
     if user_id in BLOCK_MEDIA_USER_IDS:
         return False
-    
     data = get_user_xp(user_id)
-    
-    # 150 XP 이상 리워드 체크
-    for tier_idx in [1, 3, 4]:  # 싹트기, 거목, 전설
-        if tier_idx in data.get("claimed", []):
-            return True
-    
+    now = time.time()
+    rewards = data.get("rewards_active", {})
+    # Check for active media effect
+    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        effect = tier.get("effect", {})
+        if effect.get("type") == "media":
+            reward = rewards.get(str(tier_idx))
+            if reward and reward.get("expires_at", 0) > now:
+                return True
+    # Also check for all-type effect (full exemption)
+    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        effect = tier.get("effect", {})
+        if effect.get("type") == "all":
+            reward = rewards.get(str(tier_idx))
+            if reward and reward.get("expires_at", 0) > now:
+                return True
     return False
 
 def is_user_exempt_from_profanity(user_id: int) -> bool:
     # 금칙어 필터 면제 체크 (1회용)
     data = get_user_xp(user_id)
-    
-    # 300 XP 이상 리워드 체크
-    for tier_idx in [2, 3, 4]:  # 성장, 거목, 전설
-        if tier_idx in data.get("claimed", []):
-            # 1회용이므로 사용 후 제거
-            if "profanity_used" not in data:
+    rewards = data.get("rewards_active", {})
+    # Check for active profanity effect (count-based)
+    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        effect = tier.get("effect", {})
+        if effect.get("type") == "profanity":
+            reward = rewards.get(str(tier_idx))
+            if reward and reward.get("count", 0) > 0:
                 return True
-    
+    # Also check for all-type effect (full exemption)
+    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        effect = tier.get("effect", {})
+        if effect.get("type") == "all":
+            reward = rewards.get(str(tier_idx))
+            if reward and reward.get("expires_at", 0) > time.time():
+                return True
     return False
 
 def use_profanity_pass(user_id: int):
@@ -250,7 +295,7 @@ def log_ex(ctx: str, e: Exception) -> None:
 # 미디어/이모지 업로드를 막을 사용자 ID 목록 
 BLOCK_MEDIA_USER_IDS = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
-
+    855749166764654653,
 
     # 987654321098765432,  # 필요시 추가
 }
@@ -1455,30 +1500,49 @@ async def on_message(message: discord.Message):
 
     # ───── 경험치 획득 (봇이 아닌 경우만) ─────
     if not message.author.bot:
-        xp, leveled_up = add_xp(user_id)
-        
+        xp, leveled_up, new_tier_idx = add_xp(user_id)
         # 레벨업 알림
-        if leveled_up:
-            # 어떤 티어에 도달했는지 확인
-            for i, tier in enumerate(XP_CONFIG["reward_tiers"]):
-                if xp >= tier["xp"] and i not in get_user_xp(user_id).get("claimed", []):
-                    embed = discord.Embed(
-                        title=f"🎉 레벨업! {tier['name']}",
-                        description=(
-                            f"**{message.author.mention}** 님이 **{tier['name']}** 등급에 도달했습니다!\n\n"
-                            f"**현재 경험치:** {xp} XP\n"
-                            f"**보상:** {tier['reward']}\n\n"
-                            f"💡 `!claim` 명령어로 보상을 수령하세요!\n"
-                            f"⏰ **자정(00:00)에 경험치가 0으로 초기화됩니다!**"
-                        ),
-                        color=0xFFD700,
-                        timestamp=datetime.datetime.now(seoul_tz)
-                    )
-                    embed.set_thumbnail(url=message.author.display_avatar.url)
-                    embed.set_footer(text="⚠️ 매일 자정 하드리셋 | 보상은 당일만 유효")
-                    
-                    await message.channel.send(embed=embed, delete_after=20)
-                    break
+        if leveled_up and new_tier_idx is not None:
+            tier = XP_CONFIG["reward_tiers"][new_tier_idx]
+            embed = discord.Embed(
+                title=f"🎉 레벨업! {tier['name']}",
+                description=(
+                    f"**{message.author.mention}** 님이 **{tier['name']}** 등급에 도달했습니다!\n\n"
+                    f"**현재 경험치:** {xp} XP\n"
+                    f"**보상:** {tier['reward']}\n\n"
+                    f"💡 `!claim` 명령어로 보상을 수령하세요!\n"
+                    f"⏰ **자정(00:00)에 경험치가 0으로 초기화됩니다!**"
+                ),
+                color=0xFFD700,
+                timestamp=datetime.datetime.now(seoul_tz)
+            )
+            embed.set_thumbnail(url=message.author.display_avatar.url)
+            embed.set_footer(text="⚠️ 매일 자정 하드리셋 | 보상은 당일만 유효")
+            await message.channel.send(embed=embed, delete_after=20)
+
+        # VIP Winner 축하: 최고 등급 달성 후 첫 메시지에만
+        data = get_user_xp(user_id)
+        top_idx = len(XP_CONFIG["reward_tiers"]) - 1
+        if data["xp"] >= XP_CONFIG["reward_tiers"][top_idx]["xp"]:
+            today = get_today_date()
+            if data.get("vip_winner_date") == today and not data.get("vip_winner_announced", False):
+                vip_embed = discord.Embed(
+                    title="🏆 오늘의 VIP Winner!",
+                    description=(
+                        f"✨ **{message.author.mention}** 님이 오늘의 **최고 등급(전설)**에 최초로 도달했습니다!\n\n"
+                        f"모두가 우러러보는 진정한 챔피언!\n"
+                        f"🎉 축하와 환호를 보냅니다! 🎉\n\n"
+                        f"**VIP Winner**는 오늘 하루 동안 숭배의 대상입니다. 👑"
+                    ),
+                    color=0xFFD700,
+                    timestamp=datetime.datetime.now(seoul_tz)
+                )
+                vip_embed.set_thumbnail(url=message.author.display_avatar.url)
+                vip_embed.set_footer(text="✨ VIP Winner는 하루 1회만 선정됩니다!")
+                await message.channel.send(embed=vip_embed)
+                # 플래그 저장
+                user_xp_data[user_id]["vip_winner_announced"] = True
+                save_xp_data()
 
     # ───── 제한 사용자 처리 (경험치 면제 체크 추가) ─────
     # 영구 제한 사용자는 어떠한 경우에도 제한 유지
@@ -1912,8 +1976,20 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.set_footer(text="🔄 매일 자정 하드리셋 | 메시지당 5 XP (10초 쿨다운)")
     
-    # 티어별 보상 목록
-    tiers_info = "\n".join([f"**{t['name']}** ({t['xp']} XP) - {t['reward']}" for t in XP_CONFIG["reward_tiers"]])
+    # 티어별 보상 목록 (효과 정보 포함)
+    tiers_info = ""
+    for t in XP_CONFIG["reward_tiers"]:
+        effect = t.get("effect", {})
+        eff_desc = ""
+        if effect.get("type") == "antispam":
+            eff_desc = f"(도배 면제 {effect.get('duration', '?')}분)"
+        elif effect.get("type") == "media":
+            eff_desc = f"(이미지 업로드 면제 {effect.get('duration', '?')}분)"
+        elif effect.get("type") == "profanity":
+            eff_desc = f"(금칙어 {effect.get('count', '?')}회 면제)"
+        elif effect.get("type") == "all":
+            eff_desc = f"(모든 제한 면제 {effect.get('duration', '?')}분)"
+        tiers_info += f"**{t['name']}** ({t['xp']} XP) - {t['reward']} {eff_desc}\n"
     embed.add_field(name="🏆 등급 정보", value=tiers_info, inline=False)
     
     await ctx.reply(embed=embed)
@@ -2066,11 +2142,20 @@ async def xphelp_command(ctx: commands.Context):
         inline=False
     )
     
-    # 등급 시스템
+    # 등급 시스템 (효과 정보 포함)
     tiers_text = ""
-    for tier in XP_CONFIG["reward_tiers"]:
-        tiers_text += f"**{tier['name']}** - {tier['xp']} XP\n└ {tier['reward']}\n\n"
-    
+    for t in XP_CONFIG["reward_tiers"]:
+        effect = t.get("effect", {})
+        eff_desc = ""
+        if effect.get("type") == "antispam":
+            eff_desc = f"(도배 면제 {effect.get('duration', '?')}분)"
+        elif effect.get("type") == "media":
+            eff_desc = f"(이미지 업로드 면제 {effect.get('duration', '?')}분)"
+        elif effect.get("type") == "profanity":
+            eff_desc = f"(금칙어 {effect.get('count', '?')}회 면제)"
+        elif effect.get("type") == "all":
+            eff_desc = f"(모든 제한 면제 {effect.get('duration', '?')}분)"
+        tiers_text += f"**{t['name']}** - {t['xp']} XP\n└ {t['reward']} {eff_desc}\n\n"
     embed.add_field(
         name="🏆 등급 시스템",
         value=tiers_text,
