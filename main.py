@@ -1376,6 +1376,10 @@ GAME_WARN_RE = re.compile(r'(?:^|[^가-힣])(게임|겜|game|친구)', re.I)
 # ────────────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_message_delete(message: discord.Message):
+    # 봇이 삭제한 메시지는 로그하지 않음
+    if message.author.bot:
+        return
+    
     log_ch_id = CHANNEL_TO_LOG.get(message.channel.id)
     if not log_ch_id:
         return
