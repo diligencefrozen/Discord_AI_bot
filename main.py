@@ -321,7 +321,7 @@ def log_ex(ctx: str, e: Exception) -> None:
 # 미디어/이모지 업로드를 막을 사용자 ID 목록 
 BLOCK_MEDIA_USER_IDS = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
-
+    855749166764654653,
 
     # 987654321098765432,  # 필요시 추가
 }
@@ -2162,20 +2162,28 @@ async def claim_command(ctx: commands.Context):
 
 @bot.command(name="leaderboard", aliases=["lb", "랭킹"], help="!leaderboard — 오늘의 XP 순위")
 async def leaderboard_command(ctx: commands.Context):
-    # 경험치 리더보드
+    # 경험치 리더보드 (서버별 독립 랭킹)
     today = get_today_date()
+    guild = ctx.guild
     
-    # 오늘 날짜의 사용자만 필터링
+    if not guild:
+        await ctx.reply("❌ 이 명령어는 서버에서만 사용할 수 있습니다!")
+        return
+    
+    # 현재 서버의 멤버 ID 목록
+    member_ids = {member.id for member in guild.members}
+    
+    # 오늘 날짜 + 현재 서버 멤버만 필터링
     rankings = []
     for uid, data in user_xp_data.items():
-        if data.get("date") == today and data.get("xp", 0) > 0:
+        if uid in member_ids and data.get("date") == today and data.get("xp", 0) > 0:
             rankings.append((uid, data["xp"]))
     
     # 정렬
     rankings.sort(key=lambda x: x[1], reverse=True)
     
     if not rankings:
-        await ctx.reply("📊 아직 오늘의 활동 기록이 없습니다!")
+        await ctx.reply("📊 아직 이 서버의 오늘 활동 기록이 없습니다!")
         return
     
     # 상위 10명
@@ -2184,8 +2192,12 @@ async def leaderboard_command(ctx: commands.Context):
     
     for i, (uid, xp) in enumerate(rankings[:10], 1):
         try:
-            user = await bot.fetch_user(uid)
-            name = user.display_name
+            member = guild.get_member(uid)
+            if member:
+                name = member.display_name
+            else:
+                user = await bot.fetch_user(uid)
+                name = user.display_name
         except:
             name = f"User#{uid}"
         
@@ -2199,13 +2211,13 @@ async def leaderboard_command(ctx: commands.Context):
         description += f"{medal} **{name}** - {xp} XP ({tier_name})\n"
     
     embed = discord.Embed(
-        title="🏆 오늘의 활동 순위 TOP 10",
+        title=f"🏆 {guild.name} 오늘의 활동 순위 TOP 10",
         description=description,
         color=0xFFD700,
         timestamp=datetime.datetime.now(seoul_tz)
     )
     
-    embed.set_footer(text="🔄 자정에 순위가 0으로 하드리셋됩니다!")
+    embed.set_footer(text=f"🔄 자정 리셋 | {guild.name} 서버 랭킹")
     
     # 요청자 순위
     if ctx.author.id in [uid for uid, _ in rankings]:
