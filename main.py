@@ -23,6 +23,214 @@ from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Set, Tuple
 from discord.errors import NotFound, Forbidden, HTTPException
+import pickle
+
+# ────────────────────────────────────────────────────────────────────────────
+# 24시간 경험치 시스템 (Daily XP & Rewards)
+# ────────────────────────────────────────────────────────────────────────────
+
+XP_DATA_FILE = "daily_xp_data.pkl"
+seoul_tz = timezone("Asia/Seoul")
+
+# 경험치 설정
+XP_CONFIG = {
+    "msg_xp": 5,                    # 메시지당 경험치
+    "msg_cooldown": 10,             # 경험치 획득 쿨다운 (초)
+    "daily_reset_hour": 0,          # 매일 자정에 리셋
+    "reward_tiers": [               # 단계별 리워드
+        {"xp": 50, "name": "🌱 새싹", "reward": "도배 차단 면제 30분"},
+        {"xp": 150, "name": "🌿 싹트기", "reward": "이미지 업로드 제한 면제 1시간"},
+        {"xp": 300, "name": "🌳 성장", "reward": "금칙어 필터 면제 1회"},
+        {"xp": 500, "name": "🌲 거목", "reward": "VIP 배지 + 모든 제한 면제 3시간"},
+        {"xp": 800, "name": "✨ 전설", "reward": "24시간 완전 면제 + 특별 역할"},
+    ]
+}
+
+# 사용자 데이터 구조: {user_id: {"xp": int, "last_msg": timestamp, "date": "YYYY-MM-DD", "claimed": [tier_idx], "rewards_active": {}}}
+user_xp_data: Dict[int, dict] = {}
+
+def load_xp_data():
+    """경험치 데이터 로드"""
+    global user_xp_data
+    try:
+        if os.path.exists(XP_DATA_FILE):
+            with open(XP_DATA_FILE, "rb") as f:
+                user_xp_data = pickle.load(f)
+            logging.info(f"XP 데이터 로드 완료: {len(user_xp_data)}명")
+    except Exception as e:
+        logging.error(f"XP 데이터 로드 실패: {e}")
+        user_xp_data = {}
+
+def save_xp_data():
+    # 경험치 데이터 저장
+    try:
+        with open(XP_DATA_FILE, "wb") as f:
+            pickle.dump(user_xp_data, f)
+    except Exception as e:
+        logging.error(f"XP 데이터 저장 실패: {e}")
+
+def get_today_date() -> str:
+    # 서울 시간 기준 오늘 날짜
+    return datetime.datetime.now(seoul_tz).strftime("%Y-%m-%d")
+
+def reset_daily_xp():
+    # 자정 리셋 체크 및 실행
+    global user_xp_data
+    today = get_today_date()
+    
+    for uid in list(user_xp_data.keys()):
+        data = user_xp_data[uid]
+        if data.get("date") != today:
+            # 새로운 날 - 리셋
+            user_xp_data[uid] = {
+                "xp": 0,
+                "last_msg": 0,
+                "date": today,
+                "claimed": [],
+                "rewards_active": {}
+            }
+    save_xp_data()
+
+def add_xp(user_id: int, amount: int = None) -> tuple[int, bool]:
+    # 경험치 추가
+    # Returns: (현재 xp, 레벨업 여부)
+    
+    if amount is None:
+        amount = XP_CONFIG["msg_xp"]
+    
+    today = get_today_date()
+    now = time.time()
+    
+    # 초기화
+    if user_id not in user_xp_data:
+        user_xp_data[user_id] = {
+            "xp": 0,
+            "last_msg": 0,
+            "date": today,
+            "claimed": [],
+            "rewards_active": {}
+        }
+    
+    data = user_xp_data[user_id]
+    
+    # 날짜 체크 (자정 넘어갔는지)
+    if data["date"] != today:
+        data["xp"] = 0
+        data["claimed"] = []
+        data["date"] = today
+        data["rewards_active"] = {}
+    
+    # 쿨다운 체크
+    if now - data["last_msg"] < XP_CONFIG["msg_cooldown"]:
+        return data["xp"], False
+    
+    # 이전 XP
+    old_xp = data["xp"]
+    
+    # XP 추가
+    data["xp"] += amount
+    data["last_msg"] = now
+    
+    # 새 티어 도달 체크
+    leveled_up = False
+    for i, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        if old_xp < tier["xp"] <= data["xp"]:
+            leveled_up = True
+            break
+    
+    save_xp_data()
+    return data["xp"], leveled_up
+
+def get_user_xp(user_id: int) -> dict:
+    # 사용자 경험치 정보 조회
+    today = get_today_date()
+    
+    if user_id not in user_xp_data:
+        return {"xp": 0, "last_msg": 0, "date": today, "claimed": [], "rewards_active": {}}
+    
+    data = user_xp_data[user_id]
+    
+    # 날짜 체크
+    if data["date"] != today:
+        return {"xp": 0, "last_msg": 0, "date": today, "claimed": [], "rewards_active": {}}
+    
+    return data
+
+def get_available_rewards(user_id: int) -> list:
+    # 받을 수 있는 리워드 목록
+    data = get_user_xp(user_id)
+    xp = data["xp"]
+    claimed = data.get("claimed", [])
+    
+    available = []
+    for i, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        if xp >= tier["xp"] and i not in claimed:
+            available.append((i, tier))
+    
+    return available
+
+def claim_reward(user_id: int, tier_idx: int) -> bool:
+    # 리워드 수령
+    data = user_xp_data.get(user_id)
+    if not data:
+        return False
+    
+    if tier_idx in data.get("claimed", []):
+        return False
+    
+    tier = XP_CONFIG["reward_tiers"][tier_idx]
+    if data["xp"] < tier["xp"]:
+        return False
+    
+    data["claimed"].append(tier_idx)
+    save_xp_data()
+    return True
+
+def is_user_exempt_from_spam(user_id: int) -> bool:
+    # 도배 방지 면제 체크
+    data = get_user_xp(user_id)
+    rewards = data.get("rewards_active", {})
+    
+    # 50 XP 이상 리워드 체크
+    for tier_idx in [0, 3, 4]:  # 새싹, 거목, 전설
+        if tier_idx in data.get("claimed", []):
+            return True
+    
+    return False
+
+def is_user_exempt_from_media(user_id: int) -> bool:
+    # 이미지 제한 면제 체크 (영구 제한 사용자는 제외)
+    # 영구 제한 사용자는 면제 불가
+    if user_id in BLOCK_MEDIA_USER_IDS:
+        return False
+    
+    data = get_user_xp(user_id)
+    
+    # 150 XP 이상 리워드 체크
+    for tier_idx in [1, 3, 4]:  # 싹트기, 거목, 전설
+        if tier_idx in data.get("claimed", []):
+            return True
+    
+    return False
+
+def is_user_exempt_from_profanity(user_id: int) -> bool:
+    # 금칙어 필터 면제 체크 (1회용)
+    data = get_user_xp(user_id)
+    
+    # 300 XP 이상 리워드 체크
+    for tier_idx in [2, 3, 4]:  # 성장, 거목, 전설
+        if tier_idx in data.get("claimed", []):
+            # 1회용이므로 사용 후 제거
+            if "profanity_used" not in data:
+                return True
+    
+    return False
+
+def use_profanity_pass(user_id: int):
+    # 금칙어 면제권 사용
+    if user_id in user_xp_data:
+        user_xp_data[user_id]["profanity_used"] = True
+        save_xp_data()
 
 # 금칙어 검열 기능의 버그를 해결하기 위한 임기응변 
 async def safe_delete(message: discord.Message):
@@ -42,6 +250,7 @@ def log_ex(ctx: str, e: Exception) -> None:
 # 미디어/이모지 업로드를 막을 사용자 ID 목록 
 BLOCK_MEDIA_USER_IDS = {
     638365017883934742,  # 예시: Apple iPhone 16 Pro
+    855749166764654653,
 
     # 987654321098765432,  # 필요시 추가
 }
@@ -136,15 +345,22 @@ def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: in
             "이 사용자는 **제한된 사용자**로 분류되어\n"
             "상시 **모니터링 대상**입니다.\n"
             "업로드한 **이미지**는\n"
-            "**즉시 삭제**되며, 로그로 **기록**됩니다.\n"
-            "영상, 이모지, 스티커는 정상 사용 가능합니다."
+            "**즉시 삭제**되며, 로그로 **기록**됩니다.\n\n"
+            "✅ **영상(mp4, mov 등)**: 정상 사용 가능\n"
+            "❌ **이미지(png, jpg 등)**: 차단됨\n"
+            "✅ **이모지, 스티커**: 정상 사용 가능\n\n"
+            f"💡 **면제 채널 <#{exempt_ch_id}>**에서는 이미지도 올릴 수 있습니다!"
         )
     else:
         state = "비-제한 채널 **감시 모드**"
         note  = (
             "여기는 **제한을 일시적으로 면제해주는 채널**입니다.\n"
-            "모든 업로드는 **삭제되지 않지만**, 모든 활동이 **기록**됩니다.\n"
-            "텍스트 사용을 권장하며, 불필요한 이미지는 자제해 주세요."
+            "모든 업로드는 **삭제되지 않지만**, 모든 활동이 **기록**됩니다.\n\n"
+            "📝 이 채널에서는:\n"
+            "✅ 이미지 업로드 가능\n"
+            "✅ 영상 업로드 가능\n"
+            "✅ 모든 미디어 사용 가능\n\n"
+            "💬 텍스트 사용을 권장하며, 불필요한 업로드는 자제해 주세요."
         )
 
     desc = (
@@ -157,13 +373,13 @@ def make_surveillance_embed(user: discord.Member, *, deleted: bool, guild_id: in
 
     embed = (
         discord.Embed(
-            title="�️ 제한 사용자 이미지 업로드 감시 중",
+            title="🛡️ 제한 사용자 이미지 업로드 감시 중",
             description=desc,
             color=SURVEILLANCE_RED,
             timestamp=datetime.datetime.now(seoul_tz),
         )
         .set_thumbnail(url=user.display_avatar.url)
-        .set_footer(text=f"감시 ID: {user.id} • 정책 위반 자동탐지")
+        .set_footer(text=f"감시 ID: {user.id} • 영상은 허용 | 이미지만 차단")
     )
 
     # 면제 채널로 이동 버튼 (깃드/채널 URL)
@@ -654,7 +870,7 @@ ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
-# ▼ 추가: 12시간 쿨다운과 마지막 안내 시각(UTC timestamp) 저장용
+# 12시간 쿨다운과 마지막 안내 시각(UTC timestamp) 저장용
 TYPE_REMINDER_COOLDOWN = 60 * 60 * 12  # 12 hours
 _last_typing_notice: Dict[int, float] = {}
 
@@ -1237,7 +1453,35 @@ async def on_message(message: discord.Message):
     ch_id    = message.channel.id
     user_id  = message.author.id
 
-    # ───── 제한 사용자 처리 (가장 위쪽) ─────
+    # ───── 경험치 획득 (봇이 아닌 경우만) ─────
+    if not message.author.bot:
+        xp, leveled_up = add_xp(user_id)
+        
+        # 레벨업 알림
+        if leveled_up:
+            # 어떤 티어에 도달했는지 확인
+            for i, tier in enumerate(XP_CONFIG["reward_tiers"]):
+                if xp >= tier["xp"] and i not in get_user_xp(user_id).get("claimed", []):
+                    embed = discord.Embed(
+                        title=f"🎉 레벨업! {tier['name']}",
+                        description=(
+                            f"**{message.author.mention}** 님이 **{tier['name']}** 등급에 도달했습니다!\n\n"
+                            f"**현재 경험치:** {xp} XP\n"
+                            f"**보상:** {tier['reward']}\n\n"
+                            f"💡 `!claim` 명령어로 보상을 수령하세요!\n"
+                            f"⏰ **자정(00:00)에 경험치가 0으로 초기화됩니다!**"
+                        ),
+                        color=0xFFD700,
+                        timestamp=datetime.datetime.now(seoul_tz)
+                    )
+                    embed.set_thumbnail(url=message.author.display_avatar.url)
+                    embed.set_footer(text="⚠️ 매일 자정 하드리셋 | 보상은 당일만 유효")
+                    
+                    await message.channel.send(embed=embed, delete_after=20)
+                    break
+
+    # ───── 제한 사용자 처리 (경험치 면제 체크 추가) ─────
+    # 영구 제한 사용자는 어떠한 경우에도 제한 유지
     if user_id in BLOCK_MEDIA_USER_IDS:
         _dbg("HIT restricted user", user_id, "guild=", guild_id, "channel=", ch_id)
 
@@ -1344,8 +1588,8 @@ async def on_message(message: discord.Message):
         except Exception as e:
             log_ex("mention/reply", e)
     
-    # ───── Anti-Spam 선처리 (점진적 제한 시스템) ─────
-    if SPAM_ENABLED and not _is_exempt(message.author, message.channel):
+    # ───── Anti-Spam 선처리 (점진적 제한 시스템 + 경험치 면제) ─────
+    if SPAM_ENABLED and not _is_exempt(message.author, message.channel) and not is_user_exempt_from_spam(user_id):
         reason = check_spam_and_reason(message)
         if reason:
             uid = message.author.id
@@ -1452,18 +1696,30 @@ async def on_message(message: discord.Message):
             )
         return
 
-    # 4) 금칙어
+    # 4) 금칙어 (경험치 면제 체크 추가)
     EXEMPT_PROFANITY_CHANNEL_IDS = set()  
     root = find_badroot(message.content)
     if root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
-        await safe_delete(message)
-        await message.channel.send(
-            embed=discord.Embed(
-                description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:** {root})",
-                color=0xFF0000,
+        # 금칙어 면제권 체크
+        if is_user_exempt_from_profanity(user_id):
+            use_profanity_pass(user_id)
+            await message.channel.send(
+                embed=discord.Embed(
+                    description=f"✨ {message.author.mention} 님의 금칙어 면제권이 사용되었습니다!",
+                    color=0xFFD700,
+                ),
+                delete_after=5
+            )
+            # 금칙어 필터 통과
+        else:
+            await safe_delete(message)
+            await message.channel.send(
+                embed=discord.Embed(
+                    description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:** {root})",
+                    color=0xFF0000,
                 )
             )
-        return
+            return
 
     # 5) 웃음 상호작용
     if any(k in message.content for k in LAUGH_KEYWORDS):
@@ -1521,7 +1777,6 @@ async def on_message(message: discord.Message):
 async def web(ctx: commands.Context, *, query: Optional[str] = None):
     if not query:
         return await ctx.reply("사용법: `!web <검색어>`")
-    # ... 나머지 로직 동일 ...
 
     async with ctx.typing():
         try:
@@ -1587,6 +1842,274 @@ async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
             return
 
     await ctx.reply(file=discord.File(io.BytesIO(img_bytes), "generated.png"))
+
+# ────────── 경험치 시스템 명령어 ──────────
+@bot.command(name="xp", aliases=["exp", "level"], help="!xp [@유저] — 오늘의 경험치 확인")
+async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = None):
+    target = member or ctx.author
+    data = get_user_xp(target.id)
+    xp = data["xp"]
+    
+    # 현재 티어 찾기
+    current_tier = None
+    next_tier = None
+    
+    for i, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        if xp >= tier["xp"]:
+            current_tier = tier
+        elif next_tier is None:
+            next_tier = tier
+    
+    # 진행도 바
+    if next_tier:
+        progress = (xp - (current_tier["xp"] if current_tier else 0)) / (next_tier["xp"] - (current_tier["xp"] if current_tier else 0))
+        bar_length = 20
+        filled = int(progress * bar_length)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        progress_text = f"{bar} {int(progress * 100)}%"
+    else:
+        progress_text = "✨ 최고 등급 달성!"
+    
+    # 수령 가능한 보상
+    available = get_available_rewards(target.id)
+    reward_text = ""
+    if available:
+        reward_text = "\n\n**🎁 수령 가능한 보상:**\n"
+        for idx, tier in available:
+            reward_text += f"• {tier['name']} - {tier['reward']}\n"
+        reward_text += "\n💡 `!claim` 명령어로 보상을 받으세요!"
+    
+    embed = discord.Embed(
+        title=f"📊 {target.display_name}님의 오늘 활동",
+        description=(
+            f"**현재 경험치:** {xp} XP\n"
+            f"**현재 등급:** {current_tier['name'] if current_tier else '🥚 알'}\n\n"
+            f"**다음 등급:** {next_tier['name'] if next_tier else '✨ 최고 등급'}\n"
+            f"{progress_text}"
+            f"{reward_text}\n\n"
+            f"⚠️ **자정(00:00)에 모든 경험치가 0으로 리셋됩니다!**\n"
+            f"⏰ 보상은 당일 자정까지만 유효합니다."
+        ),
+        color=0x00E5FF,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    # 영구 제한 사용자 표시
+    if target.id in BLOCK_MEDIA_USER_IDS:
+        embed.add_field(
+            name="🚨 계정 상태",
+            value=(
+                "**영구 제한 사용자**\n\n"
+                "❌ 이미지(png, jpg 등): 제한 유지\n"
+                "✅ 영상(mp4, mov 등): 정상 사용 가능\n"
+                "✅ 이모지, 스티커: 정상 사용 가능\n\n"
+                f"💡 면제 채널 <#1155789990173868122>에서는\n"
+                "   이미지도 올릴 수 있습니다!"
+            ),
+            inline=False
+        )
+    
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text="🔄 매일 자정 하드리셋 | 메시지당 5 XP (10초 쿨다운)")
+    
+    # 티어별 보상 목록
+    tiers_info = "\n".join([f"**{t['name']}** ({t['xp']} XP) - {t['reward']}" for t in XP_CONFIG["reward_tiers"]])
+    embed.add_field(name="🏆 등급 정보", value=tiers_info, inline=False)
+    
+    await ctx.reply(embed=embed)
+
+@bot.command(name="claim", help="!claim — 달성한 보상 수령")
+async def claim_command(ctx: commands.Context):
+    """보상 수령"""
+    user_id = ctx.author.id
+    available = get_available_rewards(user_id)
+    
+    if not available:
+        await ctx.reply(
+            embed=discord.Embed(
+                description="❌ 수령 가능한 보상이 없습니다!\n더 많은 메시지를 보내서 경험치를 쌓아보세요. 📝",
+                color=0xFF0000
+            )
+        )
+        return
+    
+    # 가장 높은 티어 보상 수령
+    tier_idx, tier = available[-1]
+    
+    if claim_reward(user_id, tier_idx):
+        # 기본 보상 수령 메시지
+        embed = discord.Embed(
+            title="🎉 보상 수령 완료!",
+            description=(
+                f"**{ctx.author.mention}** 님이 **{tier['name']}** 보상을 받았습니다!\n\n"
+                f"**보상 내용:** {tier['reward']}\n\n"
+                f"✨ 혜택은 오늘 자정까지 유효합니다!\n"
+                f"⚠️ **자정(00:00)에 경험치와 보상이 모두 초기화됩니다!**"
+            ),
+            color=0xFFD700,
+            timestamp=datetime.datetime.now(seoul_tz)
+        )
+        
+        # 영구 제한 사용자 경고
+        if user_id in BLOCK_MEDIA_USER_IDS:
+            embed.add_field(
+                name="⚠️ 특별 안내",
+                value=(
+                    "귀하는 **영구 제한 사용자**로 지정되어 있습니다.\n\n"
+                    "❌ **이미지(png, jpg 등)**: 제한 유지\n"
+                    "✅ **영상(mp4, mov 등)**: 정상 사용 가능\n"
+                    "✅ **이모지, 스티커**: 정상 사용 가능\n\n"
+                    f"💡 **면제 채널 <#1155789990173868122>**에서는\n"
+                    "   이미지도 올릴 수 있습니다!\n\n"
+                    "🎁 다른 혜택(도배 차단 면제 등)은 정상 적용됩니다."
+                ),
+                inline=False
+            )
+        
+        embed.set_thumbnail(url=ctx.author.display_avatar.url)
+        embed.set_footer(text="🔄 매일 자정 하드리셋 | 매일 새로운 도전!")
+        
+        await ctx.reply(embed=embed)
+        
+        # 남은 보상 알림
+        remaining = len(available) - 1
+        if remaining > 0:
+            await ctx.send(
+                f"💡 {ctx.author.mention} 님은 아직 {remaining}개의 보상을 더 받을 수 있습니다! 다시 `!claim`을 입력하세요.",
+                delete_after=10
+            )
+    else:
+        await ctx.reply("⚠️ 보상 수령에 실패했습니다. 다시 시도해주세요.")
+
+@bot.command(name="leaderboard", aliases=["lb", "랭킹"], help="!leaderboard — 오늘의 XP 순위")
+async def leaderboard_command(ctx: commands.Context):
+    """경험치 리더보드"""
+    today = get_today_date()
+    
+    # 오늘 날짜의 사용자만 필터링
+    rankings = []
+    for uid, data in user_xp_data.items():
+        if data.get("date") == today and data.get("xp", 0) > 0:
+            rankings.append((uid, data["xp"]))
+    
+    # 정렬
+    rankings.sort(key=lambda x: x[1], reverse=True)
+    
+    if not rankings:
+        await ctx.reply("📊 아직 오늘의 활동 기록이 없습니다!")
+        return
+    
+    # 상위 10명
+    description = ""
+    medals = ["🥇", "🥈", "🥉"]
+    
+    for i, (uid, xp) in enumerate(rankings[:10], 1):
+        try:
+            user = await bot.fetch_user(uid)
+            name = user.display_name
+        except:
+            name = f"User#{uid}"
+        
+        # 티어 찾기
+        tier_name = "🥚 알"
+        for tier in XP_CONFIG["reward_tiers"]:
+            if xp >= tier["xp"]:
+                tier_name = tier["name"]
+        
+        medal = medals[i-1] if i <= 3 else f"**{i}.**"
+        description += f"{medal} **{name}** - {xp} XP ({tier_name})\n"
+    
+    embed = discord.Embed(
+        title="🏆 오늘의 활동 순위 TOP 10",
+        description=description,
+        color=0xFFD700,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    embed.set_footer(text="🔄 자정에 순위가 0으로 하드리셋됩니다!")
+    
+    # 요청자 순위
+    if ctx.author.id in [uid for uid, _ in rankings]:
+        my_rank = next(i for i, (uid, _) in enumerate(rankings, 1) if uid == ctx.author.id)
+        my_xp = next(xp for uid, xp in rankings if uid == ctx.author.id)
+        embed.add_field(
+            name="📍 내 순위",
+            value=f"**{my_rank}위** - {my_xp} XP",
+            inline=False
+        )
+    
+    await ctx.reply(embed=embed)
+
+@bot.command(name="xphelp", aliases=["경험치도움말"], help="!xphelp — 경험치 시스템 설명")
+async def xphelp_command(ctx: commands.Context):
+    """경험치 시스템 도움말"""
+    embed = discord.Embed(
+        title="📚 경험치 시스템 완벽 가이드",
+        description=(
+            "**✨ 24시간 경험치 시스템에 오신 것을 환영합니다!**\n\n"
+            "메시지를 보내면 경험치를 얻고, 레벨업하면 특별한 혜택을 받을 수 있어요!\n"
+            "**하지만 주의하세요!** 매일 자정(00:00)에 **모든 것이 0으로 리셋**됩니다! ⏰"
+        ),
+        color=0x00E5FF,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    # 경험치 획득 방법
+    embed.add_field(
+        name="💎 경험치 획득 방법",
+        value=(
+            "• 메시지 1개 = **5 XP**\n"
+            "• 쿨다운: **10초** (연속 메시지는 XP 없음)\n"
+            "• 봇 명령어도 XP 획득 가능!\n"
+            "• 이모지, 짧은 메시지도 동일하게 5 XP"
+        ),
+        inline=False
+    )
+    
+    # 등급 시스템
+    tiers_text = ""
+    for tier in XP_CONFIG["reward_tiers"]:
+        tiers_text += f"**{tier['name']}** - {tier['xp']} XP\n└ {tier['reward']}\n\n"
+    
+    embed.add_field(
+        name="🏆 등급 시스템",
+        value=tiers_text,
+        inline=False
+    )
+    
+    # 명령어
+    embed.add_field(
+        name="🎮 명령어",
+        value=(
+            "`!xp` - 내 경험치 확인\n"
+            "`!xp @유저` - 다른 사람 경험치 확인\n"
+            "`!claim` - 보상 수령하기\n"
+            "`!leaderboard` - 오늘의 순위표\n"
+            "`!xphelp` - 이 도움말"
+        ),
+        inline=False
+    )
+    
+    # 중요 안내
+    embed.add_field(
+        name="⚠️ 중요 안내 (필독!)",
+        value=(
+            "🔄 **매일 자정(00:00) 하드리셋!**\n"
+            "   • 모든 경험치가 **0으로 초기화**\n"
+            "   • 받은 보상도 **모두 만료**\n"
+            "   • 순위도 **완전히 리셋**\n\n"
+            "⏰ **당일 한정 이벤트!**\n"
+            "   • 보상은 자정까지만 유효\n"
+            "   • 매일 새로운 경쟁 시작\n"
+            "   • 어제의 영광은 없습니다!\n\n"
+            "💡 **팁:** 꾸준히 활동하면 매일 보상 받기!"
+        ),
+        inline=False
+    )
+    
+    embed.set_footer(text="🔄 다음 리셋: 오늘 자정 00:00 | 매일이 새로운 시작!")
+    
+    await ctx.reply(embed=embed)
 
 # 첨부파일 알리미
 async def describe_attachments(message: discord.Message):
@@ -1686,10 +2209,36 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
 # ────────── 봇 상태 ──────────
 @bot.event
 async def on_ready():
+    # 경험치 데이터 로드
+    load_xp_data()
+    
+    # 자정 리셋 태스크
+    async def daily_reset_task():
+        await bot.wait_until_ready()
+        while not bot.is_closed():
+            now = datetime.datetime.now(seoul_tz)
+            # 다음 자정까지의 시간 계산
+            tomorrow = now + datetime.timedelta(days=1)
+            midnight = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
+            seconds_until_midnight = (midnight - now).total_seconds()
+            
+            await asyncio.sleep(seconds_until_midnight)
+            
+            # 리셋 실행 (조용히)
+            reset_daily_xp()
+            logging.info("일일 경험치 리셋 완료!")
+    
+    bot.loop.create_task(daily_reset_task())
+    
+    # 상태 메시지 로테이션
     presences = cycle([
         "!ask 로 궁금증 해결해요!",
         "!img 로 그림을 그려봐요!",
         "!web 로 웹서핑을 해봐요!",
+        "!xp 로 오늘의 경험치 확인!",
+        "메시지를 보내면 XP 획득! 🎯",
+        "⚠️ 자정에 XP 하드리셋!",
+        "!xphelp 로 경험치 시스템 확인",
     ])
 
     async def rotate():
@@ -1700,8 +2249,22 @@ async def on_ready():
             await asyncio.sleep(30)   # 30초 간격
     bot.loop.create_task(rotate())
 
-    logging.info(f"✅ Logged in as {bot.user} (ID {bot.user.id})")
+    logging.info(f"Logged in as {bot.user} (ID {bot.user.id})")
+    logging.info(f"경험치 시스템 활성화 - {len(user_xp_data)}명 데이터 로드됨")
+
+# ────────── 봇 종료 시 데이터 저장 ──────────
+@bot.event
+async def on_disconnect():
+    save_xp_data()
+    logging.info("경험치 데이터 저장 완료")
 
 # ────────── 실행 ──────────
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    try:
+        bot.run(DISCORD_TOKEN)
+    except KeyboardInterrupt:
+        logging.info("봇 종료 중...")
+        save_xp_data()
+        logging.info("경험치 데이터 저장 완료")
+    finally:
+        save_xp_data()
