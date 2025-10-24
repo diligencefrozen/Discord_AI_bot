@@ -34,21 +34,28 @@ seoul_tz = timezone("Asia/Seoul")
 
 # 경험치 설정
 XP_CONFIG = {
-    "msg_xp": 5,                    # 메시지당 경험치
-    "msg_cooldown": 10,             # 경험치 획득 쿨다운 (초)
+    "msg_xp": 15,                   # 평일 메시지당 경험치
+    "msg_xp_weekend": 25,           # 주말 메시지당 경험치 (금/토/일)
+    "msg_cooldown": 5,              # 경험치 획득 쿨다운 (10초→5초로 단축)
     "daily_reset_hour": 0,          # 매일 자정에 리셋
     # reward: description, effect_type, effect_value, duration (minutes, None for permanent)
     "reward_tiers": [
-        {"xp": 50, "name": "🌱 새싹", "reward": "도배 차단 면제 30분", "effect": {"type": "antispam", "duration": 30}},
-        {"xp": 150, "name": "🌿 싹트기", "reward": "도배 차단 면제 3시간", "effect": {"type": "antispam", "duration": 180}},
-        {"xp": 300, "name": "🌳 성장", "reward": "금칙어 필터 면제 10회", "effect": {"type": "profanity", "count": 10}},
-        {"xp": 500, "name": "🌲 거목", "reward": "VIP 배지 + 모든 제한 면제 3시간", "effect": {"type": "all", "duration": 180}},
-        {"xp": 800, "name": "✨ 전설", "reward": "24시간 완전 면제 + 특별 축하 메시지", "effect": {"type": "all", "duration": 1440, "vip_winner": True}},
+        {"xp": 30, "name": "🌱 새싹", "reward": "도배 차단 면제 30분", "effect": {"type": "antispam", "duration": 30}},  # 메시지 2개
+        {"xp": 90, "name": "🌿 싹트기", "reward": "도배 차단 면제 3시간", "effect": {"type": "antispam", "duration": 180}},  # 메시지 6개
+        {"xp": 180, "name": "🌳 성장", "reward": "금칙어 + 링크 필터 면제 10회", "effect": {"type": "profanity", "count": 10}},  # 메시지 12개
+        {"xp": 300, "name": "🌲 거목", "reward": "VIP 배지 + 모든 제한 면제 3시간", "effect": {"type": "all", "duration": 180}},  # 메시지 20개
+        {"xp": 450, "name": "✨ 전설", "reward": "24시간 완전 면제 + 특별 축하 메시지", "effect": {"type": "all", "duration": 1440, "vip_winner": True}},  # 메시지 30개 (평일), 18개 (주말)
     ]
 }
 
-# 사용자 데이터 구조: {user_id: {"xp": int, "last_msg": timestamp, "date": "YYYY-MM-DD", "claimed": [tier_idx], "rewards_active": {}}}
+# 사용자 데이터 구조: {user_id: {"xp": int, "last_msg": timestamp, "date": "YYYY-MM-DD", "claimed": [tier_idx], "rewards_active": {}, "legendary_on_weekend": bool}}
 user_xp_data: Dict[int, dict] = {}
+
+def is_weekend() -> bool:
+    # 주말 여부 확인 (금요일, 토요일, 일요일)
+    now = datetime.datetime.now(seoul_tz)
+    # weekday(): 월(0), 화(1), 수(2), 목(3), 금(4), 토(5), 일(6)
+    return now.weekday() >= 4  # 금(4), 토(5), 일(6)
 
 def load_xp_data():
     # 경험치 데이터 로드
@@ -92,12 +99,16 @@ def reset_daily_xp():
             }
     save_xp_data()
 
-def add_xp(user_id: int, amount: int = None) -> tuple[int, bool]:
+def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
     # 경험치 추가
-    # Returns: (현재 xp, 레벨업 여부)
+    # Returns: (현재 xp, 레벨업 여부, 새 티어 인덱스 or None)
     
     if amount is None:
-        amount = XP_CONFIG["msg_xp"]
+        # 주말 여부에 따라 경험치 결정
+        if is_weekend():
+            amount = XP_CONFIG["msg_xp_weekend"]
+        else:
+            amount = XP_CONFIG["msg_xp"]
     
     today = get_today_date()
     now = time.time()
@@ -123,7 +134,7 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool]:
     
     # 쿨다운 체크
     if now - data["last_msg"] < XP_CONFIG["msg_cooldown"]:
-        return data["xp"], False
+        return data["xp"], False, None
     
     # 이전 XP
     old_xp = data["xp"]
@@ -143,11 +154,13 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool]:
 
     # VIP Winner: 최고 등급 달성 시 오늘 첫 메시지에만 플래그
     if new_tier_idx is not None and new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1:
-        # 최고 등급
+        # 최고 등급 (전설)
         today = get_today_date()
         if data.get("vip_winner_date") != today:
             data["vip_winner_date"] = today
             data["vip_winner_announced"] = False
+            # 주말에 전설 달성 여부 기록
+            data["legendary_on_weekend"] = is_weekend()
 
     save_xp_data()
     return data["xp"], leveled_up, new_tier_idx
@@ -211,6 +224,12 @@ def is_user_exempt_from_spam(user_id: int) -> bool:
     data = get_user_xp(user_id)
     now = time.time()
     rewards = data.get("rewards_active", {})
+    
+    # 전설 체험 중인지 확인
+    trial = rewards.get("trial")
+    if trial and trial.get("expires_at", 0) > now:
+        return True
+    
     # Check for active antispam effect
     for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
         effect = tier.get("effect", {})
@@ -254,7 +273,14 @@ def is_user_exempt_from_media(user_id: int) -> bool:
 def is_user_exempt_from_profanity(user_id: int) -> bool:
     # 금칙어 필터 면제 체크 (1회용)
     data = get_user_xp(user_id)
+    now = time.time()
     rewards = data.get("rewards_active", {})
+    
+    # 전설 체험 중인지 확인
+    trial = rewards.get("trial")
+    if trial and trial.get("expires_at", 0) > now:
+        return True
+    
     # Check for active profanity effect (count-based)
     for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
         effect = tier.get("effect", {})
@@ -267,7 +293,7 @@ def is_user_exempt_from_profanity(user_id: int) -> bool:
         effect = tier.get("effect", {})
         if effect.get("type") == "all":
             reward = rewards.get(str(tier_idx))
-            if reward and reward.get("expires_at", 0) > time.time():
+            if reward and reward.get("expires_at", 0) > now:
                 return True
     return False
 
@@ -485,17 +511,17 @@ SPAM_CFG = {
     
     # 시간 윈도우
     "window_identical_s": 30,
-    "window_similar_s": 30,       # 유사도 판정 윈도우 (신규)
+    "window_similar_s": 30,       # 유사도 판정 윈도우 
     "window_rate_s": 10,
-    "window_rate_30s": 30,        # 30초 윈도우 (신규)
-    "window_rate_60s": 60,        # 60초 윈도우 (신규)
+    "window_rate_30s": 30,        # 30초 윈도우 
+    "window_rate_60s": 60,        # 60초 윈도우
     "window_short_s": 15,
     
     # 경고 시스템
     "warning_cooldown_s": 45,     # 경고 쿨다운 45초 (기존 30초에서 증가)
     "auto_timeout_threshold": 5,  # 5회 위반 시 자동 타임아웃
     
-    # 점진적 제한 시스템 (신규)
+    # 점진적 제한 시스템 
     "violation_decay_hours": 2,   # 2시간 후 위반 카운트 리셋
     "delete_delay_min_s": 2,      # 최소 삭제 지연 (네트워크 오류처럼 보이게)
     "delete_delay_max_s": 8,      # 최대 삭제 지연
@@ -1504,12 +1530,31 @@ async def on_message(message: discord.Message):
         # 레벨업 알림
         if leveled_up and new_tier_idx is not None:
             tier = XP_CONFIG["reward_tiers"][new_tier_idx]
+            
+            # 전설 등급 + 주말 보너스 체크
+            is_legendary = new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1
+            is_weekend_bonus = is_weekend()
+            
+            # 타이틀 설정
+            if is_legendary and is_weekend_bonus:
+                title = f"🎊 주말 보너스 레벨업! {tier['name']} 🎊"
+            else:
+                title = f"🎉 레벨업! {tier['name']}"
+            
+            # 주말 보너스 메시지
+            weekend_msg = ""
+            if is_weekend_bonus:
+                weekend_msg = "\n🎁 **주말 보너스 적용 중!** (메시지당 25 XP)\n"
+            
             embed = discord.Embed(
-                title=f"🎉 레벨업! {tier['name']}",
+                title=title,
                 description=(
-                    f"**{message.author.mention}** 님이 **{tier['name']}** 등급에 도달했습니다!\n\n"
+                    f"**{message.author.mention}** 님이 **{tier['name']}** 등급에 도달했습니다!\n"
+                    f"{weekend_msg}"
+                    f"\n"
                     f"**현재 경험치:** {xp} XP\n"
-                    f"**보상:** {tier['reward']}\n\n"
+                    f"**보상:** {tier['reward']}\n"
+                    f"\n"
                     f"💡 `!claim` 명령어로 보상을 수령하세요!\n"
                     f"⏰ **자정(00:00)에 경험치가 0으로 초기화됩니다!**"
                 ),
@@ -1526,19 +1571,43 @@ async def on_message(message: discord.Message):
         if data["xp"] >= XP_CONFIG["reward_tiers"][top_idx]["xp"]:
             today = get_today_date()
             if data.get("vip_winner_date") == today and not data.get("vip_winner_announced", False):
-                vip_embed = discord.Embed(
-                    title="🏆 오늘의 VIP Winner!",
-                    description=(
-                        f"✨ **{message.author.mention}** 님이 오늘의 **최고 등급(전설)**에 최초로 도달했습니다!\n\n"
+                # 주말에 전설 달성 여부 체크
+                is_weekend_legend = data.get("legendary_on_weekend", False)
+                
+                if is_weekend_legend:
+                    # 주말 전설 달성
+                    vip_title = "🎊 주말 보너스 VIP Winner! 🎊"
+                    vip_description = (
+                        f"✨ **{message.author.mention}** 님이 **주말 보너스**로 오늘의 **최고 등급(전설)**에 도달했습니다!\n"
+                        f"\n"
+                        f"🎁 **주말 특별 달성!** (메시지당 25 XP 적용)\n"
                         f"모두가 우러러보는 진정한 챔피언!\n"
-                        f"🎉 축하와 환호를 보냅니다! 🎉\n\n"
+                        f"🎉 축하와 환호를 보냅니다! 🎉\n"
+                        f"\n"
+                        f"**주말 보너스 VIP Winner**는 오늘 하루 동안 숭배의 대상입니다. 👑"
+                    )
+                    footer_text = "🎊 주말 보너스로 전설 달성!"
+                else:
+                    # 평일 전설 달성
+                    vip_title = "🏆 진정한 VIP Winner!"
+                    vip_description = (
+                        f"✨ **{message.author.mention}** 님이 오늘의 **최고 등급(전설)**에 도달했습니다!\n"
+                        f"\n"
+                        f"모두가 우러러보는 진정한 챔피언!\n"
+                        f"🎉 축하와 환호를 보냅니다! 🎉\n"
+                        f"\n"
                         f"**VIP Winner**는 오늘 하루 동안 숭배의 대상입니다. 👑"
-                    ),
+                    )
+                    footer_text = "✨ VIP Winner는 하루 1회만 선정됩니다!"
+                
+                vip_embed = discord.Embed(
+                    title=vip_title,
+                    description=vip_description,
                     color=0xFFD700,
                     timestamp=datetime.datetime.now(seoul_tz)
                 )
                 vip_embed.set_thumbnail(url=message.author.display_avatar.url)
-                vip_embed.set_footer(text="✨ VIP Winner는 하루 1회만 선정됩니다!")
+                vip_embed.set_footer(text=footer_text)
                 await message.channel.send(embed=vip_embed)
                 # 플래그 저장
                 user_xp_data[user_id]["vip_winner_announced"] = True
@@ -1749,18 +1818,29 @@ async def on_message(message: discord.Message):
                                                embed=embed, view=view)
                     return
             
-    # 3) 링크 삭제
+    # 3) 링크 삭제 
     if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:
-        await safe_delete(message)
-        await message.channel.send(
-            embed=discord.Embed(
-                description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요.",
-                color=0xFF0000,
-                )
+        # 경험치 면제 : 금칙어 면제권이 있으면 링크도 허용
+        if not is_user_exempt_from_profanity(user_id):
+            await safe_delete(message)
+            await message.channel.send(
+                embed=discord.Embed(
+                    description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요.\n💡 **팁**: 경험치를 모아 금칙어 면제권을 받으면 링크도 올릴 수 있습니다!",
+                    color=0xFF0000,
+                ),
+                delete_after=8
             )
-        return
+            return
+        else:
+            # 면제권 있음 - 링크 허용 (간단한 알림)
+            await message.add_reaction("🔗")  # 링크 이모지 반응
+            await message.channel.send(
+                f"✨ {message.author.mention} 님의 링크 검열 면제권이 사용되었습니다!",
+                delete_after=5
+            )
+            logging.info(f"[LINK_EXEMPT] {message.author} (ID:{user_id}) - 링크 검열 면제권으로 링크 허용")
 
-    # 4) 금칙어 (경험치 면제 체크 추가)
+    # 4) 금칙어 (경험치 면제 추가)
     EXEMPT_PROFANITY_CHANNEL_IDS = set()  
     root = find_badroot(message.content)
     if root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
@@ -1924,15 +2004,18 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
         elif next_tier is None:
             next_tier = tier
     
-    # 진행도 바
+    # 진행도 바 
     if next_tier:
         progress = (xp - (current_tier["xp"] if current_tier else 0)) / (next_tier["xp"] - (current_tier["xp"] if current_tier else 0))
-        bar_length = 20
+        bar_length = 10  
         filled = int(progress * bar_length)
         bar = "█" * filled + "░" * (bar_length - filled)
         progress_text = f"{bar} {int(progress * 100)}%"
+        next_xp_needed = next_tier["xp"] - xp
+        progress_detail = f"다음 등급까지 {next_xp_needed} XP"
     else:
-        progress_text = "✨ 최고 등급 달성!"
+        progress_text = "✨ 완료!"
+        progress_detail = "최고 등급 달성"
     
     # 수령 가능한 보상
     available = get_available_rewards(target.id)
@@ -1944,15 +2027,15 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
         reward_text += "\n💡 `!claim` 명령어로 보상을 받으세요!"
     
     embed = discord.Embed(
-        title=f"📊 {target.display_name}님의 오늘 활동",
+        title=f"📊 {target.display_name}",
         description=(
-            f"**현재 경험치:** {xp} XP\n"
-            f"**현재 등급:** {current_tier['name'] if current_tier else '🥚 알'}\n\n"
-            f"**다음 등급:** {next_tier['name'] if next_tier else '✨ 최고 등급'}\n"
-            f"{progress_text}"
-            f"{reward_text}\n\n"
-            f"⚠️ **자정(00:00)에 모든 경험치가 0으로 리셋됩니다!**\n"
-            f"⏰ 보상은 당일 자정까지만 유효합니다."
+            f"**{xp} XP** │ {current_tier['name'] if current_tier else '🥚 알'}\n"
+            f"\n"
+            f"▸ {next_tier['name'] if next_tier else '완료'}\n"
+            f"{progress_text} ({progress_detail})"
+            f"{reward_text}"
+            f"\n"
+            f"⚠️ 자정(00:00) 리셋 │ ⏰ 보상 당일만 유효"
         ),
         color=0x00E5FF,
         timestamp=datetime.datetime.now(seoul_tz)
@@ -1963,10 +2046,12 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
         embed.add_field(
             name="🚨 계정 상태",
             value=(
-                "**영구 제한 사용자**\n\n"
+                "**영구 제한 사용자**\n"
+                "\n"
                 "❌ 이미지(png, jpg 등): 제한 유지\n"
                 "✅ 영상(mp4, mov 등): 정상 사용 가능\n"
-                "✅ 이모지, 스티커: 정상 사용 가능\n\n"
+                "✅ 이모지, 스티커: 정상 사용 가능\n"
+                "\n"
                 f"💡 면제 채널 <#1155789990173868122>에서는\n"
                 "   이미지도 올릴 수 있습니다!"
             ),
@@ -1974,29 +2059,42 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
         )
     
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.set_footer(text="🔄 매일 자정 하드리셋 | 메시지당 5 XP (10초 쿨다운)")
     
-    # 티어별 보상 목록 (효과 정보 포함)
+    # 주말 보너스 표시
+    if is_weekend():
+        footer_text = "🎊 주말 보너스! 메시지당 25 XP | 5초 쿨다운"
+    else:
+        footer_text = "메시지당 15 XP | 5초 쿨다운 | 자정 리셋"
+    
+    embed.set_footer(text=footer_text)
+    
+    # 티어별 보상 목록 (효과 정보 포함) - 간결하게
     tiers_info = ""
     for t in XP_CONFIG["reward_tiers"]:
-        effect = t.get("effect", {})
-        eff_desc = ""
-        if effect.get("type") == "antispam":
-            eff_desc = f"(도배 면제 {effect.get('duration', '?')}분)"
-        elif effect.get("type") == "media":
-            eff_desc = f"(이미지 업로드 면제 {effect.get('duration', '?')}분)"
-        elif effect.get("type") == "profanity":
-            eff_desc = f"(금칙어 {effect.get('count', '?')}회 면제)"
-        elif effect.get("type") == "all":
-            eff_desc = f"(모든 제한 면제 {effect.get('duration', '?')}분)"
-        tiers_info += f"**{t['name']}** ({t['xp']} XP) - {t['reward']} {eff_desc}\n"
-    embed.add_field(name="🏆 등급 정보", value=tiers_info, inline=False)
+        tiers_info += f"{t['xp']} XP → {t['name']}\n"
+    embed.add_field(name="🏆 등급", value=tiers_info.strip(), inline=True)
+    
+    # 현재 활성화된 보상 표시
+    active_rewards = []
+    now = time.time()
+    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
+        reward = data.get("rewards_active", {}).get(str(tier_idx))
+        if reward and reward.get("expires_at", 0) > now:
+            time_left = int((reward["expires_at"] - now) / 60)
+            active_rewards.append(f"{tier['name']} ({time_left}분 남음)")
+    
+    if active_rewards:
+        embed.add_field(
+            name="✨ 활성 혜택",
+            value="\n".join(active_rewards),
+            inline=True
+        )
     
     await ctx.reply(embed=embed)
 
 @bot.command(name="claim", help="!claim — 달성한 보상 수령")
 async def claim_command(ctx: commands.Context):
-    """보상 수령"""
+    # 보상 수령
     user_id = ctx.author.id
     available = get_available_rewards(user_id)
     
@@ -2017,8 +2115,10 @@ async def claim_command(ctx: commands.Context):
         embed = discord.Embed(
             title="🎉 보상 수령 완료!",
             description=(
-                f"**{ctx.author.mention}** 님이 **{tier['name']}** 보상을 받았습니다!\n\n"
-                f"**보상 내용:** {tier['reward']}\n\n"
+                f"**{ctx.author.mention}** 님이 **{tier['name']}** 보상을 받았습니다!\n"
+                f"\n"
+                f"**보상 내용:** {tier['reward']}\n"
+                f"\n"
                 f"✨ 혜택은 오늘 자정까지 유효합니다!\n"
                 f"⚠️ **자정(00:00)에 경험치와 보상이 모두 초기화됩니다!**"
             ),
@@ -2031,12 +2131,15 @@ async def claim_command(ctx: commands.Context):
             embed.add_field(
                 name="⚠️ 특별 안내",
                 value=(
-                    "귀하는 **영구 제한 사용자**로 지정되어 있습니다.\n\n"
+                    "귀하는 **영구 제한 사용자**로 지정되어 있습니다.\n"
+                    "\n"
                     "❌ **이미지(png, jpg 등)**: 제한 유지\n"
                     "✅ **영상(mp4, mov 등)**: 정상 사용 가능\n"
-                    "✅ **이모지, 스티커**: 정상 사용 가능\n\n"
+                    "✅ **이모지, 스티커**: 정상 사용 가능\n"
+                    "\n"
                     f"💡 **면제 채널 <#1155789990173868122>**에서는\n"
-                    "   이미지도 올릴 수 있습니다!\n\n"
+                    "   이미지도 올릴 수 있습니다!\n"
+                    "\n"
                     "🎁 다른 혜택(도배 차단 면제 등)은 정상 적용됩니다."
                 ),
                 inline=False
@@ -2059,7 +2162,7 @@ async def claim_command(ctx: commands.Context):
 
 @bot.command(name="leaderboard", aliases=["lb", "랭킹"], help="!leaderboard — 오늘의 XP 순위")
 async def leaderboard_command(ctx: commands.Context):
-    """경험치 리더보드"""
+    # 경험치 리더보드
     today = get_today_date()
     
     # 오늘 날짜의 사용자만 필터링
@@ -2118,11 +2221,12 @@ async def leaderboard_command(ctx: commands.Context):
 
 @bot.command(name="xphelp", aliases=["경험치도움말"], help="!xphelp — 경험치 시스템 설명")
 async def xphelp_command(ctx: commands.Context):
-    """경험치 시스템 도움말"""
+    # 경험치 시스템 도움말
     embed = discord.Embed(
         title="📚 경험치 시스템 완벽 가이드",
         description=(
-            "**✨ 24시간 경험치 시스템에 오신 것을 환영합니다!**\n\n"
+            "**✨ 24시간 경험치 시스템에 오신 것을 환영합니다!**\n"
+            "\n"
             "메시지를 보내면 경험치를 얻고, 레벨업하면 특별한 혜택을 받을 수 있어요!\n"
             "**하지만 주의하세요!** 매일 자정(00:00)에 **모든 것이 0으로 리셋**됩니다! ⏰"
         ),
@@ -2134,10 +2238,11 @@ async def xphelp_command(ctx: commands.Context):
     embed.add_field(
         name="💎 경험치 획득 방법",
         value=(
-            "• 메시지 1개 = **5 XP**\n"
-            "• 쿨다운: **10초** (연속 메시지는 XP 없음)\n"
+            "• **평일 (월~목)**: 메시지당 **15 XP**\n"
+            "• **주말 (금~일)**: 메시지당 **25 XP** 🎊\n"
+            "• 쿨다운: **5초** (연속 메시지는 XP 없음)\n"
             "• 봇 명령어도 XP 획득 가능!\n"
-            "• 이모지, 짧은 메시지도 동일하게 5 XP"
+            "• 이모지, 짧은 메시지도 동일하게 적용"
         ),
         inline=False
     )
@@ -2152,10 +2257,14 @@ async def xphelp_command(ctx: commands.Context):
         elif effect.get("type") == "media":
             eff_desc = f"(이미지 업로드 면제 {effect.get('duration', '?')}분)"
         elif effect.get("type") == "profanity":
-            eff_desc = f"(금칙어 {effect.get('count', '?')}회 면제)"
+            eff_desc = f"(금칙어+링크 {effect.get('count', '?')}회 면제)"
         elif effect.get("type") == "all":
             eff_desc = f"(모든 제한 면제 {effect.get('duration', '?')}분)"
-        tiers_text += f"**{t['name']}** - {t['xp']} XP\n└ {t['reward']} {eff_desc}\n\n"
+        tiers_text += f"**{t['name']}** - {t['xp']} XP\n└ {t['reward']} {eff_desc}\n"
+    
+    # 주말 보너스 안내 추가
+    tiers_text += "\n💡 **주말 보너스 (금~일)**: 메시지당 25 XP로 더 빠른 달성!"
+    
     embed.add_field(
         name="🏆 등급 시스템",
         value=tiers_text,
@@ -2170,6 +2279,7 @@ async def xphelp_command(ctx: commands.Context):
             "`!xp @유저` - 다른 사람 경험치 확인\n"
             "`!claim` - 보상 수령하기\n"
             "`!leaderboard` - 오늘의 순위표\n"
+            "`!전설체험` - 전설 등급 1분 체험 (1일 1회) ✨\n"
             "`!xphelp` - 이 도움말"
         ),
         inline=False
@@ -2182,19 +2292,158 @@ async def xphelp_command(ctx: commands.Context):
             "🔄 **매일 자정(00:00) 하드리셋!**\n"
             "   • 모든 경험치가 **0으로 초기화**\n"
             "   • 받은 보상도 **모두 만료**\n"
-            "   • 순위도 **완전히 리셋**\n\n"
+            "   • 순위도 **완전히 리셋**\n"
+            "\n"
+            "🎊 **주말 보너스 (금~일)**\n"
+            "   • 메시지당 25 XP (평일 15 XP)\n"
+            "   • 주말에 전설 달성 시 특별 표시!\n"
+            "   • 평일 달성자와 차별화\n"
+            "\n"
             "⏰ **당일 한정 이벤트!**\n"
             "   • 보상은 자정까지만 유효\n"
             "   • 매일 새로운 경쟁 시작\n"
-            "   • 어제의 영광은 없습니다!\n\n"
+            "   • 어제의 영광은 없습니다!\n"
+            "\n"
+            "✨ **전설 체험 기능!**\n"
+            "   • `!전설체험` 명령어로 1분간 전설 등급 체험\n"
+            "   • 1일 1회만 사용 가능\n"
+            "   • 모든 제한이 해제되는 자유를 느껴보세요!\n"
+            "\n"
             "💡 **팁:** 꾸준히 활동하면 매일 보상 받기!"
         ),
         inline=False
     )
     
-    embed.set_footer(text="🔄 다음 리셋: 오늘 자정 00:00 | 매일이 새로운 시작!")
+    # Footer에 현재 상태 표시
+    if is_weekend():
+        footer_text = "🎊 주말 보너스 진행 중! | 다음 리셋: 오늘 자정 00:00"
+    else:
+        footer_text = "🔄 다음 리셋: 오늘 자정 00:00 | 매일이 새로운 시작!"
+    
+    embed.set_footer(text=footer_text)
     
     await ctx.reply(embed=embed)
+
+@bot.command(name="전설체험", aliases=["legendtrial", "체험"], help="!전설체험 — 전설 등급 1분 체험 (1일 1회)")
+async def legend_trial_command(ctx: commands.Context):
+    # 전설 등급 1분 체험
+    user_id = ctx.author.id
+    today = get_today_date()
+    
+    # 사용자 데이터 확인
+    if user_id not in user_xp_data:
+        user_xp_data[user_id] = {
+            "xp": 0,
+            "last_msg": 0,
+            "date": today,
+            "claimed": [],
+            "rewards_active": {}
+        }
+    
+    data = user_xp_data[user_id]
+    
+    # 오늘 이미 사용했는지 확인
+    if data.get("trial_used_date") == today:
+        await ctx.reply(
+            embed=discord.Embed(
+                title="❌ 체험 불가",
+                description=(
+                    f"{ctx.author.mention} 님은 오늘 이미 전설 체험 티켓을 사용하셨습니다!\n"
+                    f"\n"
+                    f"⏰ **다음 체험 가능 시간**: 내일 자정(00:00) 이후\n"
+                    f"💡 전설 등급을 계속 즐기려면 경험치를 모아 실제로 달성하세요!"
+                ),
+                color=0xFF0000
+            )
+        )
+        return
+    
+    # 이미 전설 등급인지 확인
+    top_tier = XP_CONFIG["reward_tiers"][-1]
+    if data["xp"] >= top_tier["xp"]:
+        await ctx.reply(
+            embed=discord.Embed(
+                title="✨ 이미 전설!",
+                description=(
+                    f"{ctx.author.mention} 님은 이미 **{top_tier['name']}** 등급입니다!\n"
+                    f"\n"
+                    f"체험이 필요 없으시네요! 이미 최고의 혜택을 누리고 계십니다! 👑"
+                ),
+                color=0xFFD700
+            )
+        )
+        return
+    
+    # 체험 활성화
+    now = time.time()
+    trial_duration = 1  # 1분
+    
+    # 특별 체험 리워드 추가
+    rewards = data.setdefault("rewards_active", {})
+    rewards["trial"] = {"expires_at": now + trial_duration * 60}
+    
+    # 사용 기록
+    data["trial_used_date"] = today
+    save_xp_data()
+    
+    # 체험 시작 알림
+    embed = discord.Embed(
+        title="🎊 전설 등급 체험 시작!",
+        description=(
+            f"**{ctx.author.mention}** 님의 1분 전설 체험이 시작되었습니다!\n"
+            f"\n"
+            f"⏱️ **체험 시간**: 1분 (60초)\n"
+            f"✨ **체험 혜택**:\n"
+            f"   • 도배 차단 완전 면제\n"
+            f"   • 금칙어 필터 완전 면제\n"
+            f"   • 링크 제한 완전 면제\n"
+            f"   • 모든 제한 해제\n"
+            f"\n"
+            f"🎯 **체험 목적**: 전설 등급이 얼마나 좋은지 느껴보세요!\n"
+            f"💪 **다음 단계**: 경험치를 모아 진짜 전설 등급 달성하기!\n"
+            f"\n"
+            f"⚠️ **주의사항**:\n"
+            f"   • 1일 1회만 사용 가능\n"
+            f"   • 1분 후 자동 종료\n"
+            f"   • 영구 제한 사용자는 이미지 제한 유지"
+        ),
+        color=0xFFD700,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    embed.set_thumbnail(url=ctx.author.display_avatar.url)
+    embed.set_footer(text="✨ 1분 전설 체험 | 진짜 전설을 달성해보세요!")
+    
+    trial_msg = await ctx.reply(embed=embed)
+    
+    # 1분 후 종료 알림
+    await asyncio.sleep(60)
+    
+    end_embed = discord.Embed(
+        title="⏰ 전설 체험 종료",
+        description=(
+            f"**{ctx.author.mention}** 님의 전설 체험이 종료되었습니다.\n"
+            f"\n"
+            f"어떠셨나요? 전설 등급의 자유로움을 느끼셨나요? 😊\n"
+            f"\n"
+            f"💡 **이 혜택을 계속 누리려면**:\n"
+            f"   • 메시지를 보내 경험치를 모으세요\n"
+            f"   • 평일: 메시지당 15 XP\n"
+            f"   • 주말: 메시지당 25 XP 🎊\n"
+            f"   • 목표: **450 XP** (평일 30개, 주말 18개)\n"
+            f"\n"
+            f"🎯 `!xp` 명령어로 현재 경험치를 확인하고\n"
+            f"   `!xphelp`로 자세한 정보를 확인하세요!\n"
+            f"\n"
+            f"⏰ **다음 체험**: 내일 자정 이후"
+        ),
+        color=0x00E5FF,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    end_embed.set_footer(text="💪 진짜 전설을 향해 달려보세요!")
+    
+    await ctx.send(embed=end_embed)
 
 # 첨부파일 알리미
 async def describe_attachments(message: discord.Message):
