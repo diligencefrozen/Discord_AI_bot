@@ -51,10 +51,6 @@ built for seamless **Korean / English bilingual servers**.
 
 ---
 
-## Future Work
-
-* Replace JSON with an async SQLite persistence layer
-* Add a keyword-trend dashboard with message analytics
 
 ---
 
