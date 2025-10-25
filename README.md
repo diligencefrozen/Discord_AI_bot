@@ -51,9 +51,6 @@ built for seamless **Korean / English bilingual servers**.
 
 ---
 
-
----
-
 ## Summary
 
 > A full-stack Discord bot blending **moderation**, **social interaction**, and **AI summarization** — all fully asynchronous and bilingual-ready.
