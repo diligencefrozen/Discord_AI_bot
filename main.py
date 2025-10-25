@@ -51,6 +51,313 @@ XP_CONFIG = {
 # 사용자 데이터 구조: {user_id: {"xp": int, "last_msg": timestamp, "date": "YYYY-MM-DD", "claimed": [tier_idx], "rewards_active": {}, "legendary_on_weekend": bool}}
 user_xp_data: Dict[int, dict] = {}
 
+# ────────────────────────────────────────────────────────────────────────────
+# 업적 시스템 (Achievement System)
+# ────────────────────────────────────────────────────────────────────────────
+
+ACHIEVEMENTS_FILE = "achievements_data.pkl"
+
+# 업적 정의 (평일 / 주말 조건 분리)
+ACHIEVEMENTS = {
+    # 기본 업적
+    "first_message": {
+        "name": "🎉 첫 발걸음",
+        "description": "첫 메시지 전송",
+        "reward_xp": 50,
+        "condition": {"type": "total_messages", "count": 1, "weekend_count": 1}
+    },
+    "early_bird": {
+        "name": "🌅 일찍 일어난 새",
+        "description": "오전 6시 전에 메시지 전송",
+        "reward_xp": 100,
+        "condition": {"type": "time_range", "start": 0, "end": 6}
+    },
+    "night_owl": {
+        "name": "🦉 올빼미",
+        "description": "자정(00시~03시)에 메시지 전송",
+        "reward_xp": 100,
+        "condition": {"type": "time_range", "start": 0, "end": 3}
+    },
+    
+    # 메시지 수 업적 (주말: 1/3 조건)
+    "msg_10": {
+        "name": "💬 수다쟁이",
+        "description": "메시지 전송 (평일: 10개 / 주말: 3개)",
+        "reward_xp": 75,
+        "condition": {"type": "total_messages", "count": 10, "weekend_count": 3}
+    },
+    "msg_50": {
+        "name": "📢 활동가",
+        "description": "메시지 전송 (평일: 50개 / 주말: 15개)",
+        "reward_xp": 150,
+        "condition": {"type": "total_messages", "count": 50, "weekend_count": 15}
+    },
+    "msg_100": {
+        "name": "🎯 백발백중",
+        "description": "메시지 전송 (평일: 100개 / 주말: 30개)",
+        "reward_xp": 300,
+        "condition": {"type": "total_messages", "count": 100, "weekend_count": 30}
+    },
+    "msg_500": {
+        "name": "⭐ 베테랑",
+        "description": "메시지 전송 (평일: 500개 / 주말: 150개)",
+        "reward_xp": 500,
+        "condition": {"type": "total_messages", "count": 500, "weekend_count": 150}
+    },
+    "msg_1000": {
+        "name": "👑 전문가",
+        "description": "메시지 전송 (평일: 1000개 / 주말: 300개)",
+        "reward_xp": 1000,
+        "condition": {"type": "total_messages", "count": 1000, "weekend_count": 300}
+    },
+    
+    # 일일 활동 업적 (주말: 1/3 조건)
+    "daily_30": {
+        "name": "🔥 열정적인 하루",
+        "description": "하루 메시지 (평일: 30개 / 주말: 10개)",
+        "reward_xp": 200,
+        "condition": {"type": "daily_messages", "count": 30, "weekend_count": 10}
+    },
+    "daily_50": {
+        "name": "💪 활동왕",
+        "description": "하루 메시지 (평일: 50개 / 주말: 15개)",
+        "reward_xp": 350,
+        "condition": {"type": "daily_messages", "count": 50, "weekend_count": 15}
+    },
+    "daily_100": {
+        "name": "🚀 초인",
+        "description": "하루 메시지 (평일: 100개 / 주말: 30개)",
+        "reward_xp": 600,
+        "condition": {"type": "daily_messages", "count": 100, "weekend_count": 30}
+    },
+    
+    # 연속 출석 업적 (주말 보너스 없음 - 연속성이 중요)
+    "streak_3": {
+        "name": "📅 꾸준함의 시작",
+        "description": "3일 연속 출석",
+        "reward_xp": 150,
+        "condition": {"type": "login_streak", "days": 3}
+    },
+    "streak_7": {
+        "name": "🌟 일주일 챔피언",
+        "description": "7일 연속 출석",
+        "reward_xp": 400,
+        "condition": {"type": "login_streak", "days": 7}
+    },
+    "streak_30": {
+        "name": "💎 한 달의 전설",
+        "description": "30일 연속 출석",
+        "reward_xp": 1500,
+        "condition": {"type": "login_streak", "days": 30}
+    },
+    
+    # 레벨 업적
+    "legendary_first": {
+        "name": "✨ 전설의 시작",
+        "description": "전설 등급 최초 달성",
+        "reward_xp": 500,
+        "condition": {"type": "reach_tier", "tier": 4}  # 전설 티어
+    },
+    "legendary_weekend": {
+        "name": "🎊 주말의 전설",
+        "description": "주말에 전설 등급 달성",
+        "reward_xp": 300,
+        "condition": {"type": "legendary_weekend"}
+    },
+    "all_tiers": {
+        "name": "🏆 완전정복",
+        "description": "모든 등급 달성 (누적)",
+        "reward_xp": 800,
+        "condition": {"type": "all_tiers_reached"}
+    },
+    
+    # 특별 업적
+    "first_reward": {
+        "name": "🎁 보상 수령자",
+        "description": "첫 보상 수령",
+        "reward_xp": 100,
+        "condition": {"type": "rewards_claimed", "count": 1}
+    },
+    "collector": {
+        "name": "🗂️ 수집가",
+        "description": "5개 이상의 보상 수령 (누적)",
+        "reward_xp": 250,
+        "condition": {"type": "rewards_claimed", "count": 5}
+    },
+}
+
+# 업적 데이터: {user_id: {"unlocked": [achievement_ids], "progress": {}, "stats": {}}}
+achievements_data: Dict[int, dict] = {}
+
+def load_achievements_data():
+    # 업적 데이터 로드
+    global achievements_data
+    try:
+        if os.path.exists(ACHIEVEMENTS_FILE):
+            with open(ACHIEVEMENTS_FILE, "rb") as f:
+                achievements_data = pickle.load(f)
+            logging.info(f"업적 데이터 로드 완료: {len(achievements_data)}명")
+    except Exception as e:
+        logging.error(f"업적 데이터 로드 실패: {e}")
+        achievements_data = {}
+
+def save_achievements_data():
+    # 업적 데이터 저장
+    try:
+        with open(ACHIEVEMENTS_FILE, "wb") as f:
+            pickle.dump(achievements_data, f)
+    except Exception as e:
+        logging.error(f"업적 데이터 저장 실패: {e}")
+
+def init_user_achievements(user_id: int):
+    # 사용자 업적 데이터 초기화
+    if user_id not in achievements_data:
+        achievements_data[user_id] = {
+            "unlocked": [],
+            "stats": {
+                "total_messages": 0,
+                "daily_messages": 0,
+                "last_message_date": None,
+                "login_streak": 0,
+                "last_login_date": None,
+                "tiers_reached": set(),
+                "rewards_claimed_count": 0,
+                "legendary_weekend_count": 0,
+            }
+        }
+
+def check_achievements(user_id: int, event_type: str = None, **kwargs) -> List[str]:
+    
+    # 업적 체크 및 해금
+    # Returns: 새로 해금된 업적 ID 리스트
+    
+    init_user_achievements(user_id)
+    user_data = achievements_data[user_id]
+    unlocked = user_data["unlocked"]
+    stats = user_data["stats"]
+    newly_unlocked = []
+    
+    now = datetime.datetime.now(seoul_tz)
+    current_hour = now.hour
+    today = get_today_date()
+    
+    # 이벤트 타입별 통계 업데이트
+    if event_type == "message":
+        stats["total_messages"] += 1
+        
+        # 일일 메시지 카운트
+        if stats.get("last_message_date") != today:
+            stats["daily_messages"] = 1
+            stats["last_message_date"] = today
+            
+            # 로그인 스트릭 업데이트
+            last_login = stats.get("last_login_date")
+            if last_login:
+                last_date = datetime.datetime.strptime(last_login, "%Y-%m-%d")
+                today_date = datetime.datetime.strptime(today, "%Y-%m-%d")
+                days_diff = (today_date - last_date).days
+                
+                if days_diff == 1:
+                    stats["login_streak"] += 1
+                elif days_diff > 1:
+                    stats["login_streak"] = 1
+            else:
+                stats["login_streak"] = 1
+            
+            stats["last_login_date"] = today
+        else:
+            stats["daily_messages"] += 1
+    
+    elif event_type == "tier_reached":
+        tier_idx = kwargs.get("tier_idx")
+        if tier_idx is not None:
+            if "tiers_reached" not in stats:
+                stats["tiers_reached"] = set()
+            stats["tiers_reached"].add(tier_idx)
+    
+    elif event_type == "reward_claimed":
+        stats["rewards_claimed_count"] += 1
+    
+    elif event_type == "legendary_weekend":
+        stats["legendary_weekend_count"] += 1
+    
+    # 주말 여부 확인
+    weekend_mode = is_weekend()
+    
+    # 업적 체크
+    for ach_id, ach in ACHIEVEMENTS.items():
+        if ach_id in unlocked:
+            continue
+        
+        condition = ach["condition"]
+        cond_type = condition["type"]
+        achieved = False
+        
+        if cond_type == "total_messages":
+            # 주말이면 weekend_count, 평일이면 count 사용
+            required_count = condition.get("weekend_count", condition["count"]) if weekend_mode else condition["count"]
+            if stats.get("total_messages", 0) >= required_count:
+                achieved = True
+        
+        elif cond_type == "daily_messages":
+            # 주말이면 weekend_count, 평일이면 count 사용
+            required_count = condition.get("weekend_count", condition["count"]) if weekend_mode else condition["count"]
+            if stats.get("daily_messages", 0) >= required_count:
+                achieved = True
+        
+        elif cond_type == "time_range":
+            if condition["start"] <= current_hour < condition["end"]:
+                if event_type == "message":
+                    achieved = True
+        
+        elif cond_type == "login_streak":
+            if stats.get("login_streak", 0) >= condition["days"]:
+                achieved = True
+        
+        elif cond_type == "reach_tier":
+            if condition["tier"] in stats.get("tiers_reached", set()):
+                achieved = True
+        
+        elif cond_type == "legendary_weekend":
+            if stats.get("legendary_weekend_count", 0) >= 1:
+                achieved = True
+        
+        elif cond_type == "all_tiers_reached":
+            total_tiers = len(XP_CONFIG["reward_tiers"])
+            if len(stats.get("tiers_reached", set())) >= total_tiers:
+                achieved = True
+        
+        elif cond_type == "rewards_claimed":
+            # 주말이면 weekend_count, 평일이면 count 사용
+            required_count = condition.get("weekend_count", condition.get("count", 1)) if weekend_mode else condition.get("count", 1)
+            if stats.get("rewards_claimed_count", 0) >= required_count:
+                achieved = True
+        
+        if achieved:
+            unlocked.append(ach_id)
+            newly_unlocked.append(ach_id)
+            # 업적 달성 시 보너스 XP 지급
+            bonus_xp = ach.get("reward_xp", 0)
+            if bonus_xp > 0:
+                add_xp(user_id, bonus_xp)
+    
+    save_achievements_data()
+    return newly_unlocked
+
+def get_user_achievements(user_id: int) -> dict:
+    # 사용자 업적 정보 조회
+    init_user_achievements(user_id)
+    return achievements_data[user_id]
+
+def get_achievement_progress(user_id: int) -> str:
+    # 업적 진행도 문자열 생성
+    init_user_achievements(user_id)
+    user_data = achievements_data[user_id]
+    unlocked = user_data["unlocked"]
+    total = len(ACHIEVEMENTS)
+    
+    return f"{len(unlocked)}/{total} 업적 달성 ({len(unlocked)*100//total}%)"
+
 def is_weekend() -> bool:
     # 주말 여부 확인 (금요일, 토요일, 일요일)
     now = datetime.datetime.now(seoul_tz)
@@ -82,10 +389,11 @@ def get_today_date() -> str:
     return datetime.datetime.now(seoul_tz).strftime("%Y-%m-%d")
 
 def reset_daily_xp():
-    # 자정 리셋 체크 및 실행
-    global user_xp_data
+    # 자정 리셋 체크 및 실행 (경험치 + 업적)
+    global user_xp_data, achievements_data
     today = get_today_date()
     
+    # 경험치 리셋
     for uid in list(user_xp_data.keys()):
         data = user_xp_data[uid]
         if data.get("date") != today:
@@ -98,10 +406,47 @@ def reset_daily_xp():
                 "rewards_active": {}
             }
     save_xp_data()
+    
+    # 업적 리셋 (24시간 하드리셋)
+    for uid in list(achievements_data.keys()):
+        # 업적은 완전히 초기화 (연속 출석 제외)
+        ach_data = achievements_data[uid]
+        old_streak = ach_data.get("stats", {}).get("login_streak", 0)
+        old_last_login = ach_data.get("stats", {}).get("last_login_date", None)
+        
+        # 연속 출석 계산
+        if old_last_login:
+            last_date = datetime.datetime.strptime(old_last_login, "%Y-%m-%d")
+            today_date = datetime.datetime.strptime(today, "%Y-%m-%d")
+            days_diff = (today_date - last_date).days
+            
+            # 2일 이상 차이나면 스트릭 끊김
+            if days_diff > 1:
+                new_streak = 0
+            else:
+                new_streak = old_streak
+        else:
+            new_streak = 0
+        
+        # 업적 데이터 리셋
+        achievements_data[uid] = {
+            "unlocked": [],
+            "stats": {
+                "total_messages": 0,
+                "daily_messages": 0,
+                "last_message_date": None,
+                "login_streak": new_streak,
+                "last_login_date": old_last_login,
+                "tiers_reached": set(),
+                "rewards_claimed_count": 0,
+                "legendary_weekend_count": 0,
+            }
+        }
+    save_achievements_data()
 
-def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
+def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int, list]:
     # 경험치 추가
-    # Returns: (현재 xp, 레벨업 여부, 새 티어 인덱스 or None)
+    # Returns: (현재 xp, 레벨업 여부, 새 티어 인덱스 or None, 새로 달성한 업적 리스트)
     
     if amount is None:
         # 주말 여부에 따라 경험치 결정
@@ -134,7 +479,7 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
     
     # 쿨다운 체크
     if now - data["last_msg"] < XP_CONFIG["msg_cooldown"]:
-        return data["xp"], False, None
+        return data["xp"], False, None, []
     
     # 이전 XP
     old_xp = data["xp"]
@@ -152,6 +497,9 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
             new_tier_idx = i
             break
 
+    # 업적 체크 리스트
+    new_achievements = []
+
     # VIP Winner: 최고 등급 달성 시 오늘 첫 메시지에만 플래그
     if new_tier_idx is not None and new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1:
         # 최고 등급 (전설)
@@ -161,9 +509,20 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
             data["vip_winner_announced"] = False
             # 주말에 전설 달성 여부 기록
             data["legendary_on_weekend"] = is_weekend()
+            
+            # 업적: 주말에 전설 달성
+            if is_weekend():
+                new_achievements.extend(check_achievements(user_id, "legendary_weekend"))
+    
+    # 업적: 티어 도달
+    if new_tier_idx is not None:
+        new_achievements.extend(check_achievements(user_id, "tier_reached", tier_idx=new_tier_idx))
+    
+    # 업적: 메시지 전송
+    new_achievements.extend(check_achievements(user_id, "message"))
 
     save_xp_data()
-    return data["xp"], leveled_up, new_tier_idx
+    return data["xp"], leveled_up, new_tier_idx, new_achievements
 
 def get_user_xp(user_id: int) -> dict:
     # 사용자 경험치 정보 조회
@@ -216,6 +575,10 @@ def claim_reward(user_id: int, tier_idx: int) -> bool:
         rewards[str(tier_idx)] = {"count": count}
     # Mark as claimed
     data["claimed"].append(tier_idx)
+    
+    # 업적: 보상 수령
+    check_achievements(user_id, "reward_claimed")
+    
     save_xp_data()
     return True
 
@@ -1651,7 +2014,44 @@ async def on_message(message: discord.Message):
 
     # ───── 경험치 획득 (봇이 아닌 경우만) ─────
     if not message.author.bot:
-        xp, leveled_up, new_tier_idx = add_xp(user_id)
+        xp, leveled_up, new_tier_idx, new_achievements = add_xp(user_id)
+        
+        # 업적 달성 알림
+        if new_achievements:
+            for ach_id in new_achievements:
+                ach = ACHIEVEMENTS.get(ach_id)
+                if ach:
+                    # 주말 보너스 여부
+                    weekend_bonus = is_weekend()
+                    
+                    # 주말 보너스 메시지 생성
+                    if weekend_bonus:
+                        weekend_info = "\n🎊 **주말 보너스로 달성!** (조건 완화 적용)\n"
+                    else:
+                        weekend_info = ""
+                    
+                    ach_embed = discord.Embed(
+                        title="🏆 업적 달성!" + (" 🎊" if weekend_bonus else ""),
+                        description=(
+                            f"**{message.author.mention}** 님이 업적을 달성했습니다!\n"
+                            f"{weekend_info}"
+                            f"\n"
+                            f"**{ach['name']}**\n"
+                            f"_{ach['description']}_\n"
+                            f"\n"
+                            f"💰 **보너스 XP**: +{ach.get('reward_xp', 0)} XP (즉시 지급)\n"
+                            f"\n"
+                            f"💡 `!업적` 명령어로 전체 업적을 확인하세요!\n"
+                            f"⏰ **주의**: 자정(00:00)에 업적이 초기화됩니다!"
+                        ),
+                        color=0xFFD700 if weekend_bonus else 0x00E5FF,
+                        timestamp=datetime.datetime.now(seoul_tz)
+                    )
+                    ach_embed.set_thumbnail(url=message.author.display_avatar.url)
+                    footer_text = "🎊 주말 보너스 달성!" if weekend_bonus else "⚠️ 24시간 하드리셋!"
+                    ach_embed.set_footer(text=footer_text + " | 매일 새롭게 도전!")
+                    await message.channel.send(embed=ach_embed, delete_after=15)
+        
         # 레벨업 알림
         if leveled_up and new_tier_idx is not None:
             tier = XP_CONFIG["reward_tiers"][new_tier_idx]
@@ -1737,6 +2137,12 @@ async def on_message(message: discord.Message):
                 # 플래그 저장
                 user_xp_data[user_id]["vip_winner_announced"] = True
                 save_xp_data()
+        
+        # 업적 달성 알림 (레벨업 후 체크)
+        # add_xp 함수에서 이미 check_achievements가 호출되었으므로,
+        # 여기서는 최근 달성된 업적만 확인하여 알림
+        # 대신 레벨업과 별개로 업적 체크는 add_xp에서 이미 완료됨
+        # 필요시 여기서 추가 알림 로직 구현 가능
 
     # ───── 제한 사용자 처리 (경험치 면제 체크 추가) ─────
     # 영구 제한 사용자는 어떠한 경우에도 제한 유지
@@ -2620,8 +3026,10 @@ async def legend_trial_command(ctx: commands.Context):
             f"💡 **이 혜택을 계속 누리려면**:\n"
             f"   • 메시지를 보내 경험치를 모으세요\n"
             f"   • 평일: 메시지당 15 XP\n"
-            f"   • 주말: 메시지당 25 XP 🎊\n"
-            f"   • 목표: **450 XP** (평일 30개, 주말 18개)\n"
+            f"   • 주말: 메시지당 45 XP 🎊\n"
+            f"   • 목표: **450 XP** (평일 30개, 주말 10개)\n"
+            f"\n"
+            f"🎊 **주말 보너스**: 업적 달성 조건도 1/3로 완화!\n"
             f"\n"
             f"🎯 `!xp` 명령어로 현재 경험치를 확인하고\n"
             f"   `!xphelp`로 자세한 정보를 확인하세요!\n"
@@ -2635,6 +3043,146 @@ async def legend_trial_command(ctx: commands.Context):
     end_embed.set_footer(text="💪 진짜 전설을 향해 달려보세요!")
     
     await ctx.send(embed=end_embed)
+
+# ────────── 업적 관련 명령어 ──────────
+@bot.command(name="업적", aliases=["achievements", "ach"], help="!업적 [@유저] — 업적 목록 확인")
+async def achievements_command(ctx: commands.Context, member: discord.Member = None):
+    """업적 목록 및 진행도 확인"""
+    target = member or ctx.author
+    user_id = target.id
+    
+    init_user_achievements(user_id)
+    user_data = achievements_data[user_id]
+    unlocked = user_data["unlocked"]
+    stats = user_data["stats"]
+    
+    # 업적 분류
+    unlocked_list = []
+    locked_list = []
+    
+    for ach_id, ach in ACHIEVEMENTS.items():
+        if ach_id in unlocked:
+            unlocked_list.append((ach_id, ach))
+        else:
+            locked_list.append((ach_id, ach))
+    
+    # 진행도 계산
+    total_achievements = len(ACHIEVEMENTS)
+    unlocked_count = len(unlocked)
+    progress_percent = (unlocked_count * 100) // total_achievements if total_achievements > 0 else 0
+    
+    # 주말 보너스 여부
+    weekend_mode = is_weekend()
+    weekend_notice = "\n🎊 **주말 보너스 중!** 업적 달성 조건이 완화되었습니다!\n" if weekend_mode else ""
+    
+    # 임베드 생성
+    embed = discord.Embed(
+        title=f"🏆 {target.display_name}님의 업적" + (" 🎊" if weekend_mode else ""),
+        description=(
+            f"**진행도**: {unlocked_count}/{total_achievements} ({progress_percent}%)\n"
+            f"⏰ **주의**: 업적은 24시간 하드리셋됩니다! (자정 00:00)\n"
+            f"{weekend_notice}"
+            f"\n"
+            f"📊 **오늘의 통계**:\n"
+            f"   • 총 메시지: {stats.get('total_messages', 0):,}개\n"
+            f"   • 오늘 메시지: {stats.get('daily_messages', 0):,}개\n"
+            f"   • 연속 출석: {stats.get('login_streak', 0)}일\n"
+            f"   • 달성 티어: {len(stats.get('tiers_reached', set()))}개\n"
+            f"   • 보상 수령: {stats.get('rewards_claimed_count', 0)}회"
+        ),
+        color=0xFFD700,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    # 해금된 업적
+    if unlocked_list:
+        unlocked_text = ""
+        for ach_id, ach in unlocked_list[:10]:  # 최대 10개만 표시
+            unlocked_text += f"✅ **{ach['name']}** - {ach['description']}\n"
+        
+        if len(unlocked_list) > 10:
+            unlocked_text += f"\n*...외 {len(unlocked_list) - 10}개 더*"
+        
+        embed.add_field(
+            name=f"🌟 해금된 업적 ({len(unlocked_list)}개)",
+            value=unlocked_text or "없음",
+            inline=False
+        )
+    
+    # 잠긴 업적 (다음 목표 3개만)
+    if locked_list:
+        locked_text = ""
+        for ach_id, ach in locked_list[:3]:
+            reward_xp = ach.get('reward_xp', 0)
+            locked_text += f"🔒 **{ach['name']}** - {ach['description']} (+{reward_xp} XP)\n"
+        
+        if len(locked_list) > 3:
+            locked_text += f"\n*...외 {len(locked_list) - 3}개*"
+        
+        embed.add_field(
+            name=f"🎯 다음 목표 업적",
+            value=locked_text,
+            inline=False
+        )
+    
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text="⚠️ 매일 자정(00:00) 하드리셋! | 업적 달성 시 보너스 XP 지급")
+    
+    await ctx.reply(embed=embed)
+
+@bot.command(name="업적상세", aliases=["achdetail", "업적정보"], help="!업적상세 — 모든 업적 상세 정보")
+async def achievement_detail_command(ctx: commands.Context):
+    # 모든 업적의 상세 정보 표시
+    user_id = ctx.author.id
+    init_user_achievements(user_id)
+    user_data = achievements_data[user_id]
+    unlocked = user_data["unlocked"]
+    
+    # 주말 보너스 여부
+    weekend_mode = is_weekend()
+    weekend_notice = "\n🎊 **주말 보너스 적용 중!** 업적 달성 조건이 1/3로 완화!\n" if weekend_mode else ""
+    
+    # 카테고리별 분류
+    categories = {
+        "기본": ["first_message", "early_bird", "night_owl"],
+        "메시지": ["msg_10", "msg_50", "msg_100", "msg_500", "msg_1000"],
+        "일일 활동": ["daily_30", "daily_50", "daily_100"],
+        "연속 출석": ["streak_3", "streak_7", "streak_30"],
+        "레벨": ["legendary_first", "legendary_weekend", "all_tiers"],
+        "특별": ["first_reward", "collector"]
+    }
+    
+    embed = discord.Embed(
+        title="📜 전체 업적 목록" + (" 🎊" if weekend_mode else ""),
+        description=(
+            "달성 가능한 모든 업적을 확인하세요!\n"
+            f"{weekend_notice}"
+            f"⏰ **중요**: 모든 업적은 매일 자정(00:00)에 하드리셋됩니다!\n"
+            f"💡 업적 달성 시 보너스 XP가 즉시 지급됩니다."
+        ),
+        color=0xFFD700 if weekend_mode else 0x00E5FF,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    for category, ach_ids in categories.items():
+        text = ""
+        for ach_id in ach_ids:
+            if ach_id in ACHIEVEMENTS:
+                ach = ACHIEVEMENTS[ach_id]
+                status = "✅" if ach_id in unlocked else "🔒"
+                reward_xp = ach.get('reward_xp', 0)
+                text += f"{status} **{ach['name']}** (+{reward_xp} XP)\n    _{ach['description']}_\n"
+        
+        if text:
+            embed.add_field(
+                name=f"🎯 {category}",
+                value=text,
+                inline=False
+            )
+    
+    embed.set_footer(text="⚠️ 매일 자정 하드리셋! | 매일 새롭게 도전하세요!")
+    
+    await ctx.reply(embed=embed)
 
 # 첨부파일 알리미
 async def describe_attachments(message: discord.Message):
@@ -2736,6 +3284,8 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
 async def on_ready():
     # 경험치 데이터 로드
     load_xp_data()
+    # 업적 데이터 로드
+    load_achievements_data()
     
     # 자정 리셋 태스크
     async def daily_reset_task():
@@ -2765,6 +3315,7 @@ async def on_ready():
         "⚠️ 자정에 XP 하드리셋!",
         "!xphelp 로 경험치 시스템 확인",
         "!trending 으로 실시간 키워드 통계 보기",
+        "!ach 로 업적 달성 현황 확인",
         
     ])
 
