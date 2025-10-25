@@ -35,7 +35,7 @@ seoul_tz = timezone("Asia/Seoul")
 # 경험치 설정
 XP_CONFIG = {
     "msg_xp": 15,                   # 평일 메시지당 경험치
-    "msg_xp_weekend": 25,           # 주말 메시지당 경험치 (금/토/일)
+    "msg_xp_weekend": 45,           # 주말 메시지당 경험치 (금/토/일) 
     "msg_cooldown": 5,              # 경험치 획득 쿨다운 (10초→5초로 단축)
     "daily_reset_hour": 0,          # 매일 자정에 리셋
     # reward: description, effect_type, effect_value, duration (minutes, None for permanent)
