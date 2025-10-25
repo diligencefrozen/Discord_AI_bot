@@ -358,6 +358,182 @@ def get_achievement_progress(user_id: int) -> str:
     
     return f"{len(unlocked)}/{total} 업적 달성 ({len(unlocked)*100//total}%)"
 
+# ────────────────────────────────────────────────────────────────────────────
+# 디시인사이드 갤러리 인기 게시물 추천 시스템
+# ────────────────────────────────────────────────────────────────────────────
+
+# 갤러리 설정
+GALLERY_CONFIG = {
+    "battlegroundmobile": {
+        "name": "배틀그라운드 모바일",
+        "short_name": "모배",
+        "url": "https://gall.dcinside.com/mgallery/board/lists?id=battlegroundmobile",
+        "is_minor": True,
+        # 관리자 목록 (게시물 제외) - 닉네임과 UID를 분리하여 정확히 매칭
+        "exclude_admins": {
+            "nicknames": ["Kar98k", "모바일배틀그라운드", "사수나무"],
+            "uids": ["pubgmobile", "pubgm180516", "id696307779"]
+        }
+    }
+}
+
+async def fetch_hot_posts(gallery_id: str, is_minor: bool = False, limit: int = 30) -> List[dict]:
+    
+    # 디시인사이드 갤러리의 게시물을 가져와서 인기도 순으로 정렬합니다.
+    # Returns: [{"no": 게시글번호, "title": 제목, "author": 작성자, "ip": IP, "link": 링크, 
+    #           "has_image": 이미지여부, "recommend": 추천수, "view": 조회수, "comment": 댓글수, "hot_score": 인기점수}]
+    
+    try:
+        if is_minor:
+            url = f"https://gall.dcinside.com/mgallery/board/lists?id={gallery_id}"
+        else:
+            url = f"https://gall.dcinside.com/board/lists?id={gallery_id}"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            posts = []
+            
+            # 게시글 목록 파싱
+            rows = soup.select('tr.ub-content')
+            
+            for row in rows:
+                try:
+                    # 게시글 번호
+                    num_elem = row.select_one('td.gall_num')
+                    if not num_elem or num_elem.text.strip() in ['공지', '설문', 'AD']:
+                        continue
+                    
+                    post_no = int(num_elem.text.strip())
+                    
+                    # 제목 및 링크
+                    title_elem = row.select_one('td.gall_tit a')
+                    if not title_elem:
+                        continue
+                    
+                    title = title_elem.text.strip()
+                    link_path = title_elem.get('href', '')
+                    
+                    # 이미지 여부
+                    has_image = row.select_one('em.icon_pic') is not None
+                    
+                    # 댓글 수
+                    comment_elem = row.select_one('span.reply_num')
+                    comment_count = 0
+                    if comment_elem:
+                        comment_text = comment_elem.text.strip().replace('[', '').replace(']', '')
+                        try:
+                            comment_count = int(comment_text)
+                        except:
+                            comment_count = 0
+                    
+                    # 추천 수
+                    recommend_elem = row.select_one('td.gall_recommend')
+                    recommend = 0
+                    if recommend_elem:
+                        try:
+                            recommend = int(recommend_elem.text.strip())
+                        except:
+                            recommend = 0
+                    
+                    # 조회 수
+                    view_elem = row.select_one('td.gall_count')
+                    view_count = 0
+                    if view_elem:
+                        try:
+                            view_count = int(view_elem.text.strip())
+                        except:
+                            view_count = 0
+                    
+                    # 작성자 정보
+                    writer_elem = row.select_one('td.gall_writer')
+                    author_nick = ""
+                    author_ip = ""
+                    
+                    if writer_elem:
+                        # 닉네임
+                        nick_elem = writer_elem.select_one('span.nickname em')
+                        if nick_elem:
+                            author_nick = nick_elem.text.strip()
+                        
+                        # IP 또는 UID
+                        ip_elem = writer_elem.select_one('span.ip')
+                        if ip_elem:
+                            author_ip = ip_elem.text.strip()
+                        else:
+                            # UID인 경우
+                            uid = writer_elem.get('data-uid', '')
+                            if uid:
+                                author_ip = f"UID:{uid}"
+                    
+                    # 전체 링크 생성
+                    if is_minor:
+                        full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mgallery/board/view/?id={gallery_id}&no={post_no}"
+                    else:
+                        full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/board/view/?id={gallery_id}&no={post_no}"
+                    
+                    # 인기 점수 계산 (추천 * 5 + 댓글 * 2 + 조회수 / 10)
+                    hot_score = (recommend * 5) + (comment_count * 2) + (view_count / 10)
+                    
+                    posts.append({
+                        "no": post_no,
+                        "title": title,
+                        "author": author_nick,
+                        "ip": author_ip,
+                        "link": full_link,
+                        "has_image": has_image,
+                        "recommend": recommend,
+                        "view": view_count,
+                        "comment": comment_count,
+                        "hot_score": hot_score
+                    })
+                    
+                except Exception as e:
+                    logging.error(f"게시글 파싱 오류: {e}")
+                    continue
+            
+            # 관리자 게시물 필터링 (닉네임과 UID를 분리하여 정확히 매칭)
+            config_data = GALLERY_CONFIG.get(gallery_id, {})
+            exclude_admins = config_data.get("exclude_admins", {})
+            
+            if exclude_admins:
+                admin_nicknames = exclude_admins.get("nicknames", [])
+                admin_uids = exclude_admins.get("uids", [])
+                
+                filtered_posts = []
+                for post in posts:
+                    is_admin = False
+                    
+                    # 닉네임으로 필터링 (author 필드에서 정확히 매칭)
+                    if post["author"] in admin_nicknames:
+                        is_admin = True
+                    
+                    # UID로 필터링 (ip 필드에서 정확히 매칭)
+                    if post["ip"] in admin_uids:
+                        is_admin = True
+                    
+                    if not is_admin:
+                        filtered_posts.append(post)
+                
+                posts = filtered_posts
+            
+            # 인기 점수 순으로 정렬
+            posts.sort(key=lambda x: x["hot_score"], reverse=True)
+            
+            return posts[:limit]
+            
+    except Exception as e:
+        logging.error(f"갤러리 {gallery_id} 불러오기 실패: {e}")
+        return []
+
 def is_weekend() -> bool:
     # 주말 여부 확인 (금요일, 토요일, 일요일)
     now = datetime.datetime.now(seoul_tz)
@@ -1887,96 +2063,113 @@ async def on_message_delete(message: discord.Message):
 GAME_CARDS: dict[str, dict] = {
     "pubg": {   # 모배 / 배그
         "pattern": re.compile(rf"(모{FILLER}배|배{FILLER}그|pubg)", re.I),
-        "title":   "🚀  **이제, 모든 곳이 배틀그라운드**",
+        "title":   "PUBG MOBILE",
+        "subtitle": "The Ultimate Battle Royale Experience",
         "desc": (
-            "누적 매출 **100억 달러** 돌파!\n"
-            "글로벌 모바일 게임 매출 **Top 2**\n\n"
-
+            "### 🏆 Global Phenomenon\n"
+            "• **$10 Billion+** in lifetime revenue\n"
+            "• **#2** highest-grossing mobile game worldwide\n"
+            "• **100M+** players in the arena right now\n\n"
+            "**Experience tactical combat where every decision counts.**"
         ),
         "thumb":  "https://iili.io/FzATZBI.md.jpg",
         "banner": "https://iili.io/FzAaKEQ.jpg",
+        "color": 0xFF6B35,
         "links": [
-            ("Android", "🤖", "https://play.google.com/store/apps/details?id=com.pubg.krmobile"),
-            ("iOS",     "🍎", "https://apps.apple.com/kr/app/%EB%B0%B0%ED%8B%80%EA%B7%B8%EB%9D%9C%EC%9A%B4%EB%93%9C/id1366526331"),
-            ("Official Discord", "🌐", "https://discord.com/invite/pubgmobile"),
+            ("Download on Android", "https://play.google.com/store/apps/details?id=com.pubg.krmobile"),
+            ("Download on iOS", "https://apps.apple.com/kr/app/%EB%B0%B0%ED%8B%80%EA%B7%B8%EB%9D%9C%EC%9A%B4%EB%93%9C/id1366526331"),
+            ("Join Official Discord", "https://discord.com/invite/pubgmobile"),
         ],
-        "cta": "Squad-up & jump in!",
+        "cta": "🎯 **SQUAD UP NOW** • Drop in. Loot up. Win.",
+        "footer": "100+ million concurrent players • Updated weekly",
     },
 
     "overwatch": {
         "pattern": re.compile(r"(옵치|오버워치|overwatch)", re.I),
-        "title":   "⚡ **새로운 영웅은 언제나 환영이야!**",
+        "title":   "OVERWATCH 2",
+        "subtitle": "The World Needs Heroes",
         "desc": (
-            "2016년은 가히 오버워치의 해!\n"
-            "PC 게임 판매량 1위, 콘솔 게임 판매량 5위!\n\n"
-
+            "### ⚡ Award-Winning Team Shooter\n"
+            "• **Game of the Year 2016** — Multiple Awards\n"
+            "• **#1** best-selling PC game at launch\n"
+            "• **40M+** heroes have answered the call\n\n"
+            "**Choose from 35+ unique heroes and change the world.**"
         ),
         "thumb":   "https://iili.io/Fz7CWu4.jpg",
         "banner":  "https://iili.io/Fz75imX.png",
+        "color": 0xFA9C1E,
         "links": [
-            ("Battle.net",  "🖥️", "https://playoverwatch.com/"),
-            ("Steam",       "💠", "https://store.steampowered.com/app/2357570/Overwatch_2/"),
-            ("Patch Notes", "📜", "https://us.forums.blizzard.com/en/overwatch/c/patch-notes"),
+            ("Play on Battle.net", "https://playoverwatch.com/"),
+            ("Play on Steam", "https://store.steampowered.com/app/2357570/Overwatch_2/"),
+            ("View Patch Notes", "https://us.forums.blizzard.com/en/overwatch/c/patch-notes"),
         ],
-        "cta": "Group-up & push the payload!",
+        "cta": "🔥 **JOIN THE FIGHT** • Free-to-play. Pure fun.",
+        "footer": "New season • New heroes • New challenges",
     },
 
     "tarkov": {
-
         "pattern": re.compile(r"(타르코프|탈콥|tarkov)", re.I),
-
-        "title":   "🕶️ **은밀하게, 그곳을 탈출하라!**",
+        "title":   "ESCAPE FROM TARKOV",
+        "subtitle": "Hardcore Survival at Its Finest",
+        "desc": (
+            "### 🎖️ The Ultimate Tactical FPS\n"
+            "• **Hyper-realistic** combat simulation\n"
+            "• **Deep progression** with RPG mechanics\n"
+            "• **Every raid matters** — High risk, high reward\n\n"
+            "**Warning:** Not for the faint of heart. Prepare to die, learn, adapt."
+        ),
         "thumb":   "https://iili.io/Fz78tRI.jpg",
         "banner":  "https://iili.io/FzcPgNj.jpg",
-
-        "desc": (
-            "하드코어 FPS 게임을 좋아하는 유저들에게\n"
-            "깊이 있는 게임 경험을 제공하지만,  \n"
-            "초보자에게는 진입 장벽이 높은 게임. \n"
-
-        ),
-
+        "color": 0x556B2F,
         "links": [
-            ("Pre-order / EoD", "💳", "https://www.escapefromtarkov.com/preorder-page"),
-            ("Wiki",    "📚", "https://escapefromtarkov.fandom.com/wiki/Escape_from_Tarkov_Wiki"),
-            ("Patch Notes", "📝", "https://www.escapefromtarkov.com/#news"),
+            ("Pre-order Now", "https://www.escapefromtarkov.com/preorder-page"),
+            ("Official Wiki", "https://escapefromtarkov.fandom.com/wiki/Escape_from_Tarkov_Wiki"),
+            ("Latest Updates", "https://www.escapefromtarkov.com/#news"),
         ],
-
-        "cta": "Think twice—then check your mags & try to extract!",
+        "cta": "⚠️ **ENTER IF YOU DARE** • Check your gear. Trust no one.",
+        "footer": "Hardcore realism • Unforgiving gameplay • Unforgettable moments",
     },
 
     "minecraft": {
         "pattern": re.compile(r"(마크|마인크래프트|minecraft)", re.I),
-        "title":   "**⛏️ Mine. Craft. Repeat.**",
+        "title":   "MINECRAFT",
+        "subtitle": "Build. Explore. Survive. Together.",
         "desc": (
-            "3억 장 판매, 역대 *게임 판매량 1위*\n"
-            "친구들과 새로운 월드를 탐험해 보세요!"
-
+            "### 🌍 The Best-Selling Game of All Time\n"
+            "• **300 Million+** copies sold worldwide\n"
+            "• **Infinite possibilities** in procedurally generated worlds\n"
+            "• **Cross-platform play** with friends everywhere\n\n"
+            "**Your imagination is the only limit.**"
         ),
         "thumb":   "https://iili.io/Fz7DYa1.jpg",
         "banner":  "https://iili.io/FzYKwSj.jpg",
+        "color": 0x62C54A,
         "links": [
-            ("Java Edition", "💻", "https://www.minecraft.net/en-us/store/minecraft-java-bedrock-edition-pc"),
-
+            ("Get Java Edition", "https://www.minecraft.net/en-us/store/minecraft-java-bedrock-edition-pc"),
         ],
-        "cta": "**⛏️ Mine. Craft. Repeat.**",
+        "cta": "⛏️ **START YOUR ADVENTURE** • Mine. Craft. Create.",
+        "footer": "Regular updates • Endless creativity • Global community",
     },
 
     "GTA": {
-        "pattern": re.compile(r"(GTA|그타)", re.I),
-        "title":   "**🏙️ Welcome to Los Santos**",
+        "pattern": re.compile(r"(GTA|그타|gta|Gta)", re.I),
+        "title":   "GRAND THEFT AUTO V",
+        "subtitle": "Welcome to Los Santos",
         "desc": (
-            "• GTA V 누적 판매 2억 장!\n"
-            "친구들과 자유롭게 거리를 누벼보세요."
-
+            "### 🌆 The Legendary Open-World Experience\n"
+            "• **200 Million+** copies sold — Still breaking records\n"
+            "• **Vast open world** with endless activities\n"
+            "• **GTA Online** constantly evolving with new content\n\n"
+            "**Los Santos awaits. What will you become?**"
         ),
         "thumb":   "https://iili.io/Fz7D73P.png",
         "banner":  "https://iili.io/FzYcOJ4.jpg",
+        "color": 0x0C8A3E,
         "links": [
-            ("Steam", "💻", "https://store.steampowered.com/app/3240220/Grand_Theft_Auto_V_Enhanced/"),
-
+            ("Buy on Steam", "https://store.steampowered.com/app/3240220/Grand_Theft_Auto_V_Enhanced/"),
         ],
-        "cta": "But remember: crimes are fun only in games 🏷️",
+        "cta": "🏙️ **EXPLORE LOS SANTOS** • Your story. Your rules.",
+        "footer": "Enhanced & expanded • Active community • Regular updates",
     },
 }
 
@@ -2103,7 +2296,7 @@ async def on_message(message: discord.Message):
                     # 주말 전설 달성
                     vip_title = "🎊 주말 보너스 VIP Winner! 🎊"
                     vip_description = (
-                        f"✨ **{message.author.mention}** 님이 **주말 보너스**로 오늘의 **최고 등급(전설)**에 도달했습니다!\n"
+                        f"✨ **{message.author.mention}** 님이 **주말 보너스**로 \n\n오늘의 **최고 등급(전설)**에 도달했습니다!\n"
                         f"\n"
                         f"🎁 **주말 특별 달성!** (메시지당 25 XP 적용)\n"
                         f"모두가 우러러보는 진정한 챔피언!\n"
@@ -2144,7 +2337,7 @@ async def on_message(message: discord.Message):
         # 대신 레벨업과 별개로 업적 체크는 add_xp에서 이미 완료됨
         # 필요시 여기서 추가 알림 로직 구현 가능
 
-    # ───── 제한 사용자 처리 (경험치 면제 체크 추가) ─────
+    # ───── 제한 사용자 처리 (면제권 기능 추가) ─────
     # 영구 제한 사용자는 어떠한 경우에도 제한 유지
     if user_id in BLOCK_MEDIA_USER_IDS:
         _dbg("HIT restricted user", user_id, "guild=", guild_id, "channel=", ch_id)
@@ -2330,28 +2523,87 @@ async def on_message(message: discord.Message):
         for cfg in GAME_CARDS.values():
             if cfg["pattern"].search(message.content):          # 키워드 매치
 
-                embed = (
-                    discord.Embed(
-                        title=cfg["title"],
-                        description=cfg["desc"],
-                        color=0x00B2FF,
-                        timestamp=datetime.datetime.now(seoul_tz),
-                        )
-                        .set_thumbnail(url=cfg["thumb"])
-                        .set_image(url=cfg["banner"])
-                        .set_footer(text="Play hard, live harder ✨")
-                        )
+                # 현대적이고 미려한 임베드 생성
+                embed = discord.Embed(
+                    title=cfg["title"],
+                    description=cfg["desc"],
+                    color=cfg.get("color", 0x5865F2),  # Modern Discord blurple
+                    timestamp=datetime.datetime.now(seoul_tz),
+                )
                 
+                # 서브타이틀을 author 필드로 표시 (더 눈에 띄게)
+                if cfg.get("subtitle"):
+                    embed.set_author(
+                        name=cfg["subtitle"],
+                        icon_url=cfg.get("icon_url", "https://cdn.discordapp.com/emojis/1234567890.png")
+                    )
+                
+                embed.set_thumbnail(url=cfg["thumb"])
+                embed.set_image(url=cfg["banner"])
+                embed.set_footer(
+                    text=cfg.get("footer", "Join millions of players worldwide"),
+                    icon_url="https://cdn.discordapp.com/emojis/1234567890.png"
+                )
+                
+                # 모던한 버튼 스타일로 개선
                 view = View(timeout=None)
-                for label, emoji, url in cfg["links"]:
-                    view.add_item(Button(label=label, emoji=emoji, url=url))
-                    await message.channel.send(content=f"{message.author.mention} {cfg['cta']}",
-                                               embed=embed, view=view)
-                    return
+                button_emojis = ["🎮", "🚀", "📱", "🌐", "⚡"]
+                
+                # links 리스트를 순회하며 버튼 생성
+                for idx, link_item in enumerate(cfg["links"]):
+                    # 튜플 언패킹
+                    label, url = link_item
+                    
+                    # 각 버튼에 어울리는 이모지 자동 할당
+                    emoji = None
+                    label_lower = label.lower()
+                    
+                    if "android" in label_lower or "play" in label_lower:
+                        emoji = "🤖"
+                    elif "ios" in label_lower or "apple" in label_lower:
+                        emoji = "🍎"
+                    elif "steam" in label_lower:
+                        emoji = "💠"
+                    elif "discord" in label_lower:
+                        emoji = "💬"
+                    elif "wiki" in label_lower:
+                        emoji = "📚"
+                    elif "battle" in label_lower or "pre-order" in label_lower:
+                        emoji = "🎯"
+                    elif "patch" in label_lower or "update" in label_lower or "notes" in label_lower:
+                        emoji = "📋"
+                    elif "buy" in label_lower or "get" in label_lower:
+                        emoji = "🛒"
+                    else:
+                        emoji = button_emojis[idx % len(button_emojis)]
+                    
+                    btn = Button(
+                        style=discord.ButtonStyle.link,
+                        label=label,
+                        url=url,
+                        emoji=emoji
+                    )
+                    view.add_item(btn)
+                
+                # 디버깅: 버튼 개수 로그
+                logging.info(f"[GAME_CARD] Created {len(view.children)} buttons for {cfg['title']}")
+                
+                # 현대적이고 설득력 있는 CTA 메시지
+                cta_embed = discord.Embed(
+                    description=f"### {cfg['cta']}",
+                    color=cfg.get("color", 0x5865F2)
+                )
+                
+                await message.channel.send(
+                    content=f"{message.author.mention}",
+                    embeds=[embed, cta_embed],
+                    view=view
+                )
+                return
             
     # 3) 링크 삭제 
     if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:
-        # 경험치 면제 : 금칙어 면제권이 있으면 링크도 허용
+
         if not is_user_exempt_from_profanity(user_id):
             await safe_delete(message)
             await message.channel.send(
@@ -2371,7 +2623,7 @@ async def on_message(message: discord.Message):
             )
             logging.info(f"[LINK_EXEMPT] {message.author} (ID:{user_id}) - 링크 검열 면제권으로 링크 허용")
 
-    # 4) 금칙어 (경험치 면제 추가)
+    # 4) 금칙어 
     EXEMPT_PROFANITY_CHANNEL_IDS = set()  
     root = find_badroot(message.content)
     if root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
@@ -2482,7 +2734,7 @@ async def web(ctx: commands.Context, *, query: Optional[str] = None):
     
     await ctx.reply(embed=embed, view=view)
 
-# 🔥 핫 키워드 통계 명령어 (새로 추가)
+# 🔥 핫 키워드 통계 명령어 
 @bot.command(name="trending", aliases=["hot", "키워드"], help="!trending — 현재 채널의 핫 키워드 통계")
 async def trending_command(ctx: commands.Context):
     # 현재 채널의 핫 키워드 통계를 보여줍니다.
@@ -3249,6 +3501,74 @@ def fix_code(chunks: List[str]) -> List[str]:
             open_block = not open_block
         fixed.append(ch)
     return fixed
+
+# ────────── 디시인사이드 갤러리 인기글 명령어 ──────────
+@bot.command(name="모배갤", aliases=["모배", "battleground", "bg"], help="!모배갤 — 배틀그라운드 모바일 갤러리 인기 게시물")
+async def gallery_hot_posts(ctx: commands.Context, limit: int = 10):
+    # 배틀그라운드 모바일 갤러리의 인기 게시물 추천
+    if limit > 15:
+        limit = 15
+    elif limit < 1:
+        limit = 10
+    
+    async with ctx.typing():
+        gallery_id = "battlegroundmobile"
+        config = GALLERY_CONFIG.get(gallery_id)
+        
+        if not config:
+            await ctx.reply("❌ 갤러리 설정을 찾을 수 없습니다.")
+            return
+        
+        # 인기 게시물 가져오기
+        posts = await fetch_hot_posts(gallery_id, config.get("is_minor", False), limit=30)
+        
+        if not posts:
+            await ctx.reply("❌ 갤러리에서 게시물을 가져올 수 없습니다.")
+            return
+        
+        # 상위 게시물만 선택
+        hot_posts = posts[:limit]
+        
+        embed = discord.Embed(
+            title=f"😊 {config['name']} 갤러리 인기글 TOP {limit}",
+            description=f"추천수와 조회수 기반 인기 게시물입니다!",
+            color=0xFF6B6B,
+            timestamp=datetime.datetime.now(seoul_tz)
+        )
+        
+        for idx, post in enumerate(hot_posts, 1):
+            # 제목 (너무 길면 자르기)
+            title = post['title']
+            if len(title) > 80:
+                title = title[:77] + "..."
+            
+            # 아이콘
+            icon = "📝" if post['has_image'] else "📝"
+            medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"**{idx}.**"
+            
+            # 작성자 정보
+            author_info = post['author']
+            if post['ip']:
+                author_info += f" `{post['ip']}`"
+            
+            # 통계 정보
+            stats = f"😊 {post['recommend']} | 👀 {post['view']:,} | 💬 {post['comment']}"
+            
+            field_value = (
+                f"**작성자**: {author_info}\n"
+                f"**통계**: {stats}\n"
+                f"[🔗 게시글 보기]({post['link']})"
+            )
+            
+            embed.add_field(
+                name=f"{medal} {icon} {title}",
+                value=field_value,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"디시인사이드 {config['name']} 갤러리 X tbBot3rd")
+        
+        await ctx.reply(embed=embed)
 
 @bot.command(name="ask", help="!ask <질문>")
 async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
