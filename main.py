@@ -1101,10 +1101,10 @@ MENTION_LOG: deque[float] = deque(maxlen=5)   # PEP 585 문법은 3.9에서도 �
 # ‘최근 메시지 기록’ – 지금 자주 언급되는 키워드 탐지를 위한 기능 - 핫 키워드
 # ────────────────────────────────────────────────────────────────────────────
 
-# 1) 버퍼 길이(반드시 보조 함수들보다 위에 위치)
-MAX_BUFFER = 5
+# 1) 버퍼 길이 (개선: 5 → 20으로 확대하여 더 많은 데이터 수집)
+MAX_BUFFER = 20
 
-# 2) 채널별 버퍼 딕셔너리
+# 2) 채널별 버퍼 딕셔너리 (메시지 내용 + 타임스탬프 저장)
 RECENT_BY_CH: Dict[int, deque] = {}
 
 # 3) 수집 제외 채널 (원하는 채널 ID를 여기에 추가)
@@ -1114,19 +1114,54 @@ HOTKEYWORD_EXCLUDE_CHANNELS: set[int] = {
     937718347133493320, 937718832020217867 # 배사모 
 }
 
-# 4) 불용어
+# 4) 확장된 불용어 (더 정확한 필터링)
 STOPWORDS = {
+    # 기존 불용어
     "ㅋㅋ","ㅎㅎ","음","이건","그건","다들","도리","7호선","칠호선","나냡",
     "1인칭","일인칭","들쥐","돌이","도리야","나냡아","호선아","the","img",
     "스겜","ㅇㅇ","하고","from","막아놓은건데","to","are","청년을",
     "서울대가","정상인이라면","in","set","web","ask","https","http",
+    # 추가 불용어 (조사, 접속사, 감탄사, 일반적인 단어)
+    "그냥","진짜","이거","저거","뭐","좀","왜","근데","그래서","그러면","하지만",
+    "아니","저기","여기","저는","제가","나는","내가","너는","네가","있어","없어",
+    "해요","했어","할게","하네","되게","엄청","완전","너무","정말","of","and",
+    "is","it","that","this","for","with","on","at","by","as","be","was",
+    "있다","없다","하다","되다","같다","많다","크다","작다","좋다","나쁘다",
+    "어떻게","어디","언제","누가","무엇","뭔가","어떤","같은","다른","또",
 }.union(set(string.punctuation))
 
+# 5) 개선된 토큰화 (복합 명사, 연속된 단어 고려)
 def tokenize(txt: str) -> List[str]:
-    tokens = re.split(r"[^\w가-힣]+", txt.lower())
-    return [t for t in tokens if t and t not in STOPWORDS and len(t) > 1 and not t.isdigit()]
+    # 조사 제거를 위한 패턴
+    # 한글 단어 뒤에 붙는 조사 제거: ~이, ~가, ~을, ~를, ~은, ~는, ~의, ~에, ~와, ~과 등
+    txt = re.sub(r'([가-힣]+)(이|가|을|를|은|는|의|에|와|과|도|만|부터|까지|로|으로|에서|에게|한테|께|보다|처럼|마다)(\s|$)', r'\1 ', txt)
+    
+    # 특수문자 및 이모지 제거
+    txt = re.sub(r'[^\w\s가-힣]', ' ', txt.lower())
+    
+    # 기본 토큰 추출
+    tokens = re.split(r'\s+', txt)
+    single_tokens = [t for t in tokens if t and t not in STOPWORDS and len(t) > 1 and not t.isdigit()]
+    
+    # 복합 명사 추출 (2-3개 연속 단어)
+    compound_tokens = []
+    for i in range(len(tokens) - 1):
+        if tokens[i] and tokens[i+1] and tokens[i] not in STOPWORDS and tokens[i+1] not in STOPWORDS:
+            compound = f"{tokens[i]} {tokens[i+1]}"
+            if len(compound) > 4:  # 너무 짧은 복합어 제외
+                compound_tokens.append(compound)
+    
+    # 3개 연속 단어 (더 구체적인 주제)
+    for i in range(len(tokens) - 2):
+        if tokens[i] and tokens[i+1] and tokens[i+2]:
+            if all(t not in STOPWORDS for t in [tokens[i], tokens[i+1], tokens[i+2]]):
+                compound = f"{tokens[i]} {tokens[i+1]} {tokens[i+2]}"
+                if len(compound) > 6:
+                    compound_tokens.append(compound)
+    
+    return single_tokens + compound_tokens
 
-# 5) 채널 버퍼 가져오기/생성
+# 6) 채널 버퍼 가져오기/생성 (타임스탬프 포함)
 def _get_buf(channel_id: int) -> deque:
     dq = RECENT_BY_CH.get(channel_id)
     if dq is None:
@@ -1134,26 +1169,112 @@ def _get_buf(channel_id: int) -> deque:
         RECENT_BY_CH[channel_id] = dq
     return dq
 
-# 6) 메시지 푸시 (수집 제외 채널 차단)
+# 7) 메시지 푸시 (수집 제외 채널 차단, 타임스탬프 추가)
 def push_recent_message(channel_id: int, text: str) -> None:
     if channel_id in HOTKEYWORD_EXCLUDE_CHANNELS:
         return
-    _get_buf(channel_id).append(text)
+    # (타임스탬프, 메시지) 튜플로 저장
+    _get_buf(channel_id).append((time.time(), text))
 
-# 7) 버퍼 비우기(해당 채널만)
+# 8) 버퍼 비우기(해당 채널만)
 def clear_recent(channel_id: int) -> None:
     RECENT_BY_CH.pop(channel_id, None)
 
-# 8) 핫 키워드 계산(채널별)
+# 9) 핫 키워드 계산 (시간 가중치 적용, 더 엄격한 기준)
 def pick_hot_keyword(channel_id: int) -> Optional[str]:
     buf = list(_get_buf(channel_id))
-    if not buf:
+    if len(buf) < 8:  # 최소 8개 메시지 필요 (기존 5에서 증가)
         return None
-    freq = Counter(itertools.chain.from_iterable(map(tokenize, buf)))
-    if not freq:
+    
+    now = time.time()
+    weighted_freq = Counter()
+    author_keyword_count = defaultdict(lambda: defaultdict(int))  # 사용자별 키워드 카운트 (스팸 방지)
+    
+    for timestamp, text in buf:
+        tokens = tokenize(text)
+        if not tokens:
+            continue
+        
+        # 시간 가중치: 최근 메시지일수록 높은 가중치 (최대 3.0, 최소 1.0)
+        age_seconds = now - timestamp
+        # 5분 이내: 3.0, 10분: 2.0, 15분 이상: 1.0
+        if age_seconds < 300:  # 5분
+            weight = 3.0
+        elif age_seconds < 600:  # 10분
+            weight = 2.0
+        elif age_seconds < 900:  # 15분
+            weight = 1.5
+        else:
+            weight = 1.0
+        
+        # 가중치 적용
+        for token in tokens:
+            weighted_freq[token] += weight
+    
+    if not weighted_freq:
         return None
-    word, cnt = freq.most_common(1)[0]
-    return word if cnt >= 2 else None  # 2회 이상 등장 시 채택
+    
+    # 상위 키워드 분석
+    top_keywords = weighted_freq.most_common(10)  # 상위 10개 분석 (기존 5에서 증가)
+    
+    # 필터링 조건:
+    # 1. 가중 빈도 최소 6.0 이상 (단순 2회 → 시간 가중 6.0으로 강화)
+    # 2. 복합 명사 우선 (공백 포함 = 복합 명사)
+    # 3. 길이 2자 이상
+    # 4. 다양성 체크 (여러 메시지에서 등장해야 함)
+    
+    # 복합 명사 우선 추천
+    for keyword, weighted_count in top_keywords:
+        # 복합 명사이고 가중 빈도 5.0 이상, 길이 5자 이상
+        if ' ' in keyword and weighted_count >= 5.0 and len(keyword) >= 5:
+            # 품질 체크: 너무 긴 복합어는 제외 (3단어 이하)
+            word_count = len(keyword.split())
+            if word_count <= 3:
+                return keyword
+    
+    # 복합 명사가 없으면 일반 단어 중 가중 빈도 6.0 이상
+    for keyword, weighted_count in top_keywords:
+        if weighted_count >= 6.0 and len(keyword) >= 2:
+            # 단일 자음/모음 제외
+            if not re.match(r'^[ㄱ-ㅎㅏ-ㅣ]+$', keyword):
+                return keyword
+    
+    return None  # 기준 미달 시 None 반환
+
+# 10) 핫 키워드 통계 조회 (디버깅/모니터링용)
+def get_keyword_stats(channel_id: int) -> Optional[Dict]:
+    # 채널의 현재 키워드 통계 반환
+    buf = list(_get_buf(channel_id))
+    if len(buf) < 3:
+        return None
+    
+    now = time.time()
+    weighted_freq = Counter()
+    
+    for timestamp, text in buf:
+        tokens = tokenize(text)
+        age_seconds = now - timestamp
+        
+        if age_seconds < 300:
+            weight = 3.0
+        elif age_seconds < 600:
+            weight = 2.0
+        elif age_seconds < 900:
+            weight = 1.5
+        else:
+            weight = 1.0
+        
+        for token in tokens:
+            weighted_freq[token] += weight
+    
+    top_5 = weighted_freq.most_common(5)
+    
+    return {
+        "channel_id": channel_id,
+        "message_count": len(buf),
+        "top_keywords": [{"keyword": k, "score": round(v, 2)} for k, v in top_5],
+        "timestamp": now
+    }
 
 # ────────────────────────────────────────────────────────────────────────────
 # 이모지 확대 – :01: ~ :50: / :dccon: ▶ 원본 PNG 링크 표시
@@ -1829,7 +1950,7 @@ async def on_message(message: discord.Message):
             await safe_delete(message)
             await message.channel.send(
                 embed=discord.Embed(
-                    description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요.\n💡 **팁**: 경험치를 모아 금칙어 면제권을 받으면 링크도 올릴 수 있습니다!",
+                    description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요.\n\n💡 **팁**: 경험치를 모아 면제권을 받으면 링크도 올릴 수 있습니다!",
                     color=0xFF0000,
                 ),
                 delete_after=8
@@ -1954,6 +2075,60 @@ async def web(ctx: commands.Context, *, query: Optional[str] = None):
         view.add_item(Button(style=discord.ButtonStyle.link, label=f"{i}", url=url))
     
     await ctx.reply(embed=embed, view=view)
+
+# 🔥 핫 키워드 통계 명령어 (새로 추가)
+@bot.command(name="trending", aliases=["hot", "키워드"], help="!trending — 현재 채널의 핫 키워드 통계")
+async def trending_command(ctx: commands.Context):
+    # 현재 채널의 핫 키워드 통계를 보여줍니다.
+    stats = get_keyword_stats(ctx.channel.id)
+    
+    if not stats:
+        await ctx.reply(
+            embed=discord.Embed(
+                description="📊 아직 충분한 대화가 쌓이지 않았어요!\n조금 더 대화를 나눠보세요. 💬",
+                color=0xFFA500
+            )
+        )
+        return
+    
+    # 통계 임베드 생성
+    desc = f"**메시지 수**: {stats['message_count']}개\n\n"
+    desc += "**🔥 현재 트렌딩 키워드**\n"
+    
+    if stats['top_keywords']:
+        for i, item in enumerate(stats['top_keywords'], 1):
+            keyword = item['keyword']
+            score = item['score']
+            
+            # 이모지 추가 (순위별)
+            if i == 1:
+                emoji = "🥇"
+            elif i == 2:
+                emoji = "🥈"
+            elif i == 3:
+                emoji = "🥉"
+            else:
+                emoji = f"{i}."
+            
+            # 복합 명사 강조
+            if ' ' in keyword:
+                keyword = f"**{keyword}**"
+            
+            desc += f"{emoji} {keyword} `({score}점)`\n"
+    else:
+        desc += "_키워드 없음_"
+    
+    desc += "\n💡 **Tip**: `!ask <키워드>` 로 검색해보세요!"
+    
+    embed = discord.Embed(
+        title=f"📈 #{ctx.channel.name} 트렌딩",
+        description=desc,
+        color=0xFF6B6B,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    embed.set_footer(text="실시간 키워드 분석 by 도리봇", icon_url="https://i.imgur.com/d1Ef9W8.jpeg")
+    
+    await ctx.reply(embed=embed)
   
 # !img  or  /img  프롬프트 → 그림 그려줌.
 @bot.command(name="img", help="!img <프롬프트> — 이미지를 생성합니다.")
@@ -2325,7 +2500,7 @@ async def xphelp_command(ctx: commands.Context):
             "   • 1일 1회만 사용 가능\n"
             "   • 모든 제한이 해제되는 자유를 느껴보세요!\n"
             "\n"
-            "💡 **팁:** 꾸준히 활동하면 매일 보상 받기!"
+            "💡 **팁:** 꾸준히 활동하면서 매일 보상 받기!"
         ),
         inline=False
     )
@@ -2589,6 +2764,8 @@ async def on_ready():
         "메시지를 보내면 XP 획득! 🎯",
         "⚠️ 자정에 XP 하드리셋!",
         "!xphelp 로 경험치 시스템 확인",
+        "!trending 으로 실시간 키워드 통계 보기",
+        
     ])
 
     async def rotate():
