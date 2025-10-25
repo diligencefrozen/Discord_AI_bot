@@ -516,8 +516,9 @@ async def fetch_hot_posts(gallery_id: str, is_minor: bool = False, limit: int = 
                     if post["author"] in admin_nicknames:
                         is_admin = True
                     
-                    # UID로 필터링 (ip 필드에서 정확히 매칭)
-                    if post["ip"] in admin_uids:
+                    # UID로 필터링 (ip 필드에서 "UID:" 접두사를 제거하고 매칭)
+                    post_uid = post["ip"].replace("UID:", "") if post["ip"].startswith("UID:") else post["ip"]
+                    if post_uid in admin_uids:
                         is_admin = True
                     
                     if not is_admin:
