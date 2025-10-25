@@ -54,7 +54,6 @@ built for seamless **Korean / English bilingual servers**.
 ## Future Work
 
 * Replace JSON with an async SQLite persistence layer
-* Integrate a Korean hate-speech classifier (HateSpeech-KR)
 * Add a keyword-trend dashboard with message analytics
 
 ---
