@@ -1535,7 +1535,7 @@ MAX_MSG   = 1900
 FILE_TH   = 6000
 HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
 IMG_MODEL    = "stabilityai/stable-diffusion-xl-base-1.0" 
-ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
+ENDPOINT     = f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}"
 HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
 img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
