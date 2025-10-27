@@ -34,22 +34,506 @@ seoul_tz = timezone("Asia/Seoul")
 
 # 경험치 설정
 XP_CONFIG = {
-    "msg_xp": 25,                   # 평일 메시지당 경험치
+    "msg_xp": 15,                   # 평일 메시지당 경험치
     "msg_xp_weekend": 45,           # 주말 메시지당 경험치 (금/토/일) 
     "msg_cooldown": 5,              # 경험치 획득 쿨다운 (10초→5초로 단축)
     "daily_reset_hour": 0,          # 매일 자정에 리셋
     # reward: description, effect_type, effect_value, duration (minutes, None for permanent)
     "reward_tiers": [
-        {"xp": 30, "name": "🌱 새싹", "reward": "도배 차단 면제 6시간", "effect": {"type": "antispam", "duration": 360}},  # 메시지 2개
-        {"xp": 90, "name": "🌿 싹트기", "reward": "금칙어 + 링크 필터 면제 10회", "effect": {"type": "profanity", "count": 10}},  # 메시지 6개
-        {"xp": 180, "name": "🌳 성장", "reward": "금칙어 + 링크 필터 면제 50회", "effect": {"type": "profanity", "count": 50}},  # 메시지 12개
-        {"xp": 300, "name": "🌲 거목", "reward": "모든 제한 면제 6시간", "effect": {"type": "all", "duration": 360}},  # 메시지 20개
+        {"xp": 30, "name": "🌱 새싹", "reward": "도배 차단 면제 30분", "effect": {"type": "antispam", "duration": 30}},  # 메시지 2개
+        {"xp": 90, "name": "🌿 싹트기", "reward": "도배 차단 면제 3시간", "effect": {"type": "antispam", "duration": 180}},  # 메시지 6개
+        {"xp": 180, "name": "🌳 성장", "reward": "금칙어 + 링크 필터 면제 10회", "effect": {"type": "profanity", "count": 10}},  # 메시지 12개
+        {"xp": 300, "name": "🌲 거목", "reward": "VIP 배지 + 모든 제한 면제 3시간", "effect": {"type": "all", "duration": 180}},  # 메시지 20개
         {"xp": 450, "name": "✨ 전설", "reward": "24시간 완전 면제 + 특별 축하 메시지", "effect": {"type": "all", "duration": 1440, "vip_winner": True}},  # 메시지 30개 (평일), 18개 (주말)
     ]
 }
 
 # 사용자 데이터 구조: {user_id: {"xp": int, "last_msg": timestamp, "date": "YYYY-MM-DD", "claimed": [tier_idx], "rewards_active": {}, "legendary_on_weekend": bool}}
 user_xp_data: Dict[int, dict] = {}
+
+# ────────────────────────────────────────────────────────────────────────────
+# 업적 시스템 (Achievement System)
+# ────────────────────────────────────────────────────────────────────────────
+
+ACHIEVEMENTS_FILE = "achievements_data.pkl"
+
+# 업적 정의 (평일 / 주말 조건 분리)
+ACHIEVEMENTS = {
+    # 기본 업적
+    "first_message": {
+        "name": "🎉 첫 발걸음",
+        "description": "첫 메시지 전송",
+        "reward_xp": 50,
+        "condition": {"type": "total_messages", "count": 1, "weekend_count": 1}
+    },
+    "early_bird": {
+        "name": "🌅 일찍 일어난 새",
+        "description": "오전 6시 전에 메시지 전송",
+        "reward_xp": 100,
+        "condition": {"type": "time_range", "start": 0, "end": 6}
+    },
+    "night_owl": {
+        "name": "🦉 올빼미",
+        "description": "자정(00시~03시)에 메시지 전송",
+        "reward_xp": 100,
+        "condition": {"type": "time_range", "start": 0, "end": 3}
+    },
+    
+    # 메시지 수 업적 (주말: 1/3 조건)
+    "msg_10": {
+        "name": "💬 수다쟁이",
+        "description": "메시지 전송 (평일: 10개 / 주말: 3개)",
+        "reward_xp": 75,
+        "condition": {"type": "total_messages", "count": 10, "weekend_count": 3}
+    },
+    "msg_50": {
+        "name": "📢 활동가",
+        "description": "메시지 전송 (평일: 50개 / 주말: 15개)",
+        "reward_xp": 150,
+        "condition": {"type": "total_messages", "count": 50, "weekend_count": 15}
+    },
+    "msg_100": {
+        "name": "🎯 백발백중",
+        "description": "메시지 전송 (평일: 100개 / 주말: 30개)",
+        "reward_xp": 300,
+        "condition": {"type": "total_messages", "count": 100, "weekend_count": 30}
+    },
+    "msg_500": {
+        "name": "⭐ 베테랑",
+        "description": "메시지 전송 (평일: 500개 / 주말: 150개)",
+        "reward_xp": 500,
+        "condition": {"type": "total_messages", "count": 500, "weekend_count": 150}
+    },
+    "msg_1000": {
+        "name": "👑 전문가",
+        "description": "메시지 전송 (평일: 1000개 / 주말: 300개)",
+        "reward_xp": 1000,
+        "condition": {"type": "total_messages", "count": 1000, "weekend_count": 300}
+    },
+    
+    # 일일 활동 업적 (주말: 1/3 조건)
+    "daily_30": {
+        "name": "🔥 열정적인 하루",
+        "description": "하루 메시지 (평일: 30개 / 주말: 10개)",
+        "reward_xp": 200,
+        "condition": {"type": "daily_messages", "count": 30, "weekend_count": 10}
+    },
+    "daily_50": {
+        "name": "💪 활동왕",
+        "description": "하루 메시지 (평일: 50개 / 주말: 15개)",
+        "reward_xp": 350,
+        "condition": {"type": "daily_messages", "count": 50, "weekend_count": 15}
+    },
+    "daily_100": {
+        "name": "🚀 초인",
+        "description": "하루 메시지 (평일: 100개 / 주말: 30개)",
+        "reward_xp": 600,
+        "condition": {"type": "daily_messages", "count": 100, "weekend_count": 30}
+    },
+    
+    # 연속 출석 업적 (주말 보너스 없음 - 연속성이 중요)
+    "streak_3": {
+        "name": "📅 꾸준함의 시작",
+        "description": "3일 연속 출석",
+        "reward_xp": 150,
+        "condition": {"type": "login_streak", "days": 3}
+    },
+    "streak_7": {
+        "name": "🌟 일주일 챔피언",
+        "description": "7일 연속 출석",
+        "reward_xp": 400,
+        "condition": {"type": "login_streak", "days": 7}
+    },
+    "streak_30": {
+        "name": "💎 한 달의 전설",
+        "description": "30일 연속 출석",
+        "reward_xp": 1500,
+        "condition": {"type": "login_streak", "days": 30}
+    },
+    
+    # 레벨 업적
+    "legendary_first": {
+        "name": "✨ 전설의 시작",
+        "description": "전설 등급 최초 달성",
+        "reward_xp": 500,
+        "condition": {"type": "reach_tier", "tier": 4}  # 전설 티어
+    },
+    "legendary_weekend": {
+        "name": "🎊 주말의 전설",
+        "description": "주말에 전설 등급 달성",
+        "reward_xp": 300,
+        "condition": {"type": "legendary_weekend"}
+    },
+    "all_tiers": {
+        "name": "🏆 완전정복",
+        "description": "모든 등급 달성 (누적)",
+        "reward_xp": 800,
+        "condition": {"type": "all_tiers_reached"}
+    },
+    
+    # 특별 업적
+    "first_reward": {
+        "name": "🎁 보상 수령자",
+        "description": "첫 보상 수령",
+        "reward_xp": 100,
+        "condition": {"type": "rewards_claimed", "count": 1}
+    },
+    "collector": {
+        "name": "🗂️ 수집가",
+        "description": "5개 이상의 보상 수령 (누적)",
+        "reward_xp": 250,
+        "condition": {"type": "rewards_claimed", "count": 5}
+    },
+}
+
+# 업적 데이터: {user_id: {"unlocked": [achievement_ids], "progress": {}, "stats": {}}}
+achievements_data: Dict[int, dict] = {}
+
+def load_achievements_data():
+    # 업적 데이터 로드
+    global achievements_data
+    try:
+        if os.path.exists(ACHIEVEMENTS_FILE):
+            with open(ACHIEVEMENTS_FILE, "rb") as f:
+                achievements_data = pickle.load(f)
+            logging.info(f"업적 데이터 로드 완료: {len(achievements_data)}명")
+    except Exception as e:
+        logging.error(f"업적 데이터 로드 실패: {e}")
+        achievements_data = {}
+
+def save_achievements_data():
+    # 업적 데이터 저장
+    try:
+        with open(ACHIEVEMENTS_FILE, "wb") as f:
+            pickle.dump(achievements_data, f)
+    except Exception as e:
+        logging.error(f"업적 데이터 저장 실패: {e}")
+
+def init_user_achievements(user_id: int):
+    # 사용자 업적 데이터 초기화
+    if user_id not in achievements_data:
+        achievements_data[user_id] = {
+            "unlocked": [],
+            "stats": {
+                "total_messages": 0,
+                "daily_messages": 0,
+                "last_message_date": None,
+                "login_streak": 0,
+                "last_login_date": None,
+                "tiers_reached": set(),
+                "rewards_claimed_count": 0,
+                "legendary_weekend_count": 0,
+            }
+        }
+
+def check_achievements(user_id: int, event_type: str = None, **kwargs) -> List[str]:
+    
+    # 업적 체크 및 해금
+    # Returns: 새로 해금된 업적 ID 리스트
+    
+    init_user_achievements(user_id)
+    user_data = achievements_data[user_id]
+    unlocked = user_data["unlocked"]
+    stats = user_data["stats"]
+    newly_unlocked = []
+    
+    now = datetime.datetime.now(seoul_tz)
+    current_hour = now.hour
+    today = get_today_date()
+    
+    # 이벤트 타입별 통계 업데이트
+    if event_type == "message":
+        stats["total_messages"] += 1
+        
+        # 일일 메시지 카운트
+        if stats.get("last_message_date") != today:
+            stats["daily_messages"] = 1
+            stats["last_message_date"] = today
+            
+            # 로그인 스트릭 업데이트
+            last_login = stats.get("last_login_date")
+            if last_login:
+                last_date = datetime.datetime.strptime(last_login, "%Y-%m-%d")
+                today_date = datetime.datetime.strptime(today, "%Y-%m-%d")
+                days_diff = (today_date - last_date).days
+                
+                if days_diff == 1:
+                    stats["login_streak"] += 1
+                elif days_diff > 1:
+                    stats["login_streak"] = 1
+            else:
+                stats["login_streak"] = 1
+            
+            stats["last_login_date"] = today
+        else:
+            stats["daily_messages"] += 1
+    
+    elif event_type == "tier_reached":
+        tier_idx = kwargs.get("tier_idx")
+        if tier_idx is not None:
+            if "tiers_reached" not in stats:
+                stats["tiers_reached"] = set()
+            stats["tiers_reached"].add(tier_idx)
+    
+    elif event_type == "reward_claimed":
+        stats["rewards_claimed_count"] += 1
+    
+    elif event_type == "legendary_weekend":
+        stats["legendary_weekend_count"] += 1
+    
+    # 주말 여부 확인
+    weekend_mode = is_weekend()
+    
+    # 업적 체크
+    for ach_id, ach in ACHIEVEMENTS.items():
+        if ach_id in unlocked:
+            continue
+        
+        condition = ach["condition"]
+        cond_type = condition["type"]
+        achieved = False
+        
+        if cond_type == "total_messages":
+            # 주말이면 weekend_count, 평일이면 count 사용
+            required_count = condition.get("weekend_count", condition["count"]) if weekend_mode else condition["count"]
+            if stats.get("total_messages", 0) >= required_count:
+                achieved = True
+        
+        elif cond_type == "daily_messages":
+            # 주말이면 weekend_count, 평일이면 count 사용
+            required_count = condition.get("weekend_count", condition["count"]) if weekend_mode else condition["count"]
+            if stats.get("daily_messages", 0) >= required_count:
+                achieved = True
+        
+        elif cond_type == "time_range":
+            if condition["start"] <= current_hour < condition["end"]:
+                if event_type == "message":
+                    achieved = True
+        
+        elif cond_type == "login_streak":
+            if stats.get("login_streak", 0) >= condition["days"]:
+                achieved = True
+        
+        elif cond_type == "reach_tier":
+            if condition["tier"] in stats.get("tiers_reached", set()):
+                achieved = True
+        
+        elif cond_type == "legendary_weekend":
+            if stats.get("legendary_weekend_count", 0) >= 1:
+                achieved = True
+        
+        elif cond_type == "all_tiers_reached":
+            total_tiers = len(XP_CONFIG["reward_tiers"])
+            if len(stats.get("tiers_reached", set())) >= total_tiers:
+                achieved = True
+        
+        elif cond_type == "rewards_claimed":
+            # 주말이면 weekend_count, 평일이면 count 사용
+            required_count = condition.get("weekend_count", condition.get("count", 1)) if weekend_mode else condition.get("count", 1)
+            if stats.get("rewards_claimed_count", 0) >= required_count:
+                achieved = True
+        
+        if achieved:
+            unlocked.append(ach_id)
+            newly_unlocked.append(ach_id)
+            # 업적 달성 시 보너스 XP 지급
+            bonus_xp = ach.get("reward_xp", 0)
+            if bonus_xp > 0:
+                add_xp(user_id, bonus_xp)
+    
+    save_achievements_data()
+    return newly_unlocked
+
+def get_user_achievements(user_id: int) -> dict:
+    # 사용자 업적 정보 조회
+    init_user_achievements(user_id)
+    return achievements_data[user_id]
+
+def get_achievement_progress(user_id: int) -> str:
+    # 업적 진행도 문자열 생성
+    init_user_achievements(user_id)
+    user_data = achievements_data[user_id]
+    unlocked = user_data["unlocked"]
+    total = len(ACHIEVEMENTS)
+    
+    return f"{len(unlocked)}/{total} 업적 달성 ({len(unlocked)*100//total}%)"
+
+# ────────────────────────────────────────────────────────────────────────────
+# 디시인사이드 갤러리 인기 게시물 추천 시스템
+# ────────────────────────────────────────────────────────────────────────────
+
+# 갤러리 설정
+GALLERY_CONFIG = {
+    "battlegroundmobile": {
+        "name": "배틀그라운드 모바일",
+        "short_name": "모배",
+        "url": "https://gall.dcinside.com/mgallery/board/lists?id=battlegroundmobile",
+        "is_minor": True,
+        # 관리자 목록 (게시물 제외) - 닉네임과 UID를 분리하여 정확히 매칭
+        "exclude_admins": {
+            "nicknames": ["Kar98k", "모바일배틀그라운드", "사수나무"],
+            "uids": ["pubgmobile", "pubgm180516", "id696307779"]
+        }
+    }
+}
+
+async def fetch_hot_posts(gallery_id: str, is_minor: bool = False, limit: int = 30) -> List[dict]:
+    
+    # 디시인사이드 갤러리의 게시물을 가져와서 인기도 순으로 정렬합니다.
+    # Returns: [{"no": 게시글번호, "title": 제목, "author": 작성자, "ip": IP, "link": 링크, 
+    #           "has_image": 이미지여부, "recommend": 추천수, "view": 조회수, "comment": 댓글수, "hot_score": 인기점수}]
+    
+    try:
+        if is_minor:
+            url = f"https://gall.dcinside.com/mgallery/board/lists?id={gallery_id}"
+        else:
+            url = f"https://gall.dcinside.com/board/lists?id={gallery_id}"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            posts = []
+            
+            # 게시글 목록 파싱
+            rows = soup.select('tr.ub-content')
+            
+            for row in rows:
+                try:
+                    # 게시글 번호
+                    num_elem = row.select_one('td.gall_num')
+                    if not num_elem or num_elem.text.strip() in ['공지', '설문', 'AD']:
+                        continue
+                    
+                    post_no = int(num_elem.text.strip())
+                    
+                    # 제목 및 링크
+                    title_elem = row.select_one('td.gall_tit a')
+                    if not title_elem:
+                        continue
+                    
+                    title = title_elem.text.strip()
+                    link_path = title_elem.get('href', '')
+                    
+                    # 이미지 여부
+                    has_image = row.select_one('em.icon_pic') is not None
+                    
+                    # 댓글 수
+                    comment_elem = row.select_one('span.reply_num')
+                    comment_count = 0
+                    if comment_elem:
+                        comment_text = comment_elem.text.strip().replace('[', '').replace(']', '')
+                        try:
+                            comment_count = int(comment_text)
+                        except:
+                            comment_count = 0
+                    
+                    # 추천 수
+                    recommend_elem = row.select_one('td.gall_recommend')
+                    recommend = 0
+                    if recommend_elem:
+                        try:
+                            recommend = int(recommend_elem.text.strip())
+                        except:
+                            recommend = 0
+                    
+                    # 조회 수
+                    view_elem = row.select_one('td.gall_count')
+                    view_count = 0
+                    if view_elem:
+                        try:
+                            view_count = int(view_elem.text.strip())
+                        except:
+                            view_count = 0
+                    
+                    # 작성자 정보
+                    writer_elem = row.select_one('td.gall_writer')
+                    author_nick = ""
+                    author_ip = ""
+                    
+                    if writer_elem:
+                        # 닉네임
+                        nick_elem = writer_elem.select_one('span.nickname em')
+                        if nick_elem:
+                            author_nick = nick_elem.text.strip()
+                        
+                        # IP 또는 UID
+                        ip_elem = writer_elem.select_one('span.ip')
+                        if ip_elem:
+                            author_ip = ip_elem.text.strip()
+                        else:
+                            # UID인 경우
+                            uid = writer_elem.get('data-uid', '')
+                            if uid:
+                                author_ip = f"UID:{uid}"
+                    
+                    # 전체 링크 생성
+                    if is_minor:
+                        full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mgallery/board/view/?id={gallery_id}&no={post_no}"
+                    else:
+                        full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/board/view/?id={gallery_id}&no={post_no}"
+                    
+                    # 인기 점수 계산 (추천 * 5 + 댓글 * 2 + 조회수 / 10)
+                    hot_score = (recommend * 5) + (comment_count * 2) + (view_count / 10)
+                    
+                    posts.append({
+                        "no": post_no,
+                        "title": title,
+                        "author": author_nick,
+                        "ip": author_ip,
+                        "link": full_link,
+                        "has_image": has_image,
+                        "recommend": recommend,
+                        "view": view_count,
+                        "comment": comment_count,
+                        "hot_score": hot_score
+                    })
+                    
+                except Exception as e:
+                    logging.error(f"게시글 파싱 오류: {e}")
+                    continue
+            
+            # 관리자 게시물 필터링 (닉네임과 UID를 분리하여 정확히 매칭)
+            config_data = GALLERY_CONFIG.get(gallery_id, {})
+            exclude_admins = config_data.get("exclude_admins", {})
+            
+            if exclude_admins:
+                admin_nicknames = exclude_admins.get("nicknames", [])
+                admin_uids = exclude_admins.get("uids", [])
+                
+                filtered_posts = []
+                for post in posts:
+                    is_admin = False
+                    
+                    # 닉네임으로 필터링 (author 필드에서 정확히 매칭)
+                    if post["author"] in admin_nicknames:
+                        is_admin = True
+                    
+                    # UID로 필터링 (ip 필드에서 "UID:" 접두사를 제거하고 매칭)
+                    post_uid = post["ip"].replace("UID:", "") if post["ip"].startswith("UID:") else post["ip"]
+                    if post_uid in admin_uids:
+                        is_admin = True
+                    
+                    if not is_admin:
+                        filtered_posts.append(post)
+                
+                posts = filtered_posts
+            
+            # 인기 점수 순으로 정렬
+            posts.sort(key=lambda x: x["hot_score"], reverse=True)
+            
+            return posts[:limit]
+            
+    except Exception as e:
+        logging.error(f"갤러리 {gallery_id} 불러오기 실패: {e}")
+        return []
 
 def is_weekend() -> bool:
     # 주말 여부 확인 (금요일, 토요일, 일요일)
@@ -58,27 +542,35 @@ def is_weekend() -> bool:
     return now.weekday() >= 4  # 금(4), 토(5), 일(6)
 
 def load_xp_data():
-    # 경험치 데이터 로드 (파일 저장 불가능 환경 - 메모리만 사용)
+    # 경험치 데이터 로드
     global user_xp_data
-    user_xp_data = {}
-    logging.info("XP 데이터: 메모리 전용 모드 (파일 저장 비활성화)")
+    try:
+        if os.path.exists(XP_DATA_FILE):
+            with open(XP_DATA_FILE, "rb") as f:
+                user_xp_data = pickle.load(f)
+            logging.info(f"XP 데이터 로드 완료: {len(user_xp_data)}명")
+    except Exception as e:
+        logging.error(f"XP 데이터 로드 실패: {e}")
+        user_xp_data = {}
 
 def save_xp_data():
-    # 경험치 데이터 저장 (파일 저장 불가능 환경 - 비활성화)
-    # 메모리 전용 모드이므로 저장하지 않음
-    pass
+    # 경험치 데이터 저장
+    try:
+        with open(XP_DATA_FILE, "wb") as f:
+            pickle.dump(user_xp_data, f)
+    except Exception as e:
+        logging.error(f"XP 데이터 저장 실패: {e}")
 
 def get_today_date() -> str:
     # 서울 시간 기준 오늘 날짜
     return datetime.datetime.now(seoul_tz).strftime("%Y-%m-%d")
 
 def reset_daily_xp():
-    # 자정 리셋 체크 및 실행 (메모리 최적화 - 파일 저장 없음)
-    global user_xp_data
+    # 자정 리셋 체크 및 실행 (경험치 + 업적)
+    global user_xp_data, achievements_data
     today = get_today_date()
     
-    # 오래된 사용자 데이터 정리 (메모리 절약)
-    users_to_remove = []
+    # 경험치 리셋
     for uid in list(user_xp_data.keys()):
         data = user_xp_data[uid]
         if data.get("date") != today:
@@ -90,22 +582,48 @@ def reset_daily_xp():
                 "claimed": [],
                 "rewards_active": {}
             }
-        # 7일 이상 비활성 사용자 제거 (메모리 최적화)
-        if data.get("last_msg", 0) and (time.time() - data.get("last_msg", 0)) > 604800:  # 7일
-            users_to_remove.append(uid)
+    save_xp_data()
     
-    # 비활성 사용자 일괄 제거
-    for uid in users_to_remove:
-        del user_xp_data[uid]
-    
-    if users_to_remove:
-        logging.info(f"메모리 최적화: {len(users_to_remove)}명의 비활성 사용자 데이터 제거")
-    
-    # 파일 저장 비활성화 (메모리 전용)
+    # 업적 리셋 (24시간 하드리셋)
+    for uid in list(achievements_data.keys()):
+        # 업적은 완전히 초기화 (연속 출석 제외)
+        ach_data = achievements_data[uid]
+        old_streak = ach_data.get("stats", {}).get("login_streak", 0)
+        old_last_login = ach_data.get("stats", {}).get("last_login_date", None)
+        
+        # 연속 출석 계산
+        if old_last_login:
+            last_date = datetime.datetime.strptime(old_last_login, "%Y-%m-%d")
+            today_date = datetime.datetime.strptime(today, "%Y-%m-%d")
+            days_diff = (today_date - last_date).days
+            
+            # 2일 이상 차이나면 스트릭 끊김
+            if days_diff > 1:
+                new_streak = 0
+            else:
+                new_streak = old_streak
+        else:
+            new_streak = 0
+        
+        # 업적 데이터 리셋
+        achievements_data[uid] = {
+            "unlocked": [],
+            "stats": {
+                "total_messages": 0,
+                "daily_messages": 0,
+                "last_message_date": None,
+                "login_streak": new_streak,
+                "last_login_date": old_last_login,
+                "tiers_reached": set(),
+                "rewards_claimed_count": 0,
+                "legendary_weekend_count": 0,
+            }
+        }
+    save_achievements_data()
 
-def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
-    # 경험치 추가 (메모리 최적화)
-    # Returns: (현재 xp, 레벨업 여부, 새 티어 인덱스 or None)
+def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int, list]:
+    # 경험치 추가
+    # Returns: (현재 xp, 레벨업 여부, 새 티어 인덱스 or None, 새로 달성한 업적 리스트)
     
     if amount is None:
         # 주말 여부에 따라 경험치 결정
@@ -117,7 +635,7 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
     today = get_today_date()
     now = time.time()
     
-    # 초기화 (최소 데이터만 저장)
+    # 초기화
     if user_id not in user_xp_data:
         user_xp_data[user_id] = {
             "xp": 0,
@@ -131,18 +649,14 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
     
     # 날짜 체크 (자정 넘어갔는지)
     if data["date"] != today:
-        # 오래된 데이터 정리
-        data.clear()
-        data.update({
-            "xp": 0,
-            "claimed": [],
-            "date": today,
-            "rewards_active": {}
-        })
+        data["xp"] = 0
+        data["claimed"] = []
+        data["date"] = today
+        data["rewards_active"] = {}
     
     # 쿨다운 체크
-    if now - data.get("last_msg", 0) < XP_CONFIG["msg_cooldown"]:
-        return data["xp"], False, None
+    if now - data["last_msg"] < XP_CONFIG["msg_cooldown"]:
+        return data["xp"], False, None, []
     
     # 이전 XP
     old_xp = data["xp"]
@@ -150,15 +664,6 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
     # XP 추가
     data["xp"] += amount
     data["last_msg"] = now
-    
-    # 만료된 보상 정리 (메모리 최적화)
-    if "rewards_active" in data:
-        expired_rewards = []
-        for tier_idx, reward in data["rewards_active"].items():
-            if reward.get("expires_at", 0) < now and reward.get("count", 1) <= 0:
-                expired_rewards.append(tier_idx)
-        for tier_idx in expired_rewards:
-            del data["rewards_active"][tier_idx]
     
     # 새 티어 도달 체크 및 VIP Winner 플래그
     leveled_up = False
@@ -169,31 +674,44 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int]:
             new_tier_idx = i
             break
 
+    # 업적 체크 리스트
+    new_achievements = []
+
     # VIP Winner: 최고 등급 달성 시 오늘 첫 메시지에만 플래그
     if new_tier_idx is not None and new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1:
         # 최고 등급 (전설)
+        today = get_today_date()
         if data.get("vip_winner_date") != today:
             data["vip_winner_date"] = today
             data["vip_winner_announced"] = False
             # 주말에 전설 달성 여부 기록
             data["legendary_on_weekend"] = is_weekend()
+            
+            # 업적: 주말에 전설 달성
+            if is_weekend():
+                new_achievements.extend(check_achievements(user_id, "legendary_weekend"))
+    
+    # 업적: 티어 도달
+    if new_tier_idx is not None:
+        new_achievements.extend(check_achievements(user_id, "tier_reached", tier_idx=new_tier_idx))
+    
+    # 업적: 메시지 전송
+    new_achievements.extend(check_achievements(user_id, "message"))
 
-    # 파일 저장 비활성화 (메모리 전용 모드)
-    return data["xp"], leveled_up, new_tier_idx
+    save_xp_data()
+    return data["xp"], leveled_up, new_tier_idx, new_achievements
 
 def get_user_xp(user_id: int) -> dict:
-    # 사용자 경험치 정보 조회 (메모리 효율적)
+    # 사용자 경험치 정보 조회
     today = get_today_date()
     
     if user_id not in user_xp_data:
-        # 기본값만 반환, 저장하지 않음 (메모리 절약)
         return {"xp": 0, "last_msg": 0, "date": today, "claimed": [], "rewards_active": {}}
     
     data = user_xp_data[user_id]
     
     # 날짜 체크
-    if data.get("date") != today:
-        # 기본값 반환, 실제 초기화는 add_xp에서만
+    if data["date"] != today:
         return {"xp": 0, "last_msg": 0, "date": today, "claimed": [], "rewards_active": {}}
     
     return data
@@ -212,7 +730,7 @@ def get_available_rewards(user_id: int) -> list:
     return available
 
 def claim_reward(user_id: int, tier_idx: int) -> bool:
-    # 리워드 수령 (메모리 전용)
+    # 리워드 수령
     data = user_xp_data.get(user_id)
     if not data:
         return False
@@ -234,7 +752,11 @@ def claim_reward(user_id: int, tier_idx: int) -> bool:
         rewards[str(tier_idx)] = {"count": count}
     # Mark as claimed
     data["claimed"].append(tier_idx)
-    # 파일 저장 비활성화 (메모리 전용)
+    
+    # 업적: 보상 수령
+    check_achievements(user_id, "reward_claimed")
+    
+    save_xp_data()
     return True
 
 def is_user_exempt_from_spam(user_id: int) -> bool:
@@ -316,10 +838,10 @@ def is_user_exempt_from_profanity(user_id: int) -> bool:
     return False
 
 def use_profanity_pass(user_id: int):
-    # 금칙어 면제권 사용 (메모리 전용)
+    # 금칙어 면제권 사용
     if user_id in user_xp_data:
         user_xp_data[user_id]["profanity_used"] = True
-        # 파일 저장 비활성화 (메모리 전용)
+        save_xp_data()
 
 # 금칙어 검열 기능의 버그를 해결하기 위한 임기응변 
 async def safe_delete(message: discord.Message):
@@ -557,13 +1079,13 @@ EXEMPT_SPAM_CHANNEL_IDS = {
     1155789990173868122,
 }
 
-# 유저별 최근 메시지 버퍼 & 통계 (메모리 최적화)
-_user_msgs = defaultdict(deque)      # user_id -> deque[(ts, norm, channel_id, len)] - raw 제거
+# 유저별 최근 메시지 버퍼 & 통계
+_user_msgs = defaultdict(deque)      # user_id -> deque[(ts, norm, channel_id, len, raw)]
 _last_warn_ts = {}                   # user_id -> ts(last warn)
-_user_violations = defaultdict(int)  # user_id -> violation count 
+_user_violations = defaultdict(int)  # user_id -> violation count (신규)
 _user_last_violation = {}            # user_id -> ts(last violation) - 점진적 제한용
 _user_deletion_rate = defaultdict(float)  # user_id -> 삭제 확률 (0.0~1.0)
-MAX_BUF = 30                         # 60 → 30으로 축소 (메모리 50% 절감)    
+MAX_BUF = 60                         # 버퍼 크기 증가 (기존 50)    
 
 def _normalize_text(s: str) -> str:
     
@@ -656,9 +1178,9 @@ def check_spam_and_reason(message) -> Optional[str]:
         _user_violations[uid] = 0
         _user_deletion_rate[uid] = 0.0
 
-    # 버퍼 업데이트 (raw 저장 제거로 메모리 절약)
+    # 버퍼 업데이트(오래된 항목 제거)
     dq = _user_msgs[uid]
-    dq.append((now, norm, ch, nlen))  # raw 제거
+    dq.append((now, norm, ch, nlen, raw))
     while dq and now - dq[0][0] > 60:  # 60초 이상 지난 건 버림
         dq.popleft()
     if len(dq) > MAX_BUF:
@@ -722,7 +1244,7 @@ def check_spam_and_reason(message) -> Optional[str]:
     # 2) 짧은 메시지 연타 (ㅇ, ㅋ, ㅠ 등)
     # ──────────────────────────────────────────────────────
     if nlen <= SPAM_CFG["short_len"]:
-        cnt = sum(1 for ts, nm, c, l in dq 
+        cnt = sum(1 for ts, nm, c, l, r in dq 
                  if now - ts <= SPAM_CFG["window_short_s"] 
                  and c == ch 
                  and l <= SPAM_CFG["short_len"])
@@ -740,7 +1262,7 @@ def check_spam_and_reason(message) -> Optional[str]:
     # ──────────────────────────────────────────────────────
     
     # 3-a) 완전 동일 메시지
-    identical_cnt = sum(1 for ts, nm, c, l in dq
+    identical_cnt = sum(1 for ts, nm, c, l, r in dq
                        if now - ts <= SPAM_CFG["window_identical_s"] 
                        and c == ch 
                        and nm == norm 
@@ -757,7 +1279,7 @@ def check_spam_and_reason(message) -> Optional[str]:
     # 3-b) 유사한 메시지 (75% 이상 유사, 우회 방지 강화)
     if nlen >= 4:  # 4글자 이상부터 검사 (기존 5에서 강화)
         similar_cnt = 0
-        for ts, nm, c, l in dq:
+        for ts, nm, c, l, r in dq:
             if (now - ts <= SPAM_CFG["window_similar_s"] 
                 and c == ch 
                 and nm != norm  # 완전 동일은 이미 위에서 체크
@@ -778,7 +1300,7 @@ def check_spam_and_reason(message) -> Optional[str]:
     # ──────────────────────────────────────────────────────
     
     # 4-a) 10초 윈도우
-    rate_10s = sum(1 for ts, nm, c, l in dq 
+    rate_10s = sum(1 for ts, nm, c, l, r in dq 
                    if now - ts <= SPAM_CFG["window_rate_s"] and c == ch)
     if rate_10s >= SPAM_CFG["max_msgs_per_10s"]:
         _user_violations[uid] += 1
@@ -790,7 +1312,7 @@ def check_spam_and_reason(message) -> Optional[str]:
         return f"과도한 연속 발화 ({rate_10s}회/10초)"
     
     # 4-b) 30초 윈도우 (더 심각한 도배)
-    rate_30s = sum(1 for ts, nm, c, l in dq 
+    rate_30s = sum(1 for ts, nm, c, l, r in dq 
                    if now - ts <= SPAM_CFG["window_rate_30s"] and c == ch)
     if rate_30s >= SPAM_CFG["max_msgs_per_30s"]:
         _user_violations[uid] += 1
@@ -802,7 +1324,7 @@ def check_spam_and_reason(message) -> Optional[str]:
         return f"심각한 도배 감지 ({rate_30s}회/30초)"
     
     # 4-c) 60초 윈도우 (장기적 도배 패턴, 우회 방지)
-    rate_60s = sum(1 for ts, nm, c, l in dq 
+    rate_60s = sum(1 for ts, nm, c, l, r in dq 
                    if now - ts <= SPAM_CFG["window_rate_60s"] and c == ch)
     if rate_60s >= SPAM_CFG["max_msgs_per_60s"]:
         _user_violations[uid] += 1
@@ -1013,7 +1535,7 @@ MAX_MSG   = 1900
 FILE_TH   = 6000
 HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
 IMG_MODEL    = "stabilityai/stable-diffusion-xl-base-1.0" 
-ENDPOINT     = f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}"
+ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
 HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
 img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
 
@@ -1119,8 +1641,8 @@ MENTION_LOG: deque[float] = deque(maxlen=5)   # PEP 585 문법은 3.9에서도 �
 # ‘최근 메시지 기록’ – 지금 자주 언급되는 키워드 탐지를 위한 기능 - 핫 키워드
 # ────────────────────────────────────────────────────────────────────────────
 
-# 1) 버퍼 길이 (메모리 최적화: 20 → 12)
-MAX_BUFFER = 12
+# 1) 버퍼 길이 (개선: 5 → 20으로 확대하여 더 많은 데이터 수집)
+MAX_BUFFER = 20
 
 # 2) 채널별 버퍼 딕셔너리 (메시지 내용 + 타임스탬프 저장)
 RECENT_BY_CH: Dict[int, deque] = {}
@@ -1201,11 +1723,11 @@ def clear_recent(channel_id: int) -> None:
 # 9) 핫 키워드 계산 (시간 가중치 적용, 더 엄격한 기준)
 def pick_hot_keyword(channel_id: int) -> Optional[str]:
     buf = list(_get_buf(channel_id))
-    if len(buf) < 5:  # 8 → 5로 축소 (메모리 효율)
+    if len(buf) < 8:  # 최소 8개 메시지 필요 (기존 5에서 증가)
         return None
     
     now = time.time()
-    weighted_freq = {}  # Counter → dict로 변경 (메모리 절약)
+    weighted_freq = Counter()
     author_keyword_count = defaultdict(lambda: defaultdict(int))  # 사용자별 키워드 카운트 (스팸 방지)
     
     for timestamp, text in buf:
@@ -1227,13 +1749,13 @@ def pick_hot_keyword(channel_id: int) -> Optional[str]:
         
         # 가중치 적용
         for token in tokens:
-            weighted_freq[token] = weighted_freq.get(token, 0) + weight
+            weighted_freq[token] += weight
     
     if not weighted_freq:
         return None
     
-    # 상위 키워드 분석 (dict를 정렬)
-    top_keywords = sorted(weighted_freq.items(), key=lambda x: x[1], reverse=True)[:10]
+    # 상위 키워드 분석
+    top_keywords = weighted_freq.most_common(10)  # 상위 10개 분석 (기존 5에서 증가)
     
     # 필터링 조건:
     # 1. 가중 빈도 최소 6.0 이상 (단순 2회 → 시간 가중 6.0으로 강화)
@@ -1267,7 +1789,7 @@ def get_keyword_stats(channel_id: int) -> Optional[Dict]:
         return None
     
     now = time.time()
-    weighted_freq = {}  # Counter → dict로 변경
+    weighted_freq = Counter()
     
     for timestamp, text in buf:
         tokens = tokenize(text)
@@ -1283,9 +1805,9 @@ def get_keyword_stats(channel_id: int) -> Optional[Dict]:
             weight = 1.0
         
         for token in tokens:
-            weighted_freq[token] = weighted_freq.get(token, 0) + weight
+            weighted_freq[token] += weight
     
-    top_5 = sorted(weighted_freq.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_5 = weighted_freq.most_common(5)
     
     return {
         "channel_id": channel_id,
@@ -1542,96 +2064,113 @@ async def on_message_delete(message: discord.Message):
 GAME_CARDS: dict[str, dict] = {
     "pubg": {   # 모배 / 배그
         "pattern": re.compile(rf"(모{FILLER}배|배{FILLER}그|pubg)", re.I),
-        "title":   "🚀  **이제, 모든 곳이 배틀그라운드**",
+        "title":   "PUBG MOBILE",
+        "subtitle": "The Ultimate Battle Royale Experience",
         "desc": (
-            "누적 매출 **100억 달러** 돌파!\n"
-            "글로벌 모바일 게임 매출 **Top 2**\n\n"
-
+            "### 🏆 Global Phenomenon\n"
+            "• **$10 Billion+** in lifetime revenue\n"
+            "• **#2** highest-grossing mobile game worldwide\n"
+            "• **100M+** players in the arena right now\n\n"
+            "**Experience tactical combat where every decision counts.**"
         ),
         "thumb":  "https://iili.io/FzATZBI.md.jpg",
         "banner": "https://iili.io/FzAaKEQ.jpg",
+        "color": 0xFF6B35,
         "links": [
-            ("Android", "🤖", "https://play.google.com/store/apps/details?id=com.pubg.krmobile"),
-            ("iOS",     "🍎", "https://apps.apple.com/kr/app/%EB%B0%B0%ED%8B%80%EA%B7%B8%EB%9D%9C%EC%9A%B4%EB%93%9C/id1366526331"),
-            ("Official Discord", "🌐", "https://discord.com/invite/pubgmobile"),
+            ("Download on Android", "https://play.google.com/store/apps/details?id=com.pubg.krmobile"),
+            ("Download on iOS", "https://apps.apple.com/kr/app/%EB%B0%B0%ED%8B%80%EA%B7%B8%EB%9D%9C%EC%9A%B4%EB%93%9C/id1366526331"),
+            ("Join Official Discord", "https://discord.com/invite/pubgmobile"),
         ],
-        "cta": "Squad-up & jump in!",
+        "cta": "🎯 **SQUAD UP NOW** • Drop in. Loot up. Win.",
+        "footer": "100+ million concurrent players • Updated weekly",
     },
 
     "overwatch": {
         "pattern": re.compile(r"(옵치|오버워치|overwatch)", re.I),
-        "title":   "⚡ **새로운 영웅은 언제나 환영이야!**",
+        "title":   "OVERWATCH 2",
+        "subtitle": "The World Needs Heroes",
         "desc": (
-            "2016년은 가히 오버워치의 해!\n"
-            "PC 게임 판매량 1위, 콘솔 게임 판매량 5위!\n\n"
-
+            "### ⚡ Award-Winning Team Shooter\n"
+            "• **Game of the Year 2016** — Multiple Awards\n"
+            "• **#1** best-selling PC game at launch\n"
+            "• **40M+** heroes have answered the call\n\n"
+            "**Choose from 35+ unique heroes and change the world.**"
         ),
         "thumb":   "https://iili.io/Fz7CWu4.jpg",
         "banner":  "https://iili.io/Fz75imX.png",
+        "color": 0xFA9C1E,
         "links": [
-            ("Battle.net",  "🖥️", "https://playoverwatch.com/"),
-            ("Steam",       "💠", "https://store.steampowered.com/app/2357570/Overwatch_2/"),
-            ("Patch Notes", "📜", "https://us.forums.blizzard.com/en/overwatch/c/patch-notes"),
+            ("Play on Battle.net", "https://playoverwatch.com/"),
+            ("Play on Steam", "https://store.steampowered.com/app/2357570/Overwatch_2/"),
+            ("View Patch Notes", "https://us.forums.blizzard.com/en/overwatch/c/patch-notes"),
         ],
-        "cta": "Group-up & push the payload!",
+        "cta": "🔥 **JOIN THE FIGHT** • Free-to-play. Pure fun.",
+        "footer": "New season • New heroes • New challenges",
     },
 
     "tarkov": {
-
         "pattern": re.compile(r"(타르코프|탈콥|tarkov)", re.I),
-
-        "title":   "🕶️ **은밀하게, 그곳을 탈출하라!**",
+        "title":   "ESCAPE FROM TARKOV",
+        "subtitle": "Hardcore Survival at Its Finest",
+        "desc": (
+            "### 🎖️ The Ultimate Tactical FPS\n"
+            "• **Hyper-realistic** combat simulation\n"
+            "• **Deep progression** with RPG mechanics\n"
+            "• **Every raid matters** — High risk, high reward\n\n"
+            "**Warning:** Not for the faint of heart. Prepare to die, learn, adapt."
+        ),
         "thumb":   "https://iili.io/Fz78tRI.jpg",
         "banner":  "https://iili.io/FzcPgNj.jpg",
-
-        "desc": (
-            "하드코어 FPS 게임을 좋아하는 유저들에게\n"
-            "깊이 있는 게임 경험을 제공하지만,  \n"
-            "초보자에게는 진입 장벽이 높은 게임. \n"
-
-        ),
-
+        "color": 0x556B2F,
         "links": [
-            ("Pre-order / EoD", "💳", "https://www.escapefromtarkov.com/preorder-page"),
-            ("Wiki",    "📚", "https://escapefromtarkov.fandom.com/wiki/Escape_from_Tarkov_Wiki"),
-            ("Patch Notes", "📝", "https://www.escapefromtarkov.com/#news"),
+            ("Pre-order Now", "https://www.escapefromtarkov.com/preorder-page"),
+            ("Official Wiki", "https://escapefromtarkov.fandom.com/wiki/Escape_from_Tarkov_Wiki"),
+            ("Latest Updates", "https://www.escapefromtarkov.com/#news"),
         ],
-
-        "cta": "Think twice—then check your mags & try to extract!",
+        "cta": "⚠️ **ENTER IF YOU DARE** • Check your gear. Trust no one.",
+        "footer": "Hardcore realism • Unforgiving gameplay • Unforgettable moments",
     },
 
     "minecraft": {
         "pattern": re.compile(r"(마크|마인크래프트|minecraft)", re.I),
-        "title":   "**⛏️ Mine. Craft. Repeat.**",
+        "title":   "MINECRAFT",
+        "subtitle": "Build. Explore. Survive. Together.",
         "desc": (
-            "3억 장 판매, 역대 *게임 판매량 1위*\n"
-            "친구들과 새로운 월드를 탐험해 보세요!"
-
+            "### 🌍 The Best-Selling Game of All Time\n"
+            "• **300 Million+** copies sold worldwide\n"
+            "• **Infinite possibilities** in procedurally generated worlds\n"
+            "• **Cross-platform play** with friends everywhere\n\n"
+            "**Your imagination is the only limit.**"
         ),
         "thumb":   "https://iili.io/Fz7DYa1.jpg",
         "banner":  "https://iili.io/FzYKwSj.jpg",
+        "color": 0x62C54A,
         "links": [
-            ("Java Edition", "💻", "https://www.minecraft.net/en-us/store/minecraft-java-bedrock-edition-pc"),
-
+            ("Get Java Edition", "https://www.minecraft.net/en-us/store/minecraft-java-bedrock-edition-pc"),
         ],
-        "cta": "**⛏️ Mine. Craft. Repeat.**",
+        "cta": "⛏️ **START YOUR ADVENTURE** • Mine. Craft. Create.",
+        "footer": "Regular updates • Endless creativity • Global community",
     },
 
     "GTA": {
-        "pattern": re.compile(r"(GTA|그타)", re.I),
-        "title":   "**🏙️ Welcome to Los Santos**",
+        "pattern": re.compile(r"(GTA|그타|gta|Gta)", re.I),
+        "title":   "GRAND THEFT AUTO V",
+        "subtitle": "Welcome to Los Santos",
         "desc": (
-            "• GTA V 누적 판매 2억 장!\n"
-            "친구들과 자유롭게 거리를 누벼보세요."
-
+            "### 🌆 The Legendary Open-World Experience\n"
+            "• **200 Million+** copies sold — Still breaking records\n"
+            "• **Vast open world** with endless activities\n"
+            "• **GTA Online** constantly evolving with new content\n\n"
+            "**Los Santos awaits. What will you become?**"
         ),
         "thumb":   "https://iili.io/Fz7D73P.png",
         "banner":  "https://iili.io/FzYcOJ4.jpg",
+        "color": 0x0C8A3E,
         "links": [
-            ("Steam", "💻", "https://store.steampowered.com/app/3240220/Grand_Theft_Auto_V_Enhanced/"),
-
+            ("Buy on Steam", "https://store.steampowered.com/app/3240220/Grand_Theft_Auto_V_Enhanced/"),
         ],
-        "cta": "But remember: crimes are fun only in games 🏷️",
+        "cta": "🏙️ **EXPLORE LOS SANTOS** • Your story. Your rules.",
+        "footer": "Enhanced & expanded • Active community • Regular updates",
     },
 }
 
@@ -1669,13 +2208,47 @@ async def on_message(message: discord.Message):
 
     # ───── 경험치 획득 (봇이 아닌 경우만) ─────
     if not message.author.bot:
-        xp, leveled_up, new_tier_idx = add_xp(user_id)
-        # 레벨업 알림 및 자동 보상 수령
+        xp, leveled_up, new_tier_idx, new_achievements = add_xp(user_id)
+        
+        # 업적 달성 알림
+        if new_achievements:
+            for ach_id in new_achievements:
+                ach = ACHIEVEMENTS.get(ach_id)
+                if ach:
+                    # 주말 보너스 여부
+                    weekend_bonus = is_weekend()
+                    
+                    # 주말 보너스 메시지 생성
+                    if weekend_bonus:
+                        weekend_info = "\n🎊 **주말 보너스로 달성!** (조건 완화 적용)\n"
+                    else:
+                        weekend_info = ""
+                    
+                    ach_embed = discord.Embed(
+                        title="🏆 업적 달성!" + (" 🎊" if weekend_bonus else ""),
+                        description=(
+                            f"**{message.author.mention}** 님이 업적을 달성했습니다!\n"
+                            f"{weekend_info}"
+                            f"\n"
+                            f"**{ach['name']}**\n"
+                            f"_{ach['description']}_\n"
+                            f"\n"
+                            f"💰 **보너스 XP**: +{ach.get('reward_xp', 0)} XP (즉시 지급)\n"
+                            f"\n"
+                            f"💡 `!업적` 명령어로 전체 업적을 확인하세요!\n"
+                            f"⏰ **주의**: 자정(00:00)에 업적이 초기화됩니다!"
+                        ),
+                        color=0xFFD700 if weekend_bonus else 0x00E5FF,
+                        timestamp=datetime.datetime.now(seoul_tz)
+                    )
+                    ach_embed.set_thumbnail(url=message.author.display_avatar.url)
+                    footer_text = "🎊 주말 보너스 달성!" if weekend_bonus else "⚠️ 24시간 하드리셋!"
+                    ach_embed.set_footer(text=footer_text + " | 매일 새롭게 도전!")
+                    await message.channel.send(embed=ach_embed, delete_after=15)
+        
+        # 레벨업 알림
         if leveled_up and new_tier_idx is not None:
             tier = XP_CONFIG["reward_tiers"][new_tier_idx]
-            
-            # 자동으로 보상 수령
-            claim_reward(user_id, new_tier_idx)
             
             # 전설 등급 + 주말 보너스 체크
             is_legendary = new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1
@@ -1701,7 +2274,7 @@ async def on_message(message: discord.Message):
                     f"**현재 경험치:** {xp} XP\n"
                     f"**보상:** {tier['reward']}\n"
                     f"\n"
-                    f"✅ **보상이 자동으로 수령되었습니다!**\n"
+                    f"💡 `!claim` 명령어로 보상을 수령하세요!\n"
                     f"⏰ **자정(00:00)에 경험치가 0으로 초기화됩니다!**"
                 ),
                 color=0xFFD700,
@@ -1724,7 +2297,7 @@ async def on_message(message: discord.Message):
                     # 주말 전설 달성
                     vip_title = "🎊 주말 보너스 VIP Winner! 🎊"
                     vip_description = (
-                        f"✨ **{message.author.mention}** 님이 **주말 보너스**로 오늘의 **최고 등급(전설)**에 도달했습니다!\n"
+                        f"✨ **{message.author.mention}** 님이 **주말 보너스**로 \n\n오늘의 **최고 등급(전설)**에 도달했습니다!\n"
                         f"\n"
                         f"🎁 **주말 특별 달성!** (메시지당 25 XP 적용)\n"
                         f"모두가 우러러보는 진정한 챔피언!\n"
@@ -1758,8 +2331,14 @@ async def on_message(message: discord.Message):
                 # 플래그 저장
                 user_xp_data[user_id]["vip_winner_announced"] = True
                 save_xp_data()
+        
+        # 업적 달성 알림 (레벨업 후 체크)
+        # add_xp 함수에서 이미 check_achievements가 호출되었으므로,
+        # 여기서는 최근 달성된 업적만 확인하여 알림
+        # 대신 레벨업과 별개로 업적 체크는 add_xp에서 이미 완료됨
+        # 필요시 여기서 추가 알림 로직 구현 가능
 
-    # ───── 제한 사용자 처리 (경험치 면제 체크 추가) ─────
+    # ───── 제한 사용자 처리 (면제권 기능 추가) ─────
     # 영구 제한 사용자는 어떠한 경우에도 제한 유지
     if user_id in BLOCK_MEDIA_USER_IDS:
         _dbg("HIT restricted user", user_id, "guild=", guild_id, "channel=", ch_id)
@@ -1867,70 +2446,6 @@ async def on_message(message: discord.Message):
         except Exception as e:
             log_ex("mention/reply", e)
     
-    # ───── 전설 등급 사용자 숭배 카드 (새 기능!) ─────
-    if not message.author.bot and message.guild:
-        data = get_user_xp(user_id)
-        top_idx = len(XP_CONFIG["reward_tiers"]) - 1
-        # 전설 등급이고, 아직 오늘 숭배 카드를 안 보여줬다면
-        if data.get("xp", 0) >= XP_CONFIG["reward_tiers"][top_idx]["xp"]:
-            today = get_today_date()
-            if data.get("vip_winner_date") == today and not data.get("worship_card_shown", False):
-                # 주말 여부 체크
-                is_weekend_legend = data.get("legendary_on_weekend", False)
-                
-                # 모든 사용자 멘션 생성 (최대 50명까지만, 스팸 방지)
-                members = [m for m in message.guild.members if not m.bot][:50]
-                mentions = " ".join([m.mention for m in members])
-                
-                if is_weekend_legend:
-                    worship_title = "👑 주말 보너스 전설의 강림! 👑"
-                    worship_desc = (
-                        f"✨ **{message.author.mention}** 님께서 주말 보너스로 **전설 등급**을 달성하셨습니다! ✨\n"
-                        f"\n"
-                        f"🎊 **주말 특별 달성** (메시지당 45 XP)\n"
-                        f"🏆 오늘의 전설을 숭배하라! 🏆\n"
-                        f"\n"
-                        f"**모두 경배하라!** 👏👏👏\n"
-                        f"{mentions}"
-                    )
-                    color = 0xFFD700  # 황금색
-                else:
-                    worship_title = "👑 전설의 강림! 👑"
-                    worship_desc = (
-                        f"✨ **{message.author.mention}** 님께서 **전설 등급**을 달성하셨습니다! ✨\n"
-                        f"\n"
-                        f"🏆 오늘의 전설을 숭배하라! 🏆\n"
-                        f"\n"
-                        f"**모두 경배하라!** 👏👏👏\n"
-                        f"{mentions}"
-                    )
-                    color = 0xFF6B6B  # 빨간색
-                
-                worship_embed = discord.Embed(
-                    title=worship_title,
-                    description=worship_desc,
-                    color=color,
-                    timestamp=datetime.datetime.now(seoul_tz)
-                )
-                worship_embed.set_thumbnail(url=message.author.display_avatar.url)
-                worship_embed.set_footer(text="🙇 30초 후 자동 삭제")
-                
-                # 숭배 카드 전송 및 30초 후 자동 삭제
-                worship_msg = await message.channel.send(embed=worship_embed)
-                
-                # 플래그 저장 (오늘 한 번만)
-                user_xp_data[user_id]["worship_card_shown"] = True
-                
-                # 30초 후 자동 삭제
-                async def delete_worship_card():
-                    await asyncio.sleep(30)
-                    try:
-                        await worship_msg.delete()
-                    except Exception:
-                        pass
-                
-                asyncio.create_task(delete_worship_card())
-    
     # ───── Anti-Spam 선처리 (점진적 제한 시스템 + 경험치 면제) ─────
     if SPAM_ENABLED and not _is_exempt(message.author, message.channel) and not is_user_exempt_from_spam(user_id):
         reason = check_spam_and_reason(message)
@@ -2009,28 +2524,87 @@ async def on_message(message: discord.Message):
         for cfg in GAME_CARDS.values():
             if cfg["pattern"].search(message.content):          # 키워드 매치
 
-                embed = (
-                    discord.Embed(
-                        title=cfg["title"],
-                        description=cfg["desc"],
-                        color=0x00B2FF,
-                        timestamp=datetime.datetime.now(seoul_tz),
-                        )
-                        .set_thumbnail(url=cfg["thumb"])
-                        .set_image(url=cfg["banner"])
-                        .set_footer(text="Play hard, live harder ✨")
-                        )
+                # 현대적이고 미려한 임베드 생성
+                embed = discord.Embed(
+                    title=cfg["title"],
+                    description=cfg["desc"],
+                    color=cfg.get("color", 0x5865F2),  # Modern Discord blurple
+                    timestamp=datetime.datetime.now(seoul_tz),
+                )
                 
+                # 서브타이틀을 author 필드로 표시 (더 눈에 띄게)
+                if cfg.get("subtitle"):
+                    embed.set_author(
+                        name=cfg["subtitle"],
+                        icon_url=cfg.get("icon_url", "https://cdn.discordapp.com/emojis/1234567890.png")
+                    )
+                
+                embed.set_thumbnail(url=cfg["thumb"])
+                embed.set_image(url=cfg["banner"])
+                embed.set_footer(
+                    text=cfg.get("footer", "Join millions of players worldwide"),
+                    icon_url="https://cdn.discordapp.com/emojis/1234567890.png"
+                )
+                
+                # 모던한 버튼 스타일로 개선
                 view = View(timeout=None)
-                for label, emoji, url in cfg["links"]:
-                    view.add_item(Button(label=label, emoji=emoji, url=url))
-                    await message.channel.send(content=f"{message.author.mention} {cfg['cta']}",
-                                               embed=embed, view=view)
-                    return
+                button_emojis = ["🎮", "🚀", "📱", "🌐", "⚡"]
+                
+                # links 리스트를 순회하며 버튼 생성
+                for idx, link_item in enumerate(cfg["links"]):
+                    # 튜플 언패킹
+                    label, url = link_item
+                    
+                    # 각 버튼에 어울리는 이모지 자동 할당
+                    emoji = None
+                    label_lower = label.lower()
+                    
+                    if "android" in label_lower or "play" in label_lower:
+                        emoji = "🤖"
+                    elif "ios" in label_lower or "apple" in label_lower:
+                        emoji = "🍎"
+                    elif "steam" in label_lower:
+                        emoji = "💠"
+                    elif "discord" in label_lower:
+                        emoji = "💬"
+                    elif "wiki" in label_lower:
+                        emoji = "📚"
+                    elif "battle" in label_lower or "pre-order" in label_lower:
+                        emoji = "🎯"
+                    elif "patch" in label_lower or "update" in label_lower or "notes" in label_lower:
+                        emoji = "📋"
+                    elif "buy" in label_lower or "get" in label_lower:
+                        emoji = "🛒"
+                    else:
+                        emoji = button_emojis[idx % len(button_emojis)]
+                    
+                    btn = Button(
+                        style=discord.ButtonStyle.link,
+                        label=label,
+                        url=url,
+                        emoji=emoji
+                    )
+                    view.add_item(btn)
+                
+                # 디버깅: 버튼 개수 로그
+                logging.info(f"[GAME_CARD] Created {len(view.children)} buttons for {cfg['title']}")
+                
+                # 현대적이고 설득력 있는 CTA 메시지
+                cta_embed = discord.Embed(
+                    description=f"### {cfg['cta']}",
+                    color=cfg.get("color", 0x5865F2)
+                )
+                
+                await message.channel.send(
+                    content=f"{message.author.mention}",
+                    embeds=[embed, cta_embed],
+                    view=view
+                )
+                return
             
     # 3) 링크 삭제 
     if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:
-        # 경험치 면제 : 금칙어 면제권이 있으면 링크도 허용
+
         if not is_user_exempt_from_profanity(user_id):
             await safe_delete(message)
             await message.channel.send(
@@ -2050,7 +2624,7 @@ async def on_message(message: discord.Message):
             )
             logging.info(f"[LINK_EXEMPT] {message.author} (ID:{user_id}) - 링크 검열 면제권으로 링크 허용")
 
-    # 4) 금칙어 (경험치 면제 추가)
+    # 4) 금칙어 
     EXEMPT_PROFANITY_CHANNEL_IDS = set()  
     root = find_badroot(message.content)
     if root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
@@ -2161,7 +2735,7 @@ async def web(ctx: commands.Context, *, query: Optional[str] = None):
     
     await ctx.reply(embed=embed, view=view)
 
-# 🔥 핫 키워드 통계 명령어 (새로 추가)
+# 🔥 핫 키워드 통계 명령어 
 @bot.command(name="trending", aliases=["hot", "키워드"], help="!trending — 현재 채널의 핫 키워드 통계")
 async def trending_command(ctx: commands.Context):
     # 현재 채널의 핫 키워드 통계를 보여줍니다.
@@ -2268,12 +2842,12 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
         elif next_tier is None:
             next_tier = tier
     
-    # 진행도 바 (간결하게 개선)
+    # 진행도 바 
     if next_tier:
         progress = (xp - (current_tier["xp"] if current_tier else 0)) / (next_tier["xp"] - (current_tier["xp"] if current_tier else 0))
-        bar_length = 5  # 10 → 5로 축소
+        bar_length = 10  
         filled = int(progress * bar_length)
-        bar = "▰" * filled + "▱" * (bar_length - filled)  # 더 작은 바 스타일
+        bar = "█" * filled + "░" * (bar_length - filled)
         progress_text = f"{bar} {int(progress * 100)}%"
         next_xp_needed = next_tier["xp"] - xp
         progress_detail = f"다음 등급까지 {next_xp_needed} XP"
@@ -2326,9 +2900,9 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
     
     # 주말 보너스 표시
     if is_weekend():
-        footer_text = "🎊 주말 보너스! 메시지당 45 XP | 5초 쿨다운"
+        footer_text = "🎊 주말 보너스! 메시지당 25 XP | 5초 쿨다운"
     else:
-        footer_text = "메시지당 25 XP | 5초 쿨다운 | 자정 리셋"
+        footer_text = "메시지당 15 XP | 5초 쿨다운 | 자정 리셋"
     
     embed.set_footer(text=footer_text)
     
@@ -2356,21 +2930,16 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
     
     await ctx.reply(embed=embed)
 
-@bot.command(name="claim", help="!claim — 달성한 보상 수령 (레벨업 시 자동 수령됨)")
+@bot.command(name="claim", help="!claim — 달성한 보상 수령")
 async def claim_command(ctx: commands.Context):
-    # 보상 수령 (자동 수령 시스템이지만 수동으로도 가능)
+    # 보상 수령
     user_id = ctx.author.id
     available = get_available_rewards(user_id)
     
     if not available:
         await ctx.reply(
             embed=discord.Embed(
-                description=(
-                    "❌ 수령 가능한 보상이 없습니다!\n"
-                    "\n"
-                    "💡 **안내**: 레벨업 시 보상이 **자동으로 수령**됩니다!\n"
-                    "더 많은 메시지를 보내서 경험치를 쌓아보세요. 📝"
-                ),
+                description="❌ 수령 가능한 보상이 없습니다!\n더 많은 메시지를 보내서 경험치를 쌓아보세요. 📝",
                 color=0xFF0000
             )
         )
@@ -2519,8 +3088,8 @@ async def xphelp_command(ctx: commands.Context):
     embed.add_field(
         name="💎 경험치 획득 방법",
         value=(
-            "• **평일 (월~목)**: 메시지당 **25 XP**\n"
-            "• **주말 (금~일)**: 메시지당 **45 XP** 🎊\n"
+            "• **평일 (월~목)**: 메시지당 **15 XP**\n"
+            "• **주말 (금~일)**: 메시지당 **25 XP** 🎊\n"
             "• 쿨다운: **5초** (연속 메시지는 XP 없음)\n"
             "• 봇 명령어도 XP 획득 가능!\n"
             "• 이모지, 짧은 메시지도 동일하게 적용"
@@ -2534,17 +3103,17 @@ async def xphelp_command(ctx: commands.Context):
         effect = t.get("effect", {})
         eff_desc = ""
         if effect.get("type") == "antispam":
-            duration_hours = effect.get('duration', 0) // 60
-            eff_desc = f"(도배 면제 {duration_hours}시간)"
+            eff_desc = f"(도배 면제 {effect.get('duration', '?')}분)"
+        elif effect.get("type") == "media":
+            eff_desc = f"(이미지 업로드 면제 {effect.get('duration', '?')}분)"
         elif effect.get("type") == "profanity":
             eff_desc = f"(금칙어+링크 {effect.get('count', '?')}회 면제)"
         elif effect.get("type") == "all":
-            duration_hours = effect.get('duration', 0) // 60
-            eff_desc = f"(모든 제한 면제 {duration_hours}시간)"
+            eff_desc = f"(모든 제한 면제 {effect.get('duration', '?')}분)"
         tiers_text += f"**{t['name']}** - {t['xp']} XP\n└ {t['reward']} {eff_desc}\n"
     
     # 주말 보너스 안내 추가
-    tiers_text += "\n💡 **주말 보너스 (금~일)**: 메시지당 45 XP로 더 빠른 달성!"
+    tiers_text += "\n💡 **주말 보너스 (금~일)**: 메시지당 25 XP로 더 빠른 달성!"
     
     embed.add_field(
         name="🏆 등급 시스템",
@@ -2558,11 +3127,10 @@ async def xphelp_command(ctx: commands.Context):
         value=(
             "`!xp` - 내 경험치 확인\n"
             "`!xp @유저` - 다른 사람 경험치 확인\n"
+            "`!claim` - 보상 수령하기\n"
             "`!leaderboard` - 오늘의 순위표\n"
             "`!전설체험` - 전설 등급 1분 체험 (1일 1회) ✨\n"
-            "`!xphelp` - 이 도움말\n"
-            "\n"
-            "💡 **자동 보상**: 레벨업 시 보상 자동 수령!"
+            "`!xphelp` - 이 도움말"
         ),
         inline=False
     )
@@ -2577,14 +3145,9 @@ async def xphelp_command(ctx: commands.Context):
             "   • 순위도 **완전히 리셋**\n"
             "\n"
             "🎊 **주말 보너스 (금~일)**\n"
-            "   • 메시지당 45 XP (평일 25 XP)\n"
+            "   • 메시지당 25 XP (평일 15 XP)\n"
             "   • 주말에 전설 달성 시 특별 표시!\n"
             "   • 평일 달성자와 차별화\n"
-            "\n"
-            "👑 **전설 등급 특전**\n"
-            "   • 첫 메시지 작성 시 **전체 유저 호출**\n"
-            "   • **숭배 카드** 자동 표시 (30초 후 삭제)\n"
-            "   • 24시간 완전 면제 + VIP 대우\n"
             "\n"
             "⏰ **당일 한정 이벤트!**\n"
             "   • 보상은 자정까지만 유효\n"
@@ -2716,8 +3279,10 @@ async def legend_trial_command(ctx: commands.Context):
             f"💡 **이 혜택을 계속 누리려면**:\n"
             f"   • 메시지를 보내 경험치를 모으세요\n"
             f"   • 평일: 메시지당 15 XP\n"
-            f"   • 주말: 메시지당 25 XP 🎊\n"
-            f"   • 목표: **450 XP** (평일 30개, 주말 18개)\n"
+            f"   • 주말: 메시지당 45 XP 🎊\n"
+            f"   • 목표: **450 XP** (평일 30개, 주말 10개)\n"
+            f"\n"
+            f"🎊 **주말 보너스**: 업적 달성 조건도 1/3로 완화!\n"
             f"\n"
             f"🎯 `!xp` 명령어로 현재 경험치를 확인하고\n"
             f"   `!xphelp`로 자세한 정보를 확인하세요!\n"
@@ -2731,6 +3296,146 @@ async def legend_trial_command(ctx: commands.Context):
     end_embed.set_footer(text="💪 진짜 전설을 향해 달려보세요!")
     
     await ctx.send(embed=end_embed)
+
+# ────────── 업적 관련 명령어 ──────────
+@bot.command(name="업적", aliases=["achievements", "ach"], help="!업적 [@유저] — 업적 목록 확인")
+async def achievements_command(ctx: commands.Context, member: discord.Member = None):
+    """업적 목록 및 진행도 확인"""
+    target = member or ctx.author
+    user_id = target.id
+    
+    init_user_achievements(user_id)
+    user_data = achievements_data[user_id]
+    unlocked = user_data["unlocked"]
+    stats = user_data["stats"]
+    
+    # 업적 분류
+    unlocked_list = []
+    locked_list = []
+    
+    for ach_id, ach in ACHIEVEMENTS.items():
+        if ach_id in unlocked:
+            unlocked_list.append((ach_id, ach))
+        else:
+            locked_list.append((ach_id, ach))
+    
+    # 진행도 계산
+    total_achievements = len(ACHIEVEMENTS)
+    unlocked_count = len(unlocked)
+    progress_percent = (unlocked_count * 100) // total_achievements if total_achievements > 0 else 0
+    
+    # 주말 보너스 여부
+    weekend_mode = is_weekend()
+    weekend_notice = "\n🎊 **주말 보너스 중!** 업적 달성 조건이 완화되었습니다!\n" if weekend_mode else ""
+    
+    # 임베드 생성
+    embed = discord.Embed(
+        title=f"🏆 {target.display_name}님의 업적" + (" 🎊" if weekend_mode else ""),
+        description=(
+            f"**진행도**: {unlocked_count}/{total_achievements} ({progress_percent}%)\n"
+            f"⏰ **주의**: 업적은 24시간 하드리셋됩니다! (자정 00:00)\n"
+            f"{weekend_notice}"
+            f"\n"
+            f"📊 **오늘의 통계**:\n"
+            f"   • 총 메시지: {stats.get('total_messages', 0):,}개\n"
+            f"   • 오늘 메시지: {stats.get('daily_messages', 0):,}개\n"
+            f"   • 연속 출석: {stats.get('login_streak', 0)}일\n"
+            f"   • 달성 티어: {len(stats.get('tiers_reached', set()))}개\n"
+            f"   • 보상 수령: {stats.get('rewards_claimed_count', 0)}회"
+        ),
+        color=0xFFD700,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    # 해금된 업적
+    if unlocked_list:
+        unlocked_text = ""
+        for ach_id, ach in unlocked_list[:10]:  # 최대 10개만 표시
+            unlocked_text += f"✅ **{ach['name']}** - {ach['description']}\n"
+        
+        if len(unlocked_list) > 10:
+            unlocked_text += f"\n*...외 {len(unlocked_list) - 10}개 더*"
+        
+        embed.add_field(
+            name=f"🌟 해금된 업적 ({len(unlocked_list)}개)",
+            value=unlocked_text or "없음",
+            inline=False
+        )
+    
+    # 잠긴 업적 (다음 목표 3개만)
+    if locked_list:
+        locked_text = ""
+        for ach_id, ach in locked_list[:3]:
+            reward_xp = ach.get('reward_xp', 0)
+            locked_text += f"🔒 **{ach['name']}** - {ach['description']} (+{reward_xp} XP)\n"
+        
+        if len(locked_list) > 3:
+            locked_text += f"\n*...외 {len(locked_list) - 3}개*"
+        
+        embed.add_field(
+            name=f"🎯 다음 목표 업적",
+            value=locked_text,
+            inline=False
+        )
+    
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text="⚠️ 매일 자정(00:00) 하드리셋! | 업적 달성 시 보너스 XP 지급")
+    
+    await ctx.reply(embed=embed)
+
+@bot.command(name="업적상세", aliases=["achdetail", "업적정보"], help="!업적상세 — 모든 업적 상세 정보")
+async def achievement_detail_command(ctx: commands.Context):
+    # 모든 업적의 상세 정보 표시
+    user_id = ctx.author.id
+    init_user_achievements(user_id)
+    user_data = achievements_data[user_id]
+    unlocked = user_data["unlocked"]
+    
+    # 주말 보너스 여부
+    weekend_mode = is_weekend()
+    weekend_notice = "\n🎊 **주말 보너스 적용 중!** 업적 달성 조건이 1/3로 완화!\n" if weekend_mode else ""
+    
+    # 카테고리별 분류
+    categories = {
+        "기본": ["first_message", "early_bird", "night_owl"],
+        "메시지": ["msg_10", "msg_50", "msg_100", "msg_500", "msg_1000"],
+        "일일 활동": ["daily_30", "daily_50", "daily_100"],
+        "연속 출석": ["streak_3", "streak_7", "streak_30"],
+        "레벨": ["legendary_first", "legendary_weekend", "all_tiers"],
+        "특별": ["first_reward", "collector"]
+    }
+    
+    embed = discord.Embed(
+        title="📜 전체 업적 목록" + (" 🎊" if weekend_mode else ""),
+        description=(
+            "달성 가능한 모든 업적을 확인하세요!\n"
+            f"{weekend_notice}"
+            f"⏰ **중요**: 모든 업적은 매일 자정(00:00)에 하드리셋됩니다!\n"
+            f"💡 업적 달성 시 보너스 XP가 즉시 지급됩니다."
+        ),
+        color=0xFFD700 if weekend_mode else 0x00E5FF,
+        timestamp=datetime.datetime.now(seoul_tz)
+    )
+    
+    for category, ach_ids in categories.items():
+        text = ""
+        for ach_id in ach_ids:
+            if ach_id in ACHIEVEMENTS:
+                ach = ACHIEVEMENTS[ach_id]
+                status = "✅" if ach_id in unlocked else "🔒"
+                reward_xp = ach.get('reward_xp', 0)
+                text += f"{status} **{ach['name']}** (+{reward_xp} XP)\n    _{ach['description']}_\n"
+        
+        if text:
+            embed.add_field(
+                name=f"🎯 {category}",
+                value=text,
+                inline=False
+            )
+    
+    embed.set_footer(text="⚠️ 매일 자정 하드리셋! | 매일 새롭게 도전하세요!")
+    
+    await ctx.reply(embed=embed)
 
 # 첨부파일 알리미
 async def describe_attachments(message: discord.Message):
@@ -2798,6 +3503,74 @@ def fix_code(chunks: List[str]) -> List[str]:
         fixed.append(ch)
     return fixed
 
+# ────────── 디시인사이드 갤러리 인기글 명령어 ──────────
+@bot.command(name="모배갤", aliases=["모배", "battleground", "bg"], help="!모배갤 — 배틀그라운드 모바일 갤러리 인기 게시물")
+async def gallery_hot_posts(ctx: commands.Context, limit: int = 10):
+    # 배틀그라운드 모바일 갤러리의 인기 게시물 추천
+    if limit > 15:
+        limit = 15
+    elif limit < 1:
+        limit = 10
+    
+    async with ctx.typing():
+        gallery_id = "battlegroundmobile"
+        config = GALLERY_CONFIG.get(gallery_id)
+        
+        if not config:
+            await ctx.reply("❌ 갤러리 설정을 찾을 수 없습니다.")
+            return
+        
+        # 인기 게시물 가져오기
+        posts = await fetch_hot_posts(gallery_id, config.get("is_minor", False), limit=30)
+        
+        if not posts:
+            await ctx.reply("❌ 갤러리에서 게시물을 가져올 수 없습니다.")
+            return
+        
+        # 상위 게시물만 선택
+        hot_posts = posts[:limit]
+        
+        embed = discord.Embed(
+            title=f"😊 {config['name']} 갤러리 인기글 TOP {limit}",
+            description=f"추천수와 조회수 기반 인기 게시물입니다!",
+            color=0xFF6B6B,
+            timestamp=datetime.datetime.now(seoul_tz)
+        )
+        
+        for idx, post in enumerate(hot_posts, 1):
+            # 제목 (너무 길면 자르기)
+            title = post['title']
+            if len(title) > 80:
+                title = title[:77] + "..."
+            
+            # 아이콘
+            icon = "📝" if post['has_image'] else "📝"
+            medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"**{idx}.**"
+            
+            # 작성자 정보
+            author_info = post['author']
+            if post['ip']:
+                author_info += f" `{post['ip']}`"
+            
+            # 통계 정보
+            stats = f"😊 {post['recommend']} | 👀 {post['view']:,} | 💬 {post['comment']}"
+            
+            field_value = (
+                f"**작성자**: {author_info}\n"
+                f"**통계**: {stats}\n"
+                f"[🔗 게시글 보기]({post['link']})"
+            )
+            
+            embed.add_field(
+                name=f"{medal} {icon} {title}",
+                value=field_value,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"디시인사이드 {config['name']} 갤러리 X tbBot3rd")
+        
+        await ctx.reply(embed=embed)
+
 @bot.command(name="ask", help="!ask <질문>")
 async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
     if prompt is None:
@@ -2832,6 +3605,8 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
 async def on_ready():
     # 경험치 데이터 로드
     load_xp_data()
+    # 업적 데이터 로드
+    load_achievements_data()
     
     # 자정 리셋 태스크
     async def daily_reset_task():
@@ -2861,6 +3636,7 @@ async def on_ready():
         "⚠️ 자정에 XP 하드리셋!",
         "!xphelp 로 경험치 시스템 확인",
         "!trending 으로 실시간 키워드 통계 보기",
+        "!ach 로 업적 달성 현황 확인",
         
     ])
 
