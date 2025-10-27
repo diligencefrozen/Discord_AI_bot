@@ -1535,9 +1535,11 @@ MAX_MSG   = 1900
 FILE_TH   = 6000
 HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
 IMG_MODEL    = "stabilityai/stable-diffusion-xl-base-1.0" 
-ENDPOINT     = f"https://api-inference.huggingface.co/models/{IMG_MODEL}"
+# 새로운 Inference Providers API 엔드포인트 사용 (2025년 11월 1일부터 필수)
+ENDPOINT     = f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}"
 HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
-img_client  = InferenceClient(IMG_MODEL, token=HF_IMG_TOKEN)
+# InferenceClient - 새 API 엔드포인트로 모델 URL 직접 지정
+img_client  = InferenceClient(model=f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}", token=HF_IMG_TOKEN)
 
 # macOS 일부 환경에서 기본 CA 경로 인식 실패 대응
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
@@ -1944,6 +1946,8 @@ SYS_PROMPT = (
     'Now go forth and charm the world! 🚀💖'
 )
 
+# Hugging Face InferenceClient
+# provider를 사용할 때는 base_url 불필요 (provider가 자동으로 엔드포인트 설정)
 hf = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
 
 intents = discord.Intents.default()
@@ -2380,9 +2384,6 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 _dbg("send warn failed:", repr(e))
             return
-
-    # (중요) 다른 핸들러/명령이 계속 동작하도록
-    await bot.process_commands(message)    
         
     # 1-1 첨부파일 메타 카드
     if message.attachments:
@@ -2699,6 +2700,9 @@ async def on_message(message: discord.Message):
             clear_recent(message.channel.id)  # 해당 채널 버퍼만 초기화
             logging.info("[HOT][ch=%s] buffer cleared after recommending %s",
                          message.channel.id, hot)
+    
+    # (중요) 명령어 처리 - on_message 이벤트 마지막에 위치해야 함
+    await bot.process_commands(message)
 
 #검색 기능
 @bot.command(name="web", help="!web <검색어> — Wikipedia 검색")
