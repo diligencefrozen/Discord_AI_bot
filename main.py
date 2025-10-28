@@ -34,7 +34,7 @@ seoul_tz = timezone("Asia/Seoul")
 
 # 경험치 설정
 XP_CONFIG = {
-    "msg_xp": 15,                   # 평일 메시지당 경험치
+    "msg_xp": 25,                   # 평일 메시지당 경험치
     "msg_xp_weekend": 45,           # 주말 메시지당 경험치 (금/토/일) 
     "msg_cooldown": 5,              # 경험치 획득 쿨다운 (10초→5초로 단축)
     "daily_reset_hour": 0,          # 매일 자정에 리셋
@@ -2067,7 +2067,7 @@ async def on_message_delete(message: discord.Message):
 # ───────────────── Game promo cards ─────────────────
 GAME_CARDS: dict[str, dict] = {
     "pubg": {   # 모배 / 배그
-        "pattern": re.compile(rf"(모{FILLER}배|배{FILLER}그|pubg)", re.I),
+        "pattern": re.compile(rf"(모{FILLER}배|배{FILLER}그|pubg|PUBG|Pubg|배틀그라운드)", re.I),
         "title":   "PUBG MOBILE",
         "subtitle": "The Ultimate Battle Royale Experience",
         "desc": (
@@ -2090,7 +2090,8 @@ GAME_CARDS: dict[str, dict] = {
     },
 
     "overwatch": {
-        "pattern": re.compile(r"(옵치|오버워치|overwatch)", re.I),
+        # 한글 별칭 사이에 공백/기호가 끼어도 인식 (예: "옵 치", "오-버워치")
+        "pattern": re.compile(rf"(옵{FILLER}치|오{FILLER}버{FILLER}워{FILLER}치|overwatch)", re.I),
         "title":   "OVERWATCH 2",
         "subtitle": "The World Needs Heroes",
         "desc": (
@@ -2136,7 +2137,7 @@ GAME_CARDS: dict[str, dict] = {
     },
 
     "minecraft": {
-        "pattern": re.compile(r"(마크|마인크래프트|minecraft)", re.I),
+        "pattern": re.compile(r"(마크|마인크래프트|minecraft|Minecraft|MINECRAFT)", re.I),
         "title":   "MINECRAFT",
         "subtitle": "Build. Explore. Survive. Together.",
         "desc": (
@@ -2214,61 +2215,70 @@ async def on_message(message: discord.Message):
     if not message.author.bot:
         xp, leveled_up, new_tier_idx, new_achievements = add_xp(user_id)
         
-        # 업적 달성 알림
+        # 업적 달성 알림 (미니멀)
         if new_achievements:
             for ach_id in new_achievements:
                 ach = ACHIEVEMENTS.get(ach_id)
-                if ach:
-                    # 주말 보너스 여부
-                    weekend_bonus = is_weekend()
-                    
-                    # 주말 보너스 메시지 생성
-                    if weekend_bonus:
-                        weekend_info = "\n🎊 **주말 보너스로 달성!** (조건 완화 적용)\n"
-                    else:
-                        weekend_info = ""
-                    
-                    ach_embed = discord.Embed(
-                        title="🏆 업적 달성!" + (" 🎊" if weekend_bonus else ""),
-                        description=(
-                            f"**{message.author.mention}** 님이 업적을 달성했습니다!\n"
-                            f"{weekend_info}"
-                            f"\n"
-                            f"**{ach['name']}**\n"
-                            f"_{ach['description']}_\n"
-                            f"\n"
-                            f"💰 **보너스 XP**: +{ach.get('reward_xp', 0)} XP (즉시 지급)\n"
-                            f"\n"
-                            f"💡 `!업적` 명령어로 전체 업적을 확인하세요!\n"
-                            f"⏰ **주의**: 자정(00:00)에 업적이 초기화됩니다!"
-                        ),
-                        color=0xFFD700 if weekend_bonus else 0x00E5FF,
-                        timestamp=datetime.datetime.now(seoul_tz)
-                    )
-                    ach_embed.set_thumbnail(url=message.author.display_avatar.url)
-                    footer_text = "🎊 주말 보너스 달성!" if weekend_bonus else "⚠️ 24시간 하드리셋!"
-                    ach_embed.set_footer(text=footer_text + " | 매일 새롭게 도전!")
-                    await message.channel.send(embed=ach_embed, delete_after=15)
+                if not ach:
+                    continue
+
+                weekend_bonus = is_weekend()
+                bonus = ach.get('reward_xp', 0)
+                badge = "🎊" if weekend_bonus else "🏆"
+
+                # 단일 라인 중심의 미니멀 카드
+                desc = (
+                    f"{message.author.mention} → **{ach['name']}**"
+                    f"  ·  +{bonus} XP"
+                )
+
+                ach_embed = discord.Embed(
+                    description=desc,
+                    color=0xFFD700 if weekend_bonus else 0x00E5FF,
+                    timestamp=datetime.datetime.now(seoul_tz)
+                )
+                ach_embed.set_author(name=f"{badge} 업적 달성", icon_url=message.author.display_avatar.url)
+                # 보조 정보는 툴팁 수준으로 한 줄만
+                ach_embed.set_footer(text="자정 리셋 · !업적 으로 전체 보기")
+
+                await message.channel.send(embed=ach_embed, delete_after=8)
         
-        # 레벨업 알림
+        # 레벨업 알림 + 자동 보상 수령
         if leveled_up and new_tier_idx is not None:
             tier = XP_CONFIG["reward_tiers"][new_tier_idx]
-            
+
+            # 레벨업 시 수령 가능한 모든 보상을 자동 수령
+            claimed_tiers: list[str] = []
+            try:
+                available = get_available_rewards(user_id)
+                for idx, t in available:
+                    if claim_reward(user_id, idx):
+                        claimed_tiers.append(t["name"])
+            except Exception as e:
+                logging.error(f"Auto-claim failed: {e}")
+                claimed_tiers = []
+
             # 전설 등급 + 주말 보너스 체크
             is_legendary = new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1
             is_weekend_bonus = is_weekend()
-            
+
             # 타이틀 설정
             if is_legendary and is_weekend_bonus:
                 title = f"🎊 주말 보너스 레벨업! {tier['name']} 🎊"
             else:
                 title = f"🎉 레벨업! {tier['name']}"
-            
+
             # 주말 보너스 메시지
             weekend_msg = ""
             if is_weekend_bonus:
-                weekend_msg = "\n🎁 **주말 보너스 적용 중!** (메시지당 25 XP)\n"
-            
+                weekend_msg = "\n🎁 **주말 보너스 적용 중!** (메시지당 35 XP)\n"
+
+            # 자동 수령 결과 문구
+            if claimed_tiers:
+                claim_line = "🎁 **자동 보상 수령 완료**: " + ", ".join(claimed_tiers) + "\n"
+            else:
+                claim_line = "🎁 **보상**: 이미 수령된 상태예요.\n"
+
             embed = discord.Embed(
                 title=title,
                 description=(
@@ -2276,10 +2286,9 @@ async def on_message(message: discord.Message):
                     f"{weekend_msg}"
                     f"\n"
                     f"**현재 경험치:** {xp} XP\n"
-                    f"**보상:** {tier['reward']}\n"
-                    f"\n"
-                    f"💡 `!claim` 명령어로 보상을 수령하세요!\n"
-                    f"⏰ **자정(00:00)에 경험치가 0으로 초기화됩니다!**"
+                    f"**보상 안내:** {tier['reward']}\n"
+                    f"{claim_line}"
+                    f"⏰ **자정(00:00)에 경험치와 보상 효과가 초기화됩니다!**"
                 ),
                 color=0xFFD700,
                 timestamp=datetime.datetime.now(seoul_tz)
@@ -2303,7 +2312,7 @@ async def on_message(message: discord.Message):
                     vip_description = (
                         f"✨ **{message.author.mention}** 님이 **주말 보너스**로 \n\n오늘의 **최고 등급(전설)**에 도달했습니다!\n"
                         f"\n"
-                        f"🎁 **주말 특별 달성!** (메시지당 25 XP 적용)\n"
+                        f"🎁 **주말 특별 달성!** (메시지당 35 XP 적용)\n"
                         f"모두가 우러러보는 진정한 챔피언!\n"
                         f"🎉 축하와 환호를 보냅니다! 🎉\n"
                         f"\n"
@@ -2849,7 +2858,7 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
     # 진행도 바 
     if next_tier:
         progress = (xp - (current_tier["xp"] if current_tier else 0)) / (next_tier["xp"] - (current_tier["xp"] if current_tier else 0))
-        bar_length = 10  
+        bar_length = 5
         filled = int(progress * bar_length)
         bar = "█" * filled + "░" * (bar_length - filled)
         progress_text = f"{bar} {int(progress * 100)}%"
@@ -2866,7 +2875,7 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
         reward_text = "\n\n**🎁 수령 가능한 보상:**\n"
         for idx, tier in available:
             reward_text += f"• {tier['name']} - {tier['reward']}\n"
-        reward_text += "\n💡 `!claim` 명령어로 보상을 받으세요!"
+        reward_text += "\n💡 레벨업 시 보상은 **자동 수령**됩니다. 누락 시 `!claim`으로 수동 수령하세요."
     
     embed = discord.Embed(
         title=f"📊 {target.display_name}",
@@ -2904,9 +2913,9 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
     
     # 주말 보너스 표시
     if is_weekend():
-        footer_text = "🎊 주말 보너스! 메시지당 25 XP | 5초 쿨다운"
+        footer_text = "🎊 주말 보너스! 메시지당 35 XP | 5초 쿨다운"
     else:
-        footer_text = "메시지당 15 XP | 5초 쿨다운 | 자정 리셋"
+        footer_text = "메시지당 25 XP | 5초 쿨다운 | 자정 리셋"
     
     embed.set_footer(text=footer_text)
     
@@ -3082,6 +3091,7 @@ async def xphelp_command(ctx: commands.Context):
             "**✨ 24시간 경험치 시스템에 오신 것을 환영합니다!**\n"
             "\n"
             "메시지를 보내면 경험치를 얻고, 레벨업하면 특별한 혜택을 받을 수 있어요!\n"
+            "레벨업 시 해당 등급의 **보상이 자동으로 수령**됩니다.\n"
             "**하지만 주의하세요!** 매일 자정(00:00)에 **모든 것이 0으로 리셋**됩니다! ⏰"
         ),
         color=0x00E5FF,
@@ -3092,8 +3102,8 @@ async def xphelp_command(ctx: commands.Context):
     embed.add_field(
         name="💎 경험치 획득 방법",
         value=(
-            "• **평일 (월~목)**: 메시지당 **15 XP**\n"
-            "• **주말 (금~일)**: 메시지당 **25 XP** 🎊\n"
+            "• **평일 (월~목)**: 메시지당 **25 XP**\n"
+            "• **주말 (금~일)**: 메시지당 **35 XP** 🎊\n"
             "• 쿨다운: **5초** (연속 메시지는 XP 없음)\n"
             "• 봇 명령어도 XP 획득 가능!\n"
             "• 이모지, 짧은 메시지도 동일하게 적용"
@@ -3117,7 +3127,7 @@ async def xphelp_command(ctx: commands.Context):
         tiers_text += f"**{t['name']}** - {t['xp']} XP\n└ {t['reward']} {eff_desc}\n"
     
     # 주말 보너스 안내 추가
-    tiers_text += "\n💡 **주말 보너스 (금~일)**: 메시지당 25 XP로 더 빠른 달성!"
+    tiers_text += "\n💡 **주말 보너스 (금~일)**: 메시지당 35 XP로 더 빠른 달성!"
     
     embed.add_field(
         name="🏆 등급 시스템",
@@ -3131,7 +3141,7 @@ async def xphelp_command(ctx: commands.Context):
         value=(
             "`!xp` - 내 경험치 확인\n"
             "`!xp @유저` - 다른 사람 경험치 확인\n"
-            "`!claim` - 보상 수령하기\n"
+            "`!claim` - 보상 수동 수령 (자동 수령 실패 시)\n"
             "`!leaderboard` - 오늘의 순위표\n"
             "`!전설체험` - 전설 등급 1분 체험 (1일 1회) ✨\n"
             "`!xphelp` - 이 도움말"
@@ -3149,7 +3159,7 @@ async def xphelp_command(ctx: commands.Context):
             "   • 순위도 **완전히 리셋**\n"
             "\n"
             "🎊 **주말 보너스 (금~일)**\n"
-            "   • 메시지당 25 XP (평일 15 XP)\n"
+            "   • 메시지당 35 XP (평일 25 XP)\n"
             "   • 주말에 전설 달성 시 특별 표시!\n"
             "   • 평일 달성자와 차별화\n"
             "\n"
@@ -3282,8 +3292,8 @@ async def legend_trial_command(ctx: commands.Context):
             f"\n"
             f"💡 **이 혜택을 계속 누리려면**:\n"
             f"   • 메시지를 보내 경험치를 모으세요\n"
-            f"   • 평일: 메시지당 15 XP\n"
-            f"   • 주말: 메시지당 45 XP 🎊\n"
+            f"   • 평일: 메시지당 25 XP\n"
+            f"   • 주말: 메시지당 35 XP 🎊\n"
             f"   • 목표: **450 XP** (평일 30개, 주말 10개)\n"
             f"\n"
             f"🎊 **주말 보너스**: 업적 달성 조건도 1/3로 완화!\n"
