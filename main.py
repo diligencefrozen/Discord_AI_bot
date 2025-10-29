@@ -482,7 +482,7 @@ GALLERY_CONFIG = {
         "name": "배틀그라운드 모바일",
         "short_name": "모배",
         "url": "https://gall.dcinside.com/mgallery/board/lists?id=battlegroundmobile",
-        "is_minor": True,
+        "gallery_type": "minor",  # "major", "minor", "mini"
         # 관리자 목록 (게시물 제외) - 닉네임과 UID를 분리하여 정확히 매칭
         "exclude_admins": {
             "nicknames": ["Kar98k", "모바일배틀그라운드", "사수나무"],
@@ -491,16 +491,26 @@ GALLERY_CONFIG = {
     }
 }
 
-async def fetch_hot_posts(gallery_id: str, is_minor: bool = False, limit: int = 30) -> List[dict]:
+async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: int = 30) -> List[dict]:
+    """
+    디시인사이드 갤러리의 게시물을 가져와서 인기도 순으로 정렬합니다.
     
-    # 디시인사이드 갤러리의 게시물을 가져와서 인기도 순으로 정렬합니다.
-    # Returns: [{"no": 게시글번호, "title": 제목, "author": 작성자, "ip": IP, "link": 링크, 
-    #           "has_image": 이미지여부, "recommend": 추천수, "view": 조회수, "comment": 댓글수, "hot_score": 인기점수}]
+    Args:
+        gallery_id: 갤러리 ID
+        gallery_type: "major" (일반), "minor" (마이너), "mini" (미니)
+        limit: 반환할 게시글 개수
+    
+    Returns: [{"no": 게시글번호, "title": 제목, "author": 작성자, "ip": IP, "link": 링크, 
+              "has_image": 이미지여부, "recommend": 추천수, "view": 조회수, "comment": 댓글수, "hot_score": 인기점수}]
+    """
     
     try:
-        if is_minor:
+        # 갤러리 타입별 URL 설정
+        if gallery_type == "minor":
             url = f"https://gall.dcinside.com/mgallery/board/lists?id={gallery_id}"
-        else:
+        elif gallery_type == "mini":
+            url = f"https://gall.dcinside.com/mini/board/lists/?id={gallery_id}"
+        else:  # major
             url = f"https://gall.dcinside.com/board/lists?id={gallery_id}"
         
         headers = {
@@ -590,9 +600,11 @@ async def fetch_hot_posts(gallery_id: str, is_minor: bool = False, limit: int = 
                                 author_ip = f"UID:{uid}"
                     
                     # 전체 링크 생성
-                    if is_minor:
+                    if gallery_type == "minor":
                         full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mgallery/board/view/?id={gallery_id}&no={post_no}"
-                    else:
+                    elif gallery_type == "mini":
+                        full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mini/board/view/?id={gallery_id}&no={post_no}"
+                    else:  # major
                         full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/board/view/?id={gallery_id}&no={post_no}"
                     
                     # 인기 점수 계산 (추천 * 5 + 댓글 * 2 + 조회수 / 10)
@@ -3760,18 +3772,18 @@ async def dcinside_gallery(ctx: commands.Context, gallery_id: Optional[str] = No
     # 기본값: battlegroundmobile
     if gallery_id is None:
         gallery_id = "battlegroundmobile"
-        is_minor = True
+        gallery_type = "minor"
         gallery_display_name = "배틀그라운드 모바일"
     else:
         # 기존 설정에 있는지 확인
         config = GALLERY_CONFIG.get(gallery_id)
         if config:
             gallery_display_name = config["name"]
-            is_minor = config.get("is_minor", False)
+            gallery_type = config.get("gallery_type", "major")
         else:
             # 설정에 없으면 갤러리 ID를 그대로 사용
             gallery_display_name = gallery_id
-            is_minor = False  # 먼저 일반 갤러리로 시도
+            gallery_type = "major"  # 먼저 일반 갤러리로 시도
     
     # 개수 제한
     if limit > 15:
@@ -3786,45 +3798,62 @@ async def dcinside_gallery(ctx: commands.Context, gallery_id: Optional[str] = No
         
         try:
             # 먼저 설정된 타입으로 시도
-            posts = await fetch_hot_posts(gallery_id, is_minor, limit=30)
+            posts = await fetch_hot_posts(gallery_id, gallery_type, limit=30)
             logging.info(f"[디시] {gallery_id} 파싱 성공: {len(posts)}개 게시글")
         except Exception as e:
             error_msg = str(e)
-            logging.error(f"[디시] {gallery_id} 파싱 실패 (타입1): {e}")
-            # 실패하면 반대 타입으로 재시도
-            try:
-                is_minor = not is_minor
-                posts = await fetch_hot_posts(gallery_id, is_minor, limit=30)
-                error_msg = None  # 성공하면 에러 메시지 제거
-                logging.info(f"[디시] {gallery_id} 재시도 성공: {len(posts)}개 게시글")
-            except Exception as e2:
-                error_msg = str(e2)
-                logging.error(f"[디시] {gallery_id} 재시도 실패: {e2}")
+            logging.error(f"[디시] {gallery_id} 파싱 실패 (타입1={gallery_type}): {e}")
+            # 실패하면 다른 타입들로 순차 재시도
+            # major → minor → mini 순으로 시도
+            other_types = ["major", "minor", "mini"]
+            other_types.remove(gallery_type)  # 이미 시도한 타입 제외
+            
+            for retry_type in other_types:
+                try:
+                    posts = await fetch_hot_posts(gallery_id, retry_type, limit=30)
+                    if posts:
+                        gallery_type = retry_type
+                        error_msg = None
+                        logging.info(f"[디시] {gallery_id} 재시도 성공 (타입={retry_type}): {len(posts)}개 게시글")
+                        break
+                except Exception:
+                    continue
+            
+            if not posts:
+                error_msg = "모든 갤러리 타입 시도 실패"
+                logging.error(f"[디시] {gallery_id} {error_msg}")
         
         if not posts:
             # 갤러리 URL 안내
             await ctx.reply(
                 f"❌ **'{gallery_id}'** 갤러리에서 게시물을 가져올 수 없습니다.\n\n"
                 f"**갤러리 ID 확인 방법:**\n"
-                f"디시인사이드 갤러리 URL에서 `id=` 뒤의 값을 입력하세요.\n"
-                f"예: `dcinside.com/mgallery/board/lists?id=frozen` → **frozen**\n\n"
+                f"디시인사이드 갤러리 URL에서 `id=` 뒤의 값을 입력하세요.\n\n"
+                f"**예시:**\n"
+                f"• 일반: `dcinside.com/board/lists?id=dcbest` → `!디시 dcbest`\n"
+                f"• 마이너: `dcinside.com/mgallery/board/lists?id=frozen` → `!디시 frozen`\n"
+                f"• 미니: `dcinside.com/mini/board/lists/?id=soopsosopbj` → `!디시 soopsosopbj`\n\n"
                 f"**사용 예시:**\n"
-                f"• `!디시 frozen` - 겨울왕국 갤러리\n"
-                f"• `!디시 dcbest` - 실시간베스트 갤러리\n"
-                f"• `!디시 overwatch` - 오버워치 갤러리\n\n"
-                f"{f'오류: {error_msg}' if error_msg else ''}"
+                f"• `!디시 frozen` - 겨울왕국 마이너 갤러리\n"
+                f"• `!디시 dcbest` - 실시간베스트 일반 갤러리\n"
+                f"• `!디시 soopsosopbj` - 숲소습 미니 갤러리\n\n"
+                f"{f'🔍 상세 오류: {error_msg}' if error_msg else ''}"
             )
             return
         
         # 상위 게시물만 선택
         hot_posts = posts[:limit]
         
-        # 마이너 갤러리 여부 표시
-        gallery_type = "마이너 갤러리" if is_minor else "일반 갤러리"
+        # 갤러리 타입 표시
+        gallery_type_display = {
+            "major": "일반 갤러리",
+            "minor": "마이너 갤러리", 
+            "mini": "미니 갤러리"
+        }.get(gallery_type, "일반 갤러리")
         
         embed = discord.Embed(
             title=f"🔥 {gallery_display_name} 인기글 TOP {limit}",
-            description=f"📊 추천수·조회수 기반 인기 게시물 | {gallery_type}",
+            description=f"📊 추천수·조회수 기반 인기 게시물 | {gallery_type_display}",
             color=0xFF6B6B,
             timestamp=datetime.datetime.now(seoul_tz)
         )
@@ -3946,6 +3975,7 @@ async def on_ready():
         "!xphelp 로 경험치 시스템 확인",
         "!trending 으로 실시간 키워드 통계 보기",
         "!ach 로 업적 달성 현황 확인",
+        "!디시 로 실시간으로 핫한 디시글 확인하기"
         
     ])
 
