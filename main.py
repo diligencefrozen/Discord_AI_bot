@@ -528,16 +528,26 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
             
             # 게시글 목록 파싱
             rows = soup.select('tr.ub-content')
-            logging.debug(f"[디시] {gallery_id} - tr.ub-content 개수: {len(rows)}")
+            logging.info(f"[디시] {gallery_id} - tr.ub-content 개수: {len(rows)}")
+            
+            skipped_count = 0
+            parsed_count = 0
             
             for row in rows:
                 try:
                     # 게시글 번호
                     num_elem = row.select_one('td.gall_num')
-                    if not num_elem or num_elem.text.strip() in ['공지', '설문', 'AD', '-']:
+                    if not num_elem:
+                        skipped_count += 1
                         continue
                     
-                    post_no = int(num_elem.text.strip())
+                    num_text = num_elem.text.strip()
+                    if num_text in ['공지', '설문', 'AD', '-']:
+                        skipped_count += 1
+                        continue
+                    
+                    post_no = int(num_text)
+                    parsed_count += 1
                     
                     # 제목 및 링크
                     title_elem = row.select_one('td.gall_tit a')
@@ -624,8 +634,11 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                     })
                     
                 except Exception as e:
-                    logging.error(f"게시글 파싱 오류: {e}")
+                    logging.error(f"[디시] 게시글 파싱 오류: {e}")
                     continue
+            
+            # 파싱 요약 로그
+            logging.info(f"[디시] {gallery_id} - 파싱 요약: 전체 {len(rows)}개, 스킵 {skipped_count}개, 파싱 성공 {parsed_count}개, posts 배열 {len(posts)}개")
             
             # 관리자 게시물 필터링 (닉네임과 UID를 분리하여 정확히 매칭)
             config_data = GALLERY_CONFIG.get(gallery_id, {})
@@ -635,23 +648,33 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                 admin_nicknames = exclude_admins.get("nicknames", [])
                 admin_uids = exclude_admins.get("uids", [])
                 
+                logging.debug(f"[디시] {gallery_id} - 관리자 필터: 닉네임={admin_nicknames}, UID={admin_uids}")
+                
                 filtered_posts = []
+                excluded_count = 0
+                
                 for post in posts:
                     is_admin = False
                     
                     # 닉네임으로 필터링 (author 필드에서 정확히 매칭)
                     if post["author"] in admin_nicknames:
                         is_admin = True
+                        excluded_count += 1
+                        logging.debug(f"[디시] 제외(닉네임): {post['author']} - {post['title'][:30]}")
                     
                     # UID로 필터링 (ip 필드에서 "UID:" 접두사를 제거하고 매칭)
-                    post_uid = post["ip"].replace("UID:", "") if post["ip"].startswith("UID:") else post["ip"]
-                    if post_uid in admin_uids:
-                        is_admin = True
+                    if not is_admin:  # 이미 제외되지 않은 경우만 체크
+                        post_uid = post["ip"].replace("UID:", "") if post["ip"].startswith("UID:") else post["ip"]
+                        if post_uid in admin_uids:
+                            is_admin = True
+                            excluded_count += 1
+                            logging.debug(f"[디시] 제외(UID): {post_uid} - {post['title'][:30]}")
                     
                     if not is_admin:
                         filtered_posts.append(post)
                 
                 posts = filtered_posts
+                logging.info(f"[디시] {gallery_id} - 필터링: {excluded_count}개 제외, {len(posts)}개 남음")
             
             # 인기 점수 순으로 정렬
             posts.sort(key=lambda x: x["hot_score"], reverse=True)
