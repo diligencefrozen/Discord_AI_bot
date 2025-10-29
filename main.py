@@ -509,7 +509,7 @@ async def fetch_hot_posts(gallery_id: str, is_minor: bool = False, limit: int = 
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         }
         
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
             response = await client.get(url, headers=headers)
             response.raise_for_status()
             
@@ -518,12 +518,13 @@ async def fetch_hot_posts(gallery_id: str, is_minor: bool = False, limit: int = 
             
             # 게시글 목록 파싱
             rows = soup.select('tr.ub-content')
+            logging.debug(f"[디시] {gallery_id} - tr.ub-content 개수: {len(rows)}")
             
             for row in rows:
                 try:
                     # 게시글 번호
                     num_elem = row.select_one('td.gall_num')
-                    if not num_elem or num_elem.text.strip() in ['공지', '설문', 'AD']:
+                    if not num_elem or num_elem.text.strip() in ['공지', '설문', 'AD', '-']:
                         continue
                     
                     post_no = int(num_elem.text.strip())
@@ -643,6 +644,7 @@ async def fetch_hot_posts(gallery_id: str, is_minor: bool = False, limit: int = 
             # 인기 점수 순으로 정렬
             posts.sort(key=lambda x: x["hot_score"], reverse=True)
             
+            logging.info(f"[디시] {gallery_id} 최종 결과: {len(posts)}개 게시글")
             return posts[:limit]
             
     except Exception as e:
@@ -3785,15 +3787,19 @@ async def dcinside_gallery(ctx: commands.Context, gallery_id: Optional[str] = No
         try:
             # 먼저 설정된 타입으로 시도
             posts = await fetch_hot_posts(gallery_id, is_minor, limit=30)
+            logging.info(f"[디시] {gallery_id} 파싱 성공: {len(posts)}개 게시글")
         except Exception as e:
             error_msg = str(e)
+            logging.error(f"[디시] {gallery_id} 파싱 실패 (타입1): {e}")
             # 실패하면 반대 타입으로 재시도
             try:
                 is_minor = not is_minor
                 posts = await fetch_hot_posts(gallery_id, is_minor, limit=30)
                 error_msg = None  # 성공하면 에러 메시지 제거
+                logging.info(f"[디시] {gallery_id} 재시도 성공: {len(posts)}개 게시글")
             except Exception as e2:
                 error_msg = str(e2)
+                logging.error(f"[디시] {gallery_id} 재시도 실패: {e2}")
         
         if not posts:
             # 갤러리 URL 안내
