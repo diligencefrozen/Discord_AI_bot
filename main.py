@@ -3,7 +3,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # 기본 모듈,라이브러리 로드
 # ────────────────────────────────────────────────────────────────────────────
-import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json                             
+import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json                            
 from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
@@ -519,17 +519,13 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                 url = f"https://gall.dcinside.com/board/lists?id={gallery_id}"
             
             # 더 상세한 헤더 추가 (실제 브라우저처럼 보이도록)
+            # ⚠️ Accept-Encoding은 제거 - httpx가 자동으로 gzip 처리하도록 함
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                 "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate, br",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
                 "Cache-Control": "max-age=0",
             }
             
@@ -542,17 +538,31 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                 response = await client.get(url, headers=headers)
                 response.raise_for_status()
                 
-                # 응답 크기 확인 (너무 작으면 차단된 것)
-                content_length = len(response.text)
-                logging.info(f"[디시] {gallery_id} - 응답 크기: {content_length} bytes (시도 {attempt + 1}/{max_retries})")
+                # 응답 본문 가져오기 (명시적으로 인코딩 처리)
+                try:
+                    html_content = response.text
+                except Exception as decode_error:
+                    logging.error(f"[디시] {gallery_id} - 텍스트 디코딩 실패: {decode_error}")
+                    # 바이트로 직접 디코딩 시도
+                    try:
+                        html_content = response.content.decode('utf-8', errors='ignore')
+                    except:
+                        html_content = response.content.decode('euc-kr', errors='ignore')
+                
+                # 응답 크기 확인
+                content_length = len(html_content)
+                content_bytes = len(response.content)
+                logging.info(f"[디시] {gallery_id} - 응답: {content_length} chars, {content_bytes} bytes (시도 {attempt + 1}/{max_retries})")
                 
                 if content_length < 10000:  # 정상 응답은 보통 100KB 이상
                     logging.warning(f"[디시] {gallery_id} - 응답 크기가 너무 작음. 차단 가능성 있음.")
+                    logging.warning(f"[디시] Content-Type: {response.headers.get('content-type')}")
+                    logging.warning(f"[디시] Content-Encoding: {response.headers.get('content-encoding')}")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(retry_delay * (attempt + 1))
                         continue
                 
-                soup = BeautifulSoup(response.text, 'html.parser')
+                soup = BeautifulSoup(html_content, 'html.parser')
                 posts = []
                 
                 # 게시글 목록 파싱
@@ -562,7 +572,7 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                 # 0개일 경우 디버깅 정보 출력
                 if len(rows) == 0:
                     logging.error(f"[디시] {gallery_id} - 게시글을 찾을 수 없음!")
-                    logging.error(f"[디시] 응답 첫 500자: {response.text[:500]}")
+                    logging.error(f"[디시] 응답 첫 500자: {html_content[:500]}")
                     
                     # 대체 셀렉터 시도
                     alternative_rows = soup.select('tr.us-post')
