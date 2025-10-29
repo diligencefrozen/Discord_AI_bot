@@ -492,199 +492,252 @@ GALLERY_CONFIG = {
 }
 
 async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: int = 30) -> List[dict]:
-    """
-    디시인사이드 갤러리의 게시물을 가져와서 인기도 순으로 정렬합니다.
     
-    Args:
-        gallery_id: 갤러리 ID
-        gallery_type: "major" (일반), "minor" (마이너), "mini" (미니)
-        limit: 반환할 게시글 개수
+    # 디시인사이드 갤러리의 게시물을 가져와서 인기도 순으로 정렬합니다.
     
-    Returns: [{"no": 게시글번호, "title": 제목, "author": 작성자, "ip": IP, "link": 링크, 
-              "has_image": 이미지여부, "recommend": 추천수, "view": 조회수, "comment": 댓글수, "hot_score": 인기점수}]
-    """
+    # Args:
+        # gallery_id: 갤러리 ID
+        # gallery_type: "major" (일반), "minor" (마이너), "mini" (미니)
+        # limit: 반환할 게시글 개수
     
-    try:
-        # 갤러리 타입별 URL 설정
-        if gallery_type == "minor":
-            url = f"https://gall.dcinside.com/mgallery/board/lists?id={gallery_id}"
-        elif gallery_type == "mini":
-            url = f"https://gall.dcinside.com/mini/board/lists/?id={gallery_id}"
-        else:  # major
-            url = f"https://gall.dcinside.com/board/lists?id={gallery_id}"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        }
-        
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
+    # Returns: [{"no": 게시글번호, "title": 제목, "author": 작성자, "ip": IP, "link": 링크, 
+              # "has_image": 이미지여부, "recommend": 추천수, "view": 조회수, "comment": 댓글수, "hot_score": 인기점수}]
+    
+    
+    # 재시도 로직 추가
+    max_retries = 3
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            # 갤러리 타입별 URL 설정
+            if gallery_type == "minor":
+                url = f"https://gall.dcinside.com/mgallery/board/lists?id={gallery_id}"
+            elif gallery_type == "mini":
+                url = f"https://gall.dcinside.com/mini/board/lists/?id={gallery_id}"
+            else:  # major
+                url = f"https://gall.dcinside.com/board/lists?id={gallery_id}"
             
-            soup = BeautifulSoup(response.text, 'html.parser')
-            posts = []
+            # 더 상세한 헤더 추가 (실제 브라우저처럼 보이도록)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0",
+            }
             
-            # 게시글 목록 파싱
-            rows = soup.select('tr.ub-content')
-            logging.info(f"[디시] {gallery_id} - tr.ub-content 개수: {len(rows)}")
-            
-            skipped_count = 0
-            parsed_count = 0
-            
-            for row in rows:
-                try:
-                    # 게시글 번호
-                    num_elem = row.select_one('td.gall_num')
-                    if not num_elem:
-                        skipped_count += 1
+            # SSL 검증 비활성화 및 타임아웃 증가
+            async with httpx.AsyncClient(
+                timeout=60.0, 
+                follow_redirects=True,
+                verify=False  # SSL 검증 비활성화 (일부 환경에서 필요)
+            ) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                
+                # 응답 크기 확인 (너무 작으면 차단된 것)
+                content_length = len(response.text)
+                logging.info(f"[디시] {gallery_id} - 응답 크기: {content_length} bytes (시도 {attempt + 1}/{max_retries})")
+                
+                if content_length < 10000:  # 정상 응답은 보통 100KB 이상
+                    logging.warning(f"[디시] {gallery_id} - 응답 크기가 너무 작음. 차단 가능성 있음.")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
                         continue
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                posts = []
+                
+                # 게시글 목록 파싱
+                rows = soup.select('tr.ub-content')
+                logging.info(f"[디시] {gallery_id} - tr.ub-content 개수: {len(rows)}")
+                
+                # 0개일 경우 디버깅 정보 출력
+                if len(rows) == 0:
+                    logging.error(f"[디시] {gallery_id} - 게시글을 찾을 수 없음!")
+                    logging.error(f"[디시] 응답 첫 500자: {response.text[:500]}")
                     
-                    num_text = num_elem.text.strip()
-                    if num_text in ['공지', '설문', 'AD', '-']:
-                        skipped_count += 1
+                    # 대체 셀렉터 시도
+                    alternative_rows = soup.select('tr.us-post')
+                    logging.info(f"[디시] {gallery_id} - tr.us-post 개수: {len(alternative_rows)}")
+                    
+                    if len(alternative_rows) > 0:
+                        rows = alternative_rows
+                    elif attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
                         continue
-                    
-                    post_no = int(num_text)
-                    parsed_count += 1
-                    
-                    # 제목 및 링크
-                    title_elem = row.select_one('td.gall_tit a')
-                    if not title_elem:
-                        continue
-                    
-                    title = title_elem.text.strip()
-                    link_path = title_elem.get('href', '')
-                    
-                    # 이미지 여부
-                    has_image = row.select_one('em.icon_pic') is not None
-                    
-                    # 댓글 수
-                    comment_elem = row.select_one('span.reply_num')
-                    comment_count = 0
-                    if comment_elem:
-                        comment_text = comment_elem.text.strip().replace('[', '').replace(']', '')
-                        try:
-                            comment_count = int(comment_text)
-                        except:
-                            comment_count = 0
-                    
-                    # 추천 수
-                    recommend_elem = row.select_one('td.gall_recommend')
-                    recommend = 0
-                    if recommend_elem:
-                        try:
-                            recommend = int(recommend_elem.text.strip())
-                        except:
-                            recommend = 0
-                    
-                    # 조회 수
-                    view_elem = row.select_one('td.gall_count')
-                    view_count = 0
-                    if view_elem:
-                        try:
-                            view_count = int(view_elem.text.strip())
-                        except:
-                            view_count = 0
-                    
-                    # 작성자 정보
-                    writer_elem = row.select_one('td.gall_writer')
-                    author_nick = ""
-                    author_ip = ""
-                    
-                    if writer_elem:
-                        # 닉네임
-                        nick_elem = writer_elem.select_one('span.nickname em')
-                        if nick_elem:
-                            author_nick = nick_elem.text.strip()
+                    else:
+                        return []
+                
+                skipped_count = 0
+                parsed_count = 0
+                
+                for row in rows:
+                    try:
+                        # 게시글 번호
+                        num_elem = row.select_one('td.gall_num')
+                        if not num_elem:
+                            skipped_count += 1
+                            continue
                         
-                        # IP 또는 UID
-                        ip_elem = writer_elem.select_one('span.ip')
-                        if ip_elem:
-                            author_ip = ip_elem.text.strip()
-                        else:
-                            # UID인 경우
-                            uid = writer_elem.get('data-uid', '')
-                            if uid:
-                                author_ip = f"UID:{uid}"
-                    
-                    # 전체 링크 생성
-                    if gallery_type == "minor":
-                        full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mgallery/board/view/?id={gallery_id}&no={post_no}"
-                    elif gallery_type == "mini":
-                        full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mini/board/view/?id={gallery_id}&no={post_no}"
-                    else:  # major
-                        full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/board/view/?id={gallery_id}&no={post_no}"
-                    
-                    # 인기 점수 계산 (추천 * 5 + 댓글 * 2 + 조회수 / 10)
-                    hot_score = (recommend * 5) + (comment_count * 2) + (view_count / 10)
-                    
-                    posts.append({
-                        "no": post_no,
-                        "title": title,
-                        "author": author_nick,
-                        "ip": author_ip,
-                        "link": full_link,
-                        "has_image": has_image,
-                        "recommend": recommend,
-                        "view": view_count,
-                        "comment": comment_count,
-                        "hot_score": hot_score
-                    })
-                    
-                except Exception as e:
-                    logging.error(f"[디시] 게시글 파싱 오류: {e}")
-                    continue
-            
-            # 파싱 요약 로그
-            logging.info(f"[디시] {gallery_id} - 파싱 요약: 전체 {len(rows)}개, 스킵 {skipped_count}개, 파싱 성공 {parsed_count}개, posts 배열 {len(posts)}개")
-            
-            # 관리자 게시물 필터링 (닉네임과 UID를 분리하여 정확히 매칭)
-            config_data = GALLERY_CONFIG.get(gallery_id, {})
-            exclude_admins = config_data.get("exclude_admins", {})
-            
-            if exclude_admins:
-                admin_nicknames = exclude_admins.get("nicknames", [])
-                admin_uids = exclude_admins.get("uids", [])
+                        num_text = num_elem.text.strip()
+                        if num_text in ['공지', '설문', 'AD', '-']:
+                            skipped_count += 1
+                            continue
+                        
+                        post_no = int(num_text)
+                        parsed_count += 1
+                        
+                        # 제목 및 링크
+                        title_elem = row.select_one('td.gall_tit a')
+                        if not title_elem:
+                            continue
+                        
+                        title = title_elem.text.strip()
+                        link_path = title_elem.get('href', '')
+                        
+                        # 이미지 여부
+                        has_image = row.select_one('em.icon_pic') is not None
+                        
+                        # 댓글 수
+                        comment_elem = row.select_one('span.reply_num')
+                        comment_count = 0
+                        if comment_elem:
+                            comment_text = comment_elem.text.strip().replace('[', '').replace(']', '')
+                            try:
+                                comment_count = int(comment_text)
+                            except:
+                                comment_count = 0
+                        
+                        # 추천 수
+                        recommend_elem = row.select_one('td.gall_recommend')
+                        recommend = 0
+                        if recommend_elem:
+                            try:
+                                recommend = int(recommend_elem.text.strip())
+                            except:
+                                recommend = 0
+                        
+                        # 조회 수
+                        view_elem = row.select_one('td.gall_count')
+                        view_count = 0
+                        if view_elem:
+                            try:
+                                view_count = int(view_elem.text.strip())
+                            except:
+                                view_count = 0
+                        
+                        # 작성자 정보
+                        writer_elem = row.select_one('td.gall_writer')
+                        author_nick = ""
+                        author_ip = ""
+                        
+                        if writer_elem:
+                            # 닉네임
+                            nick_elem = writer_elem.select_one('span.nickname em')
+                            if nick_elem:
+                                author_nick = nick_elem.text.strip()
+                            
+                            # IP 또는 UID
+                            ip_elem = writer_elem.select_one('span.ip')
+                            if ip_elem:
+                                author_ip = ip_elem.text.strip()
+                            else:
+                                # UID인 경우
+                                uid = writer_elem.get('data-uid', '')
+                                if uid:
+                                    author_ip = f"UID:{uid}"
+                        
+                        # 전체 링크 생성
+                        if gallery_type == "minor":
+                            full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mgallery/board/view/?id={gallery_id}&no={post_no}"
+                        elif gallery_type == "mini":
+                            full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mini/board/view/?id={gallery_id}&no={post_no}"
+                        else:  # major
+                            full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/board/view/?id={gallery_id}&no={post_no}"
+                        
+                        # 인기 점수 계산 (추천 * 5 + 댓글 * 2 + 조회수 / 10)
+                        hot_score = (recommend * 5) + (comment_count * 2) + (view_count / 10)
+                        
+                        posts.append({
+                            "no": post_no,
+                            "title": title,
+                            "author": author_nick,
+                            "ip": author_ip,
+                            "link": full_link,
+                            "has_image": has_image,
+                            "recommend": recommend,
+                            "view": view_count,
+                            "comment": comment_count,
+                            "hot_score": hot_score
+                        })
+                        
+                    except Exception as e:
+                        logging.error(f"[디시] 게시글 파싱 오류: {e}")
+                        continue
                 
-                logging.debug(f"[디시] {gallery_id} - 관리자 필터: 닉네임={admin_nicknames}, UID={admin_uids}")
+                # 파싱 요약 로그
+                logging.info(f"[디시] {gallery_id} - 파싱 요약: 전체 {len(rows)}개, 스킵 {skipped_count}개, 파싱 성공 {parsed_count}개, posts 배열 {len(posts)}개")
                 
-                filtered_posts = []
-                excluded_count = 0
+                # 관리자 게시물 필터링 (닉네임과 UID를 분리하여 정확히 매칭)
+                config_data = GALLERY_CONFIG.get(gallery_id, {})
+                exclude_admins = config_data.get("exclude_admins", {})
                 
-                for post in posts:
-                    is_admin = False
+                if exclude_admins:
+                    admin_nicknames = exclude_admins.get("nicknames", [])
+                    admin_uids = exclude_admins.get("uids", [])
                     
-                    # 닉네임으로 필터링 (author 필드에서 정확히 매칭)
-                    if post["author"] in admin_nicknames:
-                        is_admin = True
-                        excluded_count += 1
-                        logging.debug(f"[디시] 제외(닉네임): {post['author']} - {post['title'][:30]}")
+                    logging.debug(f"[디시] {gallery_id} - 관리자 필터: 닉네임={admin_nicknames}, UID={admin_uids}")
                     
-                    # UID로 필터링 (ip 필드에서 "UID:" 접두사를 제거하고 매칭)
-                    if not is_admin:  # 이미 제외되지 않은 경우만 체크
-                        post_uid = post["ip"].replace("UID:", "") if post["ip"].startswith("UID:") else post["ip"]
-                        if post_uid in admin_uids:
+                    filtered_posts = []
+                    excluded_count = 0
+                    
+                    for post in posts:
+                        is_admin = False
+                        
+                        # 닉네임으로 필터링 (author 필드에서 정확히 매칭)
+                        if post["author"] in admin_nicknames:
                             is_admin = True
                             excluded_count += 1
-                            logging.debug(f"[디시] 제외(UID): {post_uid} - {post['title'][:30]}")
+                            logging.debug(f"[디시] 제외(닉네임): {post['author']} - {post['title'][:30]}")
+                        
+                        # UID로 필터링 (ip 필드에서 "UID:" 접두사를 제거하고 매칭)
+                        if not is_admin:  # 이미 제외되지 않은 경우만 체크
+                            post_uid = post["ip"].replace("UID:", "") if post["ip"].startswith("UID:") else post["ip"]
+                            if post_uid in admin_uids:
+                                is_admin = True
+                                excluded_count += 1
+                                logging.debug(f"[디시] 제외(UID): {post_uid} - {post['title'][:30]}")
+                        
+                        if not is_admin:
+                            filtered_posts.append(post)
                     
-                    if not is_admin:
-                        filtered_posts.append(post)
+                    posts = filtered_posts
+                    logging.info(f"[디시] {gallery_id} - 필터링: {excluded_count}개 제외, {len(posts)}개 남음")
                 
-                posts = filtered_posts
-                logging.info(f"[디시] {gallery_id} - 필터링: {excluded_count}개 제외, {len(posts)}개 남음")
-            
-            # 인기 점수 순으로 정렬
-            posts.sort(key=lambda x: x["hot_score"], reverse=True)
-            
-            logging.info(f"[디시] {gallery_id} 최종 결과: {len(posts)}개 게시글")
-            return posts[:limit]
-            
-    except Exception as e:
-        logging.error(f"갤러리 {gallery_id} 불러오기 실패: {e}")
-        return []
+                # 인기 점수 순으로 정렬
+                posts.sort(key=lambda x: x["hot_score"], reverse=True)
+                
+                logging.info(f"[디시] {gallery_id} 파싱 성공: {len(posts)}개 게시글")
+                return posts[:limit]
+                
+        except Exception as e:
+            logging.error(f"[디시] {gallery_id} 불러오기 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (attempt + 1))
+            else:
+                logging.error(f"[디시] {gallery_id} 최종 실패")
+                return []
+    
+    # 모든 재시도 실패
+    return []
 
 def is_weekend() -> bool:
     # 주말 여부 확인 (금요일, 토요일, 일요일)
@@ -1695,7 +1748,7 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
 
     finally:
         _typing_tasks.pop(key, None)
-        
+
 # ────────── HF / Discord 설정 ──────────
 HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
 PROVIDER      = "novita"
