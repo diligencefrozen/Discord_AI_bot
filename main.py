@@ -3855,11 +3855,11 @@ async def dcinside_gallery(ctx: commands.Context, gallery_id: Optional[str] = No
                 f"**예시:**\n"
                 f"• 일반: `dcinside.com/board/lists?id=dcbest` → `!디시 dcbest`\n"
                 f"• 마이너: `dcinside.com/mgallery/board/lists?id=frozen` → `!디시 frozen`\n"
-                f"• 미니: `dcinside.com/mini/board/lists/?id=soopsosopbj` → `!디시 soopsosopbj`\n\n"
+                f"• 미니: `https://gall.dcinside.com/mini/board/lists/?id=frozen3mini` → `!디시 frozen3mini`\n\n"
                 f"**사용 예시:**\n"
                 f"• `!디시 frozen` - 겨울왕국 마이너 갤러리\n"
                 f"• `!디시 dcbest` - 실시간베스트 일반 갤러리\n"
-                f"• `!디시 soopsosopbj` - 숲소습 미니 갤러리\n\n"
+                f"• `!디시 frozen3mini` - 겨울왕국3 미니 갤러리\n\n"
                 f"{f'🔍 상세 오류: {error_msg}' if error_msg else ''}"
             )
             return
@@ -3906,7 +3906,7 @@ async def dcinside_gallery(ctx: commands.Context, gallery_id: Optional[str] = No
                 author_info += f" `{post['ip']}`"
             
             # 통계 정보 (인기 점수 포함)
-            stats = f"� {post['recommend']} | 👀 {post['view']:,} | 💬 {post['comment']} | 🔥 {int(post['hot_score'])}"
+            stats = f"😊 {post['recommend']} | 👀 {post['view']:,} | 💬 {post['comment']} | 🔥 {int(post['hot_score'])}"
             
             field_value = (
                 f"**작성자**: {author_info}\n"
