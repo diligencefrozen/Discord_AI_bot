@@ -3841,102 +3841,35 @@ def fix_code(chunks: List[str]) -> List[str]:
     return fixed
 
 # ────────── 디시인사이드 갤러리 인기글 명령어 ──────────
-@bot.command(name="디시", aliases=["dcinside", "dc갤", "갤"], help="!디시 [갤러리ID] [개수] — 디시인사이드 인기 게시물 (기본: battlegroundmobile)")
-async def dcinside_gallery(ctx: commands.Context, gallery_id: Optional[str] = None, limit: int = 10):
-    #디시인사이드 갤러리 인기 게시물 추천
-    
-    # 사용법:
-        # !디시                     → battlegroundmobile 갤러리 (기본값)
-        # !디시 frozen              → frozen 갤러리
-    
-    # 갤러리 ID는 dcinside.com/board/lists?id={갤러리ID} 또는
-    # dcinside.com/mgallery/board/lists?id={갤러리ID} 에서 확인하세요.
-    
-    # 기본값: battlegroundmobile
-    if gallery_id is None:
-        gallery_id = "battlegroundmobile"
-        gallery_type = "minor"
-        gallery_display_name = "배틀그라운드 모바일"
-    else:
-        # 기존 설정에 있는지 확인
-        config = GALLERY_CONFIG.get(gallery_id)
-        if config:
-            gallery_display_name = config["name"]
-            gallery_type = config.get("gallery_type", "major")
-        else:
-            # 설정에 없으면 갤러리 ID를 그대로 사용
-            gallery_display_name = gallery_id
-            gallery_type = "major"  # 먼저 일반 갤러리로 시도
-    
-    # 개수 제한
+@bot.command(name="모배갤", aliases=["모배", "battleground", "bg"], help="!모배갤 — 배틀그라운드 모바일 갤러리 인기 게시물")
+async def gallery_hot_posts(ctx: commands.Context, limit: int = 10):
+    # 배틀그라운드 모바일 갤러리의 인기 게시물 추천
     if limit > 15:
         limit = 15
     elif limit < 1:
         limit = 10
     
     async with ctx.typing():
-        # 인기 게시물 가져오기
-        posts = []
-        error_msg = None
+        gallery_id = "battlegroundmobile"
+        config = GALLERY_CONFIG.get(gallery_id)
         
-        try:
-            # 먼저 설정된 타입으로 시도
-            posts = await fetch_hot_posts(gallery_id, gallery_type, limit=30)
-            logging.info(f"[디시] {gallery_id} 파싱 성공: {len(posts)}개 게시글")
-        except Exception as e:
-            error_msg = str(e)
-            logging.error(f"[디시] {gallery_id} 파싱 실패 (타입1={gallery_type}): {e}")
-            # 실패하면 다른 타입들로 순차 재시도
-            # major → minor → mini 순으로 시도
-            other_types = ["major", "minor", "mini"]
-            other_types.remove(gallery_type)  # 이미 시도한 타입 제외
-            
-            for retry_type in other_types:
-                try:
-                    posts = await fetch_hot_posts(gallery_id, retry_type, limit=30)
-                    if posts:
-                        gallery_type = retry_type
-                        error_msg = None
-                        logging.info(f"[디시] {gallery_id} 재시도 성공 (타입={retry_type}): {len(posts)}개 게시글")
-                        break
-                except Exception:
-                    continue
-            
-            if not posts:
-                error_msg = "모든 갤러리 타입 시도 실패"
-                logging.error(f"[디시] {gallery_id} {error_msg}")
+        if not config:
+            await ctx.reply("❌ 갤러리 설정을 찾을 수 없습니다.")
+            return
+        
+        # 인기 게시물 가져오기
+        posts = await fetch_hot_posts(gallery_id, config.get("gallery_type", "major"), limit=30)
         
         if not posts:
-            # 갤러리 URL 안내
-            await ctx.reply(
-                f"❌ **'{gallery_id}'** 갤러리에서 게시물을 가져올 수 없습니다.\n\n"
-                f"**갤러리 ID 확인 방법:**\n"
-                f"디시인사이드 갤러리 URL에서 `id=` 뒤의 값을 입력하세요.\n\n"
-                f"**예시:**\n"
-                f"• 일반: `dcinside.com/board/lists?id=dcbest` → `!디시 dcbest`\n"
-                f"• 마이너: `dcinside.com/mgallery/board/lists?id=frozen` → `!디시 frozen`\n"
-                f"• 미니: `https://gall.dcinside.com/mini/board/lists/?id=frozen3mini` → `!디시 frozen3mini`\n\n"
-                f"**사용 예시:**\n"
-                f"• `!디시 frozen` - 겨울왕국 마이너 갤러리\n"
-                f"• `!디시 dcbest` - 실시간베스트 일반 갤러리\n"
-                f"• `!디시 frozen3mini` - 겨울왕국3 미니 갤러리\n\n"
-                f"{f'🔍 상세 오류: {error_msg}' if error_msg else ''}"
-            )
+            await ctx.reply("❌ 갤러리에서 게시물을 가져올 수 없습니다.")
             return
         
         # 상위 게시물만 선택
         hot_posts = posts[:limit]
         
-        # 갤러리 타입 표시
-        gallery_type_display = {
-            "major": "일반 갤러리",
-            "minor": "마이너 갤러리", 
-            "mini": "미니 갤러리"
-        }.get(gallery_type, "일반 갤러리")
-        
         embed = discord.Embed(
-            title=f"🔥 {gallery_display_name} 인기글 TOP {limit}",
-            description=f"📊 추천수·조회수 기반 인기 게시물 | {gallery_type_display}",
+            title=f"😊 {config['name']} 갤러리 인기글 TOP {limit}",
+            description=f"추천수와 조회수 기반 인기 게시물입니다!",
             color=0xFF6B6B,
             timestamp=datetime.datetime.now(seoul_tz)
         )
@@ -3947,31 +3880,22 @@ async def dcinside_gallery(ctx: commands.Context, gallery_id: Optional[str] = No
             if len(title) > 80:
                 title = title[:77] + "..."
             
-            # 순위 메달
-            if idx == 1:
-                medal = "🥇"
-            elif idx == 2:
-                medal = "🥈"
-            elif idx == 3:
-                medal = "🥉"
-            else:
-                medal = f"**{idx}.**"
-            
-            # 이미지 아이콘
-            icon = "🖼️" if post['has_image'] else "📝"
+            # 아이콘
+            icon = "📝" if post['has_image'] else "📝"
+            medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"**{idx}.**"
             
             # 작성자 정보
             author_info = post['author']
             if post['ip']:
                 author_info += f" `{post['ip']}`"
             
-            # 통계 정보 (인기 점수 포함)
-            stats = f"😊 {post['recommend']} | 👀 {post['view']:,} | 💬 {post['comment']} | 🔥 {int(post['hot_score'])}"
+            # 통계 정보
+            stats = f"😊 {post['recommend']} | 👀 {post['view']:,} | 💬 {post['comment']}"
             
             field_value = (
                 f"**작성자**: {author_info}\n"
                 f"**통계**: {stats}\n"
-                f"[🔗 게시글 바로가기]({post['link']})"
+                f"[🔗 게시글 보기]({post['link']})"
             )
             
             embed.add_field(
@@ -3980,17 +3904,9 @@ async def dcinside_gallery(ctx: commands.Context, gallery_id: Optional[str] = No
                 inline=False
             )
         
-        # 푸터에 갤러리 정보 추가
-        footer_text = f"디시인사이드 {gallery_display_name} ({gallery_type}) | tbBot3rd"
-        
-        embed.set_footer(text=footer_text)
+        embed.set_footer(text=f"디시인사이드 {config['name']} 갤러리 X tbBot3rd")
         
         await ctx.reply(embed=embed)
-
-@bot.command(name="모배갤", aliases=["모배", "battleground", "bg"], help="!모배갤 [개수] — 배틀그라운드 모바일 갤러리 (별칭)")
-async def gallery_hot_posts(ctx: commands.Context, limit: int = 10):
-    # 배틀그라운드 모바일 갤러리 (하위 호환성)
-    await dcinside_gallery(ctx, "battlegroundmobile", limit)
 
 @bot.command(name="ask", help="!ask <질문>")
 async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
@@ -4058,7 +3974,7 @@ async def on_ready():
         "!xphelp 로 경험치 시스템 확인",
         "!trending 으로 실시간 키워드 통계 보기",
         "!ach 로 업적 달성 현황 확인",
-        "!디시 로 실시간으로 핫한 디시글 확인하기"
+        "!모배갤 로 모배 정보 확인"
         
     ])
 
