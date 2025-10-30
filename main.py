@@ -514,7 +514,7 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
             if gallery_type == "minor":
                 url = f"https://gall.dcinside.com/mgallery/board/lists?id={gallery_id}"
             elif gallery_type == "mini":
-                url = f"https://gall.dcinside.com/mini/board/lists/?id={gallery_id}"
+                url = f"https://gall.dcinside.com/mini/board/lists?id={gallery_id}"
             else:  # major
                 url = f"https://gall.dcinside.com/board/lists?id={gallery_id}"
             
@@ -523,9 +523,13 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Referer": "https://gall.dcinside.com/",
+                "Connection": "keep-alive",
             }
             
-            # ⚠️ httpx 대신 aiohttp 사용 (Heroku 환경에서 더 안정적)
+            # httpx 대신 aiohttp 사용 (Heroku 환경에서 더 안정적)
             import aiohttp
             
             timeout = aiohttp.ClientTimeout(total=60)
@@ -551,13 +555,11 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                     content_length = len(html_content)
                     logging.info(f"[디시] {gallery_id} - 응답: {content_length} chars, {content_bytes} bytes (시도 {attempt + 1}/{max_retries})")
                     
-                    if content_length < 10000:  # 정상 응답은 보통 100KB 이상
-                        logging.warning(f"[디시] {gallery_id} - 응답 크기가 너무 작음. 차단 가능성 있음.")
+                    # 응답 길이가 짧아도 일단 파싱 시도 (차단/압축/마크업 변경 등 고려)
+                    if content_length < 3000:
+                        logging.warning(f"[디시] {gallery_id} - 응답 크기가 비정상적으로 작음. (차단 가능성/마크업 변경 가능성)")
                         logging.warning(f"[디시] Content-Type: {response.headers.get('content-type')}")
                         logging.warning(f"[디시] Content-Encoding: {response.headers.get('content-encoding')}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay * (attempt + 1))
-                            continue
                     
                     soup = BeautifulSoup(html_content, 'html.parser')
                     posts = []
@@ -571,17 +573,22 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                         logging.error(f"[디시] {gallery_id} - 게시글을 찾을 수 없음!")
                         logging.error(f"[디시] 응답 첫 500자: {html_content[:500]}")
                         
-                        # 대체 셀렉터 시도
+                        # 대체 셀렉터 시도 (대체 마크업 대응)
                         alternative_rows = soup.select('tr.us-post')
                         logging.info(f"[디시] {gallery_id} - tr.us-post 개수: {len(alternative_rows)}")
+                        if len(alternative_rows) == 0:
+                            # 마지막 보루: tbody 내에서 필수 칼럼이 있는 행만
+                            alternative_rows = [r for r in soup.select('tbody tr') if r.select_one('td.gall_tit')]
+                            logging.info(f"[디시] {gallery_id} - tbody tr(gall_tit 존재) 개수: {len(alternative_rows)}")
                         
                         if len(alternative_rows) > 0:
                             rows = alternative_rows
-                        elif attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay * (attempt + 1))
-                            continue
                         else:
-                            return []
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(retry_delay * (attempt + 1))
+                                continue
+                            else:
+                                return []
                     
                     skipped_count = 0
                     parsed_count = 0
@@ -602,8 +609,8 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                             post_no = int(num_text)
                             parsed_count += 1
                             
-                            # 제목 및 링크
-                            title_elem = row.select_one('td.gall_tit a')
+                            # 제목 및 링크 (여러 마크업 케이스 대응)
+                            title_elem = row.select_one('td.gall_tit a') or row.select_one('td.gall_tit a.ub-word')
                             if not title_elem:
                                 continue
                             
@@ -611,7 +618,7 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                             link_path = title_elem.get('href', '')
                             
                             # 이미지 여부
-                            has_image = row.select_one('em.icon_pic') is not None
+                            has_image = row.select_one('em.icon_pic, em.icon_recomimg') is not None
                             
                             # 댓글 수
                             comment_elem = row.select_one('span.reply_num')
