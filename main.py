@@ -526,67 +526,78 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                 "Cache-Control": "max-age=0",
                 "Referer": "https://www.dcinside.com/",
                 "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1"
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Ch-Ua": '"Google Chrome";v="120", "Chromium";v="120", "Not?A_Brand";v="99"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"macOS"'
             }
             
-            timeout = aiohttp.ClientTimeout(total=30)
-            connector = aiohttp.TCPConnector(ssl=False, limit=10)  # SSL 검증 비활성화, 연결 제한
+            # httpx로 변경 (더 나은 호환성)
+            # 프록시 설정 (필요시 아래 주석 해제하고 프록시 주소 입력)
+            # proxy_url = "http://proxy-server:port"  # 예: "http://proxy.example.com:8080"
+            proxy_url = None  # 프록시 없이 직접 연결 (헤로쿠에서 차단되면 프록시 필요)
             
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                async with session.get(url, headers=headers) as response:
-                    response.raise_for_status()
-                    
-                    # 응답 본문 가져오기 (바이트로 먼저 읽기)
-                    content_bytes_raw = await response.read()
-                    content_bytes = len(content_bytes_raw)
-                    
-                    # UTF-8로 디코딩 시도
+            async with httpx.AsyncClient(timeout=30.0, verify=False, follow_redirects=True) as client:
+                if proxy_url:
+                    response = await client.get(url, headers=headers, proxy=proxy_url)
+                else:
+                    response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                
+                # 응답 본문 가져오기
+                content_bytes_raw = response.content
+                content_bytes = len(content_bytes_raw)
+                
+                # UTF-8로 디코딩 시도
+                try:
+                    html_content = content_bytes_raw.decode('utf-8')
+                except UnicodeDecodeError:
                     try:
-                        html_content = content_bytes_raw.decode('utf-8')
-                    except UnicodeDecodeError:
-                        try:
-                            html_content = content_bytes_raw.decode('euc-kr')
-                        except:
-                            html_content = content_bytes_raw.decode('utf-8', errors='ignore')
+                        html_content = content_bytes_raw.decode('euc-kr')
+                    except:
+                        html_content = content_bytes_raw.decode('utf-8', errors='ignore')
+                
+                content_length = len(html_content)
+                logging.info(f"[디시] {gallery_id} - HTTP {response.status_code}, {content_length} chars (시도 {attempt + 1}/{max_retries})")
+                
+                # 응답 길이 체크 완화 (최소 1000자로 낮춤)
+                if content_length < 1000:
+                    logging.warning(f"[디시] {gallery_id} - 응답 크기가 작음 ({content_length} chars)")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
+                        continue
+                
+                soup = BeautifulSoup(html_content, 'html.parser')
+                posts = []
+                
+                # 게시글 목록 파싱 - 여러 셀렉터 시도
+                rows = soup.select('tr.ub-content')
+                if not rows:
+                    rows = soup.select('tbody tr.us-post')
+                if not rows:
+                    # 백업: gall_tit 클래스가 있는 모든 tr
+                    rows = [r for r in soup.select('tbody tr') if r.select_one('td.gall_tit')]
+                
+                logging.info(f"[디시] {gallery_id} - 발견된 행: {len(rows)}개")
+                
+                # 0개일 경우 디버깅 정보 출력
+                if len(rows) == 0:
+                    logging.error(f"[디시] {gallery_id} - 게시글 없음! HTML 첫 1000자:")
+                    logging.error(html_content[:1000])
                     
-                    content_length = len(html_content)
-                    logging.info(f"[디시] {gallery_id} - HTTP {response.status}, {content_length} chars (시도 {attempt + 1}/{max_retries})")
-                    
-                    # 응답 길이 체크 완화 (최소 1000자로 낮춤)
-                    if content_length < 1000:
-                        logging.warning(f"[디시] {gallery_id} - 응답 크기가 작음 ({content_length} chars)")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay * (attempt + 1))
-                            continue
-                    
-                    soup = BeautifulSoup(html_content, 'html.parser')
-                    posts = []
-                    
-                    # 게시글 목록 파싱 - 여러 셀렉터 시도
-                    rows = soup.select('tr.ub-content')
-                    if not rows:
-                        rows = soup.select('tbody tr.us-post')
-                    if not rows:
-                        # 백업: gall_tit 클래스가 있는 모든 tr
-                        rows = [r for r in soup.select('tbody tr') if r.select_one('td.gall_tit')]
-                    
-                    logging.info(f"[디시] {gallery_id} - 발견된 행: {len(rows)}개")
-                    
-                    # 0개일 경우 디버깅 정보 출력
-                    if len(rows) == 0:
-                        logging.error(f"[디시] {gallery_id} - 게시글 없음! HTML 첫 1000자:")
-                        logging.error(html_content[:1000])
-                        
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay * (attempt + 1))
-                            continue
-                        else:
-                            return []
-                    
-                    skipped_count = 0
-                    parsed_count = 0
-                    
-                    for row in rows:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
+                        continue
+                    else:
+                        return []
+                
+                skipped_count = 0
+                parsed_count = 0
+                
+                for row in rows:
                         try:
                             # 게시글 번호
                             num_elem = row.select_one('td.gall_num')
@@ -689,47 +700,47 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                         except Exception as e:
                             logging.error(f"[디시] 게시글 파싱 오류: {e}")
                             continue
+                
+                # 파싱 요약 로그
+                logging.info(f"[디시] {gallery_id} - 파싱 완료: {len(posts)}개 게시글")
+                
+                # 관리자 게시물 필터링 (간소화)
+                config_data = GALLERY_CONFIG.get(gallery_id, {})
+                exclude_admins = config_data.get("exclude_admins", {})
+                
+                if exclude_admins and posts:
+                    admin_nicknames = set(exclude_admins.get("nicknames", []))
+                    admin_uids = set(exclude_admins.get("uids", []))
                     
-                    # 파싱 요약 로그
-                    logging.info(f"[디시] {gallery_id} - 파싱 완료: {len(posts)}개 게시글")
+                    filtered_posts = []
+                    excluded_count = 0
                     
-                    # 관리자 게시물 필터링 (간소화)
-                    config_data = GALLERY_CONFIG.get(gallery_id, {})
-                    exclude_admins = config_data.get("exclude_admins", {})
-                    
-                    if exclude_admins and posts:
-                        admin_nicknames = set(exclude_admins.get("nicknames", []))
-                        admin_uids = set(exclude_admins.get("uids", []))
+                    for post in posts:
+                        is_admin = False
                         
-                        filtered_posts = []
-                        excluded_count = 0
+                        # 닉네임 체크
+                        if post["author"] in admin_nicknames:
+                            is_admin = True
+                            excluded_count += 1
                         
-                        for post in posts:
-                            is_admin = False
-                            
-                            # 닉네임 체크
-                            if post["author"] in admin_nicknames:
+                        # UID 체크
+                        elif post["ip"].startswith("UID:"):
+                            post_uid = post["ip"][4:]  # "UID:" 제거
+                            if post_uid in admin_uids:
                                 is_admin = True
                                 excluded_count += 1
-                            
-                            # UID 체크
-                            elif post["ip"].startswith("UID:"):
-                                post_uid = post["ip"][4:]  # "UID:" 제거
-                                if post_uid in admin_uids:
-                                    is_admin = True
-                                    excluded_count += 1
-                            
-                            if not is_admin:
-                                filtered_posts.append(post)
                         
-                        posts = filtered_posts
-                        logging.info(f"[디시] {gallery_id} - 관리자 제외: {excluded_count}개, 남은 게시글: {len(posts)}개")
+                        if not is_admin:
+                            filtered_posts.append(post)
                     
-                    # 인기 점수 순으로 정렬
-                    posts.sort(key=lambda x: x["hot_score"], reverse=True)
-                    
-                    logging.info(f"[디시] {gallery_id} 성공: {len(posts)}개 반환")
-                    return posts[:limit]
+                    posts = filtered_posts
+                    logging.info(f"[디시] {gallery_id} - 관리자 제외: {excluded_count}개, 남은 게시글: {len(posts)}개")
+                
+                # 인기 점수 순으로 정렬
+                posts.sort(key=lambda x: x["hot_score"], reverse=True)
+                
+                logging.info(f"[디시] {gallery_id} 성공: {len(posts)}개 반환")
+                return posts[:limit]
                 
         except Exception as e:
             logging.error(f"[디시] {gallery_id} 불러오기 실패 (시도 {attempt + 1}/{max_retries}): {e}")
@@ -2492,7 +2503,12 @@ async def on_message(message: discord.Message):
                 ach_embed.set_thumbnail(url=message.author.display_avatar.url)
                 ach_embed.set_footer(text="⏰ 자정 리셋 · !업적 으로 전체 확인")
 
-                await message.channel.send(embed=ach_embed, delete_after=15)
+                try:
+                    await message.channel.send(embed=ach_embed, delete_after=15)
+                except discord.errors.DiscordServerError as e:
+                    logging.error(f"Discord 서버 오류로 업적 알림 전송 실패 (520 등): {e}")
+                except Exception as e:
+                    logging.error(f"업적 알림 전송 실패: {e}")
         
         # 레벨업 알림 + 자동 보상 수령
         if leveled_up and new_tier_idx is not None:
@@ -2546,7 +2562,14 @@ async def on_message(message: discord.Message):
             )
             embed.set_thumbnail(url=message.author.display_avatar.url)
             embed.set_footer(text="⚠️ 매일 자정 하드리셋 | 보상은 당일만 유효")
-            await message.channel.send(embed=embed, delete_after=20)
+            
+            # Discord 서버 오류 대비 예외 처리
+            try:
+                await message.channel.send(embed=embed, delete_after=20)
+            except discord.errors.DiscordServerError as e:
+                logging.error(f"Discord 서버 오류로 레벨업 알림 전송 실패 (520 등): {e}")
+            except Exception as e:
+                logging.error(f"레벨업 알림 전송 실패: {e}")
 
         # VIP Winner 축하: 최고 등급 달성 후 첫 메시지에만
         data = get_user_xp(user_id)
@@ -2591,7 +2614,14 @@ async def on_message(message: discord.Message):
                 )
                 vip_embed.set_thumbnail(url=message.author.display_avatar.url)
                 vip_embed.set_footer(text=footer_text)
-                await message.channel.send(embed=vip_embed)
+                
+                try:
+                    await message.channel.send(embed=vip_embed)
+                except discord.errors.DiscordServerError as e:
+                    logging.error(f"Discord 서버 오류로 VIP 알림 전송 실패 (520 등): {e}")
+                except Exception as e:
+                    logging.error(f"VIP 알림 전송 실패: {e}")
+                
                 # 플래그 저장
                 user_xp_data[user_id]["vip_winner_announced"] = True
                 save_xp_data()
