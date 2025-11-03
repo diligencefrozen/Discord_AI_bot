@@ -3,7 +3,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # 기본 모듈,라이브러리 로드
 # ────────────────────────────────────────────────────────────────────────────
-import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json                            
+import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json, aiohttp, pickle                         
 from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
@@ -23,7 +23,6 @@ from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Set, Tuple
 from discord.errors import NotFound, Forbidden, HTTPException
-import pickle
 
 # ────────────────────────────────────────────────────────────────────────────
 # 24시간 경험치 시스템 (Daily XP & Rewards)
@@ -505,8 +504,8 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
     
     
     # 재시도 로직 추가
-    max_retries = 3
-    retry_delay = 2
+    max_retries = 2
+    retry_delay = 1
     
     for attempt in range(max_retries):
         try:
@@ -520,20 +519,18 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
             
             # 더 상세한 헤더 추가 (실제 브라우저처럼 보이도록)
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-                "Referer": "https://gall.dcinside.com/",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Cache-Control": "max-age=0",
+                "Referer": "https://www.dcinside.com/",
                 "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1"
             }
             
-            # httpx 대신 aiohttp 사용 (Heroku 환경에서 더 안정적)
-            import aiohttp
-            
-            timeout = aiohttp.ClientTimeout(total=60)
-            connector = aiohttp.TCPConnector(ssl=False)  # SSL 검증 비활성화
+            timeout = aiohttp.ClientTimeout(total=30)
+            connector = aiohttp.TCPConnector(ssl=False, limit=10)  # SSL 검증 비활성화, 연결 제한
             
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 async with session.get(url, headers=headers) as response:
@@ -553,42 +550,38 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                             html_content = content_bytes_raw.decode('utf-8', errors='ignore')
                     
                     content_length = len(html_content)
-                    logging.info(f"[디시] {gallery_id} - 응답: {content_length} chars, {content_bytes} bytes (시도 {attempt + 1}/{max_retries})")
+                    logging.info(f"[디시] {gallery_id} - HTTP {response.status}, {content_length} chars (시도 {attempt + 1}/{max_retries})")
                     
-                    # 응답 길이가 짧아도 일단 파싱 시도 (차단/압축/마크업 변경 등 고려)
-                    if content_length < 3000:
-                        logging.warning(f"[디시] {gallery_id} - 응답 크기가 비정상적으로 작음. (차단 가능성/마크업 변경 가능성)")
-                        logging.warning(f"[디시] Content-Type: {response.headers.get('content-type')}")
-                        logging.warning(f"[디시] Content-Encoding: {response.headers.get('content-encoding')}")
+                    # 응답 길이 체크 완화 (최소 1000자로 낮춤)
+                    if content_length < 1000:
+                        logging.warning(f"[디시] {gallery_id} - 응답 크기가 작음 ({content_length} chars)")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay * (attempt + 1))
+                            continue
                     
                     soup = BeautifulSoup(html_content, 'html.parser')
                     posts = []
                     
-                    # 게시글 목록 파싱
+                    # 게시글 목록 파싱 - 여러 셀렉터 시도
                     rows = soup.select('tr.ub-content')
-                    logging.info(f"[디시] {gallery_id} - tr.ub-content 개수: {len(rows)}")
+                    if not rows:
+                        rows = soup.select('tbody tr.us-post')
+                    if not rows:
+                        # 백업: gall_tit 클래스가 있는 모든 tr
+                        rows = [r for r in soup.select('tbody tr') if r.select_one('td.gall_tit')]
+                    
+                    logging.info(f"[디시] {gallery_id} - 발견된 행: {len(rows)}개")
                     
                     # 0개일 경우 디버깅 정보 출력
                     if len(rows) == 0:
-                        logging.error(f"[디시] {gallery_id} - 게시글을 찾을 수 없음!")
-                        logging.error(f"[디시] 응답 첫 500자: {html_content[:500]}")
+                        logging.error(f"[디시] {gallery_id} - 게시글 없음! HTML 첫 1000자:")
+                        logging.error(html_content[:1000])
                         
-                        # 대체 셀렉터 시도 (대체 마크업 대응)
-                        alternative_rows = soup.select('tr.us-post')
-                        logging.info(f"[디시] {gallery_id} - tr.us-post 개수: {len(alternative_rows)}")
-                        if len(alternative_rows) == 0:
-                            # 마지막 보루: tbody 내에서 필수 칼럼이 있는 행만
-                            alternative_rows = [r for r in soup.select('tbody tr') if r.select_one('td.gall_tit')]
-                            logging.info(f"[디시] {gallery_id} - tbody tr(gall_tit 존재) 개수: {len(alternative_rows)}")
-                        
-                        if len(alternative_rows) > 0:
-                            rows = alternative_rows
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay * (attempt + 1))
+                            continue
                         else:
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(retry_delay * (attempt + 1))
-                                continue
-                            else:
-                                return []
+                            return []
                     
                     skipped_count = 0
                     parsed_count = 0
@@ -698,17 +691,15 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                             continue
                     
                     # 파싱 요약 로그
-                    logging.info(f"[디시] {gallery_id} - 파싱 요약: 전체 {len(rows)}개, 스킵 {skipped_count}개, 파싱 성공 {parsed_count}개, posts 배열 {len(posts)}개")
+                    logging.info(f"[디시] {gallery_id} - 파싱 완료: {len(posts)}개 게시글")
                     
-                    # 관리자 게시물 필터링 (닉네임과 UID를 분리하여 정확히 매칭)
+                    # 관리자 게시물 필터링 (간소화)
                     config_data = GALLERY_CONFIG.get(gallery_id, {})
                     exclude_admins = config_data.get("exclude_admins", {})
                     
-                    if exclude_admins:
-                        admin_nicknames = exclude_admins.get("nicknames", [])
-                        admin_uids = exclude_admins.get("uids", [])
-                        
-                        logging.debug(f"[디시] {gallery_id} - 관리자 필터: 닉네임={admin_nicknames}, UID={admin_uids}")
+                    if exclude_admins and posts:
+                        admin_nicknames = set(exclude_admins.get("nicknames", []))
+                        admin_uids = set(exclude_admins.get("uids", []))
                         
                         filtered_posts = []
                         excluded_count = 0
@@ -716,30 +707,28 @@ async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: i
                         for post in posts:
                             is_admin = False
                             
-                            # 닉네임으로 필터링 (author 필드에서 정확히 매칭)
+                            # 닉네임 체크
                             if post["author"] in admin_nicknames:
                                 is_admin = True
                                 excluded_count += 1
-                                logging.debug(f"[디시] 제외(닉네임): {post['author']} - {post['title'][:30]}")
                             
-                            # UID로 필터링 (ip 필드에서 "UID:" 접두사를 제거하고 매칭)
-                            if not is_admin:  # 이미 제외되지 않은 경우만 체크
-                                post_uid = post["ip"].replace("UID:", "") if post["ip"].startswith("UID:") else post["ip"]
+                            # UID 체크
+                            elif post["ip"].startswith("UID:"):
+                                post_uid = post["ip"][4:]  # "UID:" 제거
                                 if post_uid in admin_uids:
                                     is_admin = True
                                     excluded_count += 1
-                                    logging.debug(f"[디시] 제외(UID): {post_uid} - {post['title'][:30]}")
                             
                             if not is_admin:
                                 filtered_posts.append(post)
                         
                         posts = filtered_posts
-                        logging.info(f"[디시] {gallery_id} - 필터링: {excluded_count}개 제외, {len(posts)}개 남음")
+                        logging.info(f"[디시] {gallery_id} - 관리자 제외: {excluded_count}개, 남은 게시글: {len(posts)}개")
                     
                     # 인기 점수 순으로 정렬
                     posts.sort(key=lambda x: x["hot_score"], reverse=True)
                     
-                    logging.info(f"[디시] {gallery_id} 파싱 성공: {len(posts)}개 게시글")
+                    logging.info(f"[디시] {gallery_id} 성공: {len(posts)}개 반환")
                     return posts[:limit]
                 
         except Exception as e:
