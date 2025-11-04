@@ -3839,6 +3839,20 @@ async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
                     
                     logging.info(f"✅ 페이지 {page} 크롤링 성공 (응답 크기: {len(resp.text)} bytes)")
                 
+                    # 빈 응답 감지 (봇 차단) → TLS 지문 우회로 즉시 재시도
+                    if len(resp.text) < 1000:
+                        logging.warning(f"⚠️ 페이지 {page} 빈 응답 감지 (봇 차단 가능성) - TLS 우회 시도")
+                        html = await _fetch_with_tls_client(base_url, params, headers, cookies, timeout=30)
+                        if html and len(html) > 1000:
+                            parsed = _parse_posts_from_html(html)
+                            posts.extend(parsed)
+                            logging.info(f"🛡️ TLS-우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
+                            await asyncio.sleep(random.uniform(2, 4))
+                            continue
+                        else:
+                            logging.error(f"TLS-우회도 빈 응답 - 페이지 {page} 건너뜀")
+                            continue
+                
                     # BeautifulSoup으로 HTML 파싱
                     soup = BeautifulSoup(resp.text, "html.parser")
                 
@@ -3846,7 +3860,13 @@ async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
                     post_rows = soup.select("tr.ub-content")
                     
                     if not post_rows:
-                        logging.warning(f"페이지 {page}에서 게시글을 찾을 수 없습니다. HTML 구조 변경 가능성")
+                        logging.warning(f"페이지 {page}에서 게시글을 찾을 수 없습니다. TLS 우회 재시도...")
+                        html = await _fetch_with_tls_client(base_url, params, headers, cookies, timeout=30)
+                        if html:
+                            parsed = _parse_posts_from_html(html)
+                            posts.extend(parsed)
+                            logging.info(f"🛡️ TLS-우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
+                            await asyncio.sleep(random.uniform(2, 4))
                         continue
                 
                     for row in post_rows:
