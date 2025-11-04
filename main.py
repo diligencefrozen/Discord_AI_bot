@@ -3,7 +3,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # 기본 모듈,라이브러리 로드
 # ────────────────────────────────────────────────────────────────────────────
-import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json, aiohttp, pickle                         
+import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json, aiohttp, pickle, h2                       
 from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
@@ -3631,104 +3631,407 @@ class GalleryPost:
     url: str
     is_notice: bool = False
 
+async def get_free_proxy() -> Optional[str]:
+    # 무료 프록시 가져오기 (작동 확인된 것만)
+    try:
+        # PubProxy API - 가장 성공률 높음
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get("http://pubproxy.com/api/proxy?limit=20&format=txt&type=http&level=anonymous")
+                if resp.status_code == 200:
+                    proxies = resp.text.strip().split('\n')
+                    logging.info(f"📋 PubProxy에서 {len(proxies)}개 프록시 발견")
+                    
+                    for proxy in proxies[:5]:  # 상위 5개만 테스트
+                        proxy = proxy.strip()
+                        if not proxy or ':' not in proxy:
+                            continue
+                        
+                        test_proxy = f"http://{proxy}"
+                        try:
+                            test_client = httpx.AsyncClient(
+                                timeout=5,
+                                mounts={
+                                    "http://": httpx.AsyncHTTPTransport(proxy=test_proxy),
+                                    "https://": httpx.AsyncHTTPTransport(proxy=test_proxy)
+                                }
+                            )
+                            async with test_client:
+                                test_resp = await test_client.get("http://httpbin.org/ip", timeout=3)
+                                if test_resp.status_code == 200:
+                                    logging.info(f"✅ 작동하는 프록시 발견: {proxy}")
+                                    return test_proxy
+                        except Exception:
+                            continue
+        except Exception as e:
+            logging.debug(f"PubProxy 실패: {e}")
+        
+        logging.warning("⚠️ 사용 가능한 프록시 없음")
+        return None
+        
+    except Exception as e:
+        logging.error(f"프록시 가져오기 실패: {e}")
+        return None
+
+def _parse_posts_from_html(html: str) -> List[GalleryPost]:
+    # DCInside 리스트 HTML에서 게시글을 파싱해서 GalleryPost 리스트로 반환
+    results: List[GalleryPost] = []
+    soup = BeautifulSoup(html, "html.parser")
+    post_rows = soup.select("tr.ub-content")
+    for row in post_rows:
+        try:
+            subject_td = row.select_one("td.gall_subject")
+            if subject_td and subject_td.select_one("b"):
+                # 공지 제외
+                continue
+
+            title_tag = row.select_one("td.gall_tit a")
+            if not title_tag:
+                continue
+
+            title = title_tag.get_text(strip=True)
+            post_url = "https://gall.dcinside.com" + title_tag.get("href", "")
+
+            writer_td = row.select_one("td.gall_writer")
+            if not writer_td:
+                continue
+
+            nickname_span = writer_td.select_one("span.nickname")
+            author = nickname_span.get_text(strip=True) if nickname_span else "익명"
+            uid = writer_td.get("data-uid", "unknown")
+
+            date_td = row.select_one("td.gall_date")
+            date = date_td.get("title", date_td.get_text(strip=True)) if date_td else ""
+
+            count_td = row.select_one("td.gall_count")
+            views = int(count_td.get_text(strip=True)) if count_td and count_td.get_text(strip=True).isdigit() else 0
+
+            recommend_td = row.select_one("td.gall_recommend")
+            recommends = int(recommend_td.get_text(strip=True)) if recommend_td and recommend_td.get_text(strip=True).isdigit() else 0
+
+            score = (views * 0.3) + (recommends * 10)
+
+            results.append(GalleryPost(
+                title=title,
+                author=author,
+                uid=uid,
+                date=date,
+                views=views,
+                recommends=recommends,
+                score=score,
+                url=post_url,
+                is_notice=False,
+            ))
+        except Exception:
+            continue
+    return results
+
+async def _fetch_with_tls_client(url: str, params: dict, headers: dict, cookies: dict, timeout: int = 30) -> Optional[str]:
+    # curl_cffi를 사용해 실제 브라우저 TLS 지문으로 요청 (비동기 쓰레드 실행)
+    # 성공 시 HTML 문자열 반환, 실패 시 None
+
+    import asyncio as _asyncio
+    def _do_request():
+        try:
+            from curl_cffi import requests as crequests
+            resp = crequests.get(
+                url,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                timeout=timeout,
+                impersonate="chrome120",
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            return resp.text
+        except Exception as _e:
+            return None
+
+    return await _asyncio.to_thread(_do_request)
+
 async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
     base_url = "https://gall.dcinside.com/mgallery/board/lists/"
     gallery_id = "battlegroundmobile"
     posts = []
 
+    # 디시인사이드 우회를 위한 고급 헤더 설정
     headers = {
+        # 실제 브라우저처럼 보이기
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://gall.dcinside.com/",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        # 디시인사이드 리퍼러 추가 (중요!)
+        "Referer": "https://www.dcinside.com/",
+        "Origin": "https://www.dcinside.com",
     }
+    
+    # 프록시 사용 여부 확인
+    use_proxy = os.getenv("USE_PROXY", "false").lower() == "true"
+    proxy = None
+    
+    if use_proxy:
+        try:
+            proxy = await get_free_proxy()
+            if proxy:
+                logging.info(f"🌐 프록시 사용 중: {proxy}")
+            else:
+                logging.warning("⚠️ 프록시 없이 직접 연결 시도")
+        except Exception as e:
+            logging.warning(f"프록시 로드 실패, 직접 연결: {e}")
+    else:
+        logging.info("🔗 직접 연결 사용 (프록시 비활성화됨)")
+    
+    # httpx 클라이언트 설정
+    # HTTP/2 지원 여부 확인 (h2 미설치 시 자동 비활성화)
+    http2_supported = False
+    try:
 
-    async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
-        for page in range(1, max_pages + 1):
-            try:
-                params = {"id": gallery_id, "page": page}
-                resp = await client.get(base_url, params=params)
-                resp.raise_for_status()
-            
-                # BeautifulSoup으로 HTML 파싱
-                soup = BeautifulSoup(resp.text, "html.parser")
-            
-                # 게시글 목록 테이블 찾기
-                post_rows = soup.select("tr.ub-content")
-            
-                for row in post_rows:
-                    try:
-                        # 공지 여부 확인 (td.gall_subject에 <b>공지</b>가 있으면 건너뛰기)
-                        subject_td = row.select_one("td.gall_subject")
-                        if subject_td and subject_td.select_one("b"):
-                            continue  # 공지 게시글은 제외
+        http2_supported = True
+    except Exception:
+        logging.warning("HTTP/2 비활성화: 'h2' 패키지가 설치되어 있지 않습니다. (pip install httpx[http2])")
+
+    client_kwargs = {
+        "timeout": 30,  # 타임아웃 증가
+        "headers": headers,
+        "follow_redirects": True,
+        "http2": http2_supported,  # 가능하면 HTTP/2 사용, 아니면 자동 비활성화
+    }
+    
+    if proxy:
+        client_kwargs["mounts"] = {
+            "http://": httpx.AsyncHTTPTransport(proxy=proxy, retries=3),
+            "https://": httpx.AsyncHTTPTransport(proxy=proxy, retries=3)
+        }
+
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            for page in range(1, max_pages + 1):
+                try:
+                    params = {"id": gallery_id, "page": page}
                     
-                        # 제목 추출
-                        title_tag = row.select_one("td.gall_tit a")
-                        if not title_tag:
-                            continue
+                    # 디시인사이드 우회 전략 1: 쿠키 설정
+                    cookies = {
+                        "_ga": "GA1.2.123456789.1234567890",
+                        "_gid": "GA1.2.987654321.9876543210",
+                        "list_count": "100",
+                    }
                     
-                        title = title_tag.get_text(strip=True)
-                        post_url = "https://gall.dcinside.com" + title_tag.get("href", "")
+                    # 요청 전 랜덤 딜레이 (봇 탐지 회피)
+                    if page > 1:
+                        await asyncio.sleep(random.uniform(2, 4))
                     
-                        # 작성자 정보 추출
-                        writer_td = row.select_one("td.gall_writer")
-                        if not writer_td:
-                            continue
+                    resp = await client.get(
+                        base_url, 
+                        params=params,
+                        cookies=cookies,
+                        timeout=30
+                    )
+                    resp.raise_for_status()
                     
-                        # 닉네임 추출
-                        nickname_span = writer_td.select_one("span.nickname")
-                        if nickname_span:
-                            author = nickname_span.get_text(strip=True)
-                        else:
-                            author = "익명"
+                    logging.info(f"✅ 페이지 {page} 크롤링 성공 (응답 크기: {len(resp.text)} bytes)")
+                
+                    # BeautifulSoup으로 HTML 파싱
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                
+                    # 게시글 목록 테이블 찾기
+                    post_rows = soup.select("tr.ub-content")
                     
-                        # UID 추출 (data-uid 속성)
-                        uid = writer_td.get("data-uid", "")
-                        if not uid:
-                            uid = "unknown"
-                    
-                        # 날짜 추출
-                        date_td = row.select_one("td.gall_date")
-                        date = date_td.get("title", date_td.get_text(strip=True)) if date_td else ""
-                    
-                        # 조회수 추출
-                        count_td = row.select_one("td.gall_count")
-                        views = int(count_td.get_text(strip=True)) if count_td and count_td.get_text(strip=True).isdigit() else 0
-                    
-                        # 추천수 추출
-                        recommend_td = row.select_one("td.gall_recommend")
-                        recommends = int(recommend_td.get_text(strip=True)) if recommend_td and recommend_td.get_text(strip=True).isdigit() else 0
-                    
-                        # 점수 계산: 조회수 * 0.3 + 추천수 * 10 (추천수에 더 높은 가중치)
-                        score = (views * 0.3) + (recommends * 10)
-                    
-                        # 게시글 객체 생성
-                        post = GalleryPost(
-                            title=title,
-                            author=author,
-                            uid=uid,
-                            date=date,
-                            views=views,
-                            recommends=recommends,
-                            score=score,
-                            url=post_url,
-                            is_notice=False
-                        )
-                    
-                        posts.append(post)
-                    
-                    except Exception as e:
-                        logging.error(f"게시글 파싱 오류: {e}")
+                    if not post_rows:
+                        logging.warning(f"페이지 {page}에서 게시글을 찾을 수 없습니다. HTML 구조 변경 가능성")
                         continue
-            
-                # 페이지 간 딜레이 (서버 부담 최소화)
-                await asyncio.sleep(1)
-            
-            except Exception as e:
-                logging.error(f"페이지 {page} 크롤링 오류: {e}")
-                continue
+                
+                    for row in post_rows:
+                        try:
+                            # 공지 여부 확인
+                            subject_td = row.select_one("td.gall_subject")
+                            if subject_td and subject_td.select_one("b"):
+                                continue
+                        
+                            # 제목 추출
+                            title_tag = row.select_one("td.gall_tit a")
+                            if not title_tag:
+                                continue
+                        
+                            title = title_tag.get_text(strip=True)
+                            post_url = "https://gall.dcinside.com" + title_tag.get("href", "")
+                        
+                            # 작성자 정보
+                            writer_td = row.select_one("td.gall_writer")
+                            if not writer_td:
+                                continue
+                        
+                            nickname_span = writer_td.select_one("span.nickname")
+                            author = nickname_span.get_text(strip=True) if nickname_span else "익명"
+                            uid = writer_td.get("data-uid", "unknown")
+                        
+                            # 날짜
+                            date_td = row.select_one("td.gall_date")
+                            date = date_td.get("title", date_td.get_text(strip=True)) if date_td else ""
+                        
+                            # 조회수
+                            count_td = row.select_one("td.gall_count")
+                            views = int(count_td.get_text(strip=True)) if count_td and count_td.get_text(strip=True).isdigit() else 0
+                        
+                            # 추천수
+                            recommend_td = row.select_one("td.gall_recommend")
+                            recommends = int(recommend_td.get_text(strip=True)) if recommend_td and recommend_td.get_text(strip=True).isdigit() else 0
+                        
+                            # 점수 계산
+                            score = (views * 0.3) + (recommends * 10)
+                        
+                            post = GalleryPost(
+                                title=title,
+                                author=author,
+                                uid=uid,
+                                date=date,
+                                views=views,
+                                recommends=recommends,
+                                score=score,
+                                url=post_url,
+                                is_notice=False
+                            )
+                        
+                            posts.append(post)
+                        
+                        except Exception as e:
+                            logging.error(f"게시글 파싱 오류: {e}")
+                            continue
+                    
+                    logging.info(f"📊 페이지 {page}: {len([p for p in posts if p])}개 게시글 수집 완료")
+                
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in (403, 400, 503):
+                        logging.error(f"🚫 페이지 {page} 차단/거부됨 (HTTP {e.response.status_code})")
+                        # 프록시 없이 TLS 지문 우회 재시도
+                        if not proxy:
+                            logging.info("🔁 TLS 지문 우회로 재시도...")
+                            html = await _fetch_with_tls_client(base_url, params, headers, cookies, timeout=30)
+                            if html:
+                                parsed = _parse_posts_from_html(html)
+                                posts.extend(parsed)
+                                logging.info(f"🛡️ TLS-우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
+                                await asyncio.sleep(2)
+                                continue
+                            else:
+                                logging.warning("TLS-우회도 실패")
+                                await asyncio.sleep(3)
+                                continue
+                    elif e.response.status_code == 429:
+                        logging.error(f"⏰ Rate limit 도달 - 10초 대기 후 재시도")
+                        await asyncio.sleep(10)
+                        continue
+                    else:
+                        logging.error(f"페이지 {page} 크롤링 오류: HTTP {e.response.status_code}")
+                        continue
+                        
+                except Exception as e:
+                    logging.error(f"페이지 {page} 크롤링 오류: {e}")
+                    # 일반 오류 시에도 TLS-우회 한 번 시도
+                    if not proxy:
+                        try:
+                            html = await _fetch_with_tls_client(base_url, params, headers, cookies, timeout=30)
+                            if html:
+                                parsed = _parse_posts_from_html(html)
+                                posts.extend(parsed)
+                                logging.info(f"🛡️ TLS-우회(예외) 성공: 페이지 {page}에서 {len(parsed)}개 수집")
+                                await asyncio.sleep(2)
+                                continue
+                        except Exception:
+                            pass
+                    continue
+    
+    except Exception as e:
+        logging.error(f"크롤링 전체 실패: {e}")
+        # 프록시 실패 시 재시도 (프록시 없이)
+        if proxy and not posts:
+            logging.info("🔄 프록시 없이 재시도...")
+            try:
+                client_kwargs.pop("mounts", None)
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    for page in range(1, max_pages + 1):
+                        try:
+                            params = {"id": gallery_id, "page": page}
+                            cookies = {
+                                "_ga": "GA1.2.123456789.1234567890",
+                                "_gid": "GA1.2.987654321.9876543210",
+                            }
+                            
+                            resp = await client.get(base_url, params=params, cookies=cookies)
+                            resp.raise_for_status()
+                            
+                            soup = BeautifulSoup(resp.text, "html.parser")
+                            post_rows = soup.select("tr.ub-content")
+                            
+                            for row in post_rows:
+                                try:
+                                    subject_td = row.select_one("td.gall_subject")
+                                    if subject_td and subject_td.select_one("b"):
+                                        continue
+                                    
+                                    title_tag = row.select_one("td.gall_tit a")
+                                    if not title_tag:
+                                        continue
+                                    
+                                    title = title_tag.get_text(strip=True)
+                                    post_url = "https://gall.dcinside.com" + title_tag.get("href", "")
+                                    
+                                    writer_td = row.select_one("td.gall_writer")
+                                    if not writer_td:
+                                        continue
+                                    
+                                    nickname_span = writer_td.select_one("span.nickname")
+                                    author = nickname_span.get_text(strip=True) if nickname_span else "익명"
+                                    uid = writer_td.get("data-uid", "unknown")
+                                    
+                                    date_td = row.select_one("td.gall_date")
+                                    date = date_td.get("title", date_td.get_text(strip=True)) if date_td else ""
+                                    
+                                    count_td = row.select_one("td.gall_count")
+                                    views = int(count_td.get_text(strip=True)) if count_td and count_td.get_text(strip=True).isdigit() else 0
+                                    
+                                    recommend_td = row.select_one("td.gall_recommend")
+                                    recommends = int(recommend_td.get_text(strip=True)) if recommend_td and recommend_td.get_text(strip=True).isdigit() else 0
+                                    
+                                    score = (views * 0.3) + (recommends * 10)
+                                    
+                                    post = GalleryPost(
+                                        title=title,
+                                        author=author,
+                                        uid=uid,
+                                        date=date,
+                                        views=views,
+                                        recommends=recommends,
+                                        score=score,
+                                        url=post_url,
+                                        is_notice=False
+                                    )
+                                    
+                                    posts.append(post)
+                                
+                                except Exception:
+                                    continue
+                            
+                            await asyncio.sleep(2)
+                        
+                        except Exception:
+                            continue
+            except Exception as retry_e:
+                logging.error(f"재시도도 실패: {retry_e}")
 
+    if not posts:
+        logging.error("❌ 게시글을 하나도 가져오지 못했습니다!")
+    else:
+        logging.info(f"✅ 총 {len(posts)}개 게시글 수집 완료")
+    
     return posts
 
 def format_pubg_gallery_embed(posts: List[GalleryPost]) -> discord.Embed:
