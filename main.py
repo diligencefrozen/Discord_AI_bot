@@ -3614,199 +3614,196 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
         await ctx.reply(part)
         await asyncio.sleep(0.1)
 
-    # ────────────────────────────────────────────────────────────────────────────
-    # 배틀그라운드 모바일 갤러리 크롤링 - 인기글 TOP 10
-    # ────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# 배틀그라운드 모바일 갤러리 크롤링 - 인기글 TOP 10
+# ────────────────────────────────────────────────────────────────────────────
 
-    @dataclass
-    class GalleryPost:
-        # 갤러리 게시글 데이터 클래스
-        title: str
-        author: str
-        uid: str
-        date: str
-        views: int
-        recommends: int
-        score: float  # 조회수 + 추천수 기반 점수
-        url: str
-        is_notice: bool = False
+@dataclass
+class GalleryPost:
+    # 갤러리 게시글 데이터 클래스
+    title: str
+    author: str
+    uid: str
+    date: str
+    views: int
+    recommends: int
+    score: float  # 조회수 + 추천수 기반 점수
+    url: str
+    is_notice: bool = False
 
-    async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
+async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
+    base_url = "https://gall.dcinside.com/mgallery/board/lists/"
+    gallery_id = "battlegroundmobile"
+    posts = []
 
-        base_url = "https://gall.dcinside.com/mgallery/board/lists/"
-        gallery_id = "battlegroundmobile"
-        posts = []
-    
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://gall.dcinside.com/",
-        }
-    
-        async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
-            for page in range(1, max_pages + 1):
-                try:
-                    params = {"id": gallery_id, "page": page}
-                    resp = await client.get(base_url, params=params)
-                    resp.raise_for_status()
-                
-                    # BeautifulSoup으로 HTML 파싱
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                
-                    # 게시글 목록 테이블 찾기
-                    post_rows = soup.select("tr.ub-content")
-                
-                    for row in post_rows:
-                        try:
-                            # 공지 여부 확인 (td.gall_subject에 <b>공지</b>가 있으면 건너뛰기)
-                            subject_td = row.select_one("td.gall_subject")
-                            if subject_td and subject_td.select_one("b"):
-                                continue  # 공지 게시글은 제외
-                        
-                            # 제목 추출
-                            title_tag = row.select_one("td.gall_tit a")
-                            if not title_tag:
-                                continue
-                        
-                            title = title_tag.get_text(strip=True)
-                            post_url = "https://gall.dcinside.com" + title_tag.get("href", "")
-                        
-                            # 작성자 정보 추출
-                            writer_td = row.select_one("td.gall_writer")
-                            if not writer_td:
-                                continue
-                        
-                            # 닉네임 추출
-                            nickname_span = writer_td.select_one("span.nickname")
-                            if nickname_span:
-                                author = nickname_span.get_text(strip=True)
-                            else:
-                                author = "익명"
-                        
-                            # UID 추출 (data-uid 속성)
-                            uid = writer_td.get("data-uid", "")
-                            if not uid:
-                                uid = "unknown"
-                        
-                            # 날짜 추출
-                            date_td = row.select_one("td.gall_date")
-                            date = date_td.get("title", date_td.get_text(strip=True)) if date_td else ""
-                        
-                            # 조회수 추출
-                            count_td = row.select_one("td.gall_count")
-                            views = int(count_td.get_text(strip=True)) if count_td and count_td.get_text(strip=True).isdigit() else 0
-                        
-                            # 추천수 추출
-                            recommend_td = row.select_one("td.gall_recommend")
-                            recommends = int(recommend_td.get_text(strip=True)) if recommend_td and recommend_td.get_text(strip=True).isdigit() else 0
-                        
-                            # 점수 계산: 조회수 * 0.3 + 추천수 * 10 (추천수에 더 높은 가중치)
-                            score = (views * 0.3) + (recommends * 10)
-                        
-                            # 게시글 객체 생성
-                            post = GalleryPost(
-                                title=title,
-                                author=author,
-                                uid=uid,
-                                date=date,
-                                views=views,
-                                recommends=recommends,
-                                score=score,
-                                url=post_url,
-                                is_notice=False
-                            )
-                        
-                            posts.append(post)
-                        
-                        except Exception as e:
-                            logging.error(f"게시글 파싱 오류: {e}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://gall.dcinside.com/",
+    }
+
+    async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
+        for page in range(1, max_pages + 1):
+            try:
+                params = {"id": gallery_id, "page": page}
+                resp = await client.get(base_url, params=params)
+                resp.raise_for_status()
+            
+                # BeautifulSoup으로 HTML 파싱
+                soup = BeautifulSoup(resp.text, "html.parser")
+            
+                # 게시글 목록 테이블 찾기
+                post_rows = soup.select("tr.ub-content")
+            
+                for row in post_rows:
+                    try:
+                        # 공지 여부 확인 (td.gall_subject에 <b>공지</b>가 있으면 건너뛰기)
+                        subject_td = row.select_one("td.gall_subject")
+                        if subject_td and subject_td.select_one("b"):
+                            continue  # 공지 게시글은 제외
+                    
+                        # 제목 추출
+                        title_tag = row.select_one("td.gall_tit a")
+                        if not title_tag:
                             continue
-                
-                    # 페이지 간 딜레이 (서버 부담 최소화)
-                    await asyncio.sleep(1)
-                
-                except Exception as e:
-                    logging.error(f"페이지 {page} 크롤링 오류: {e}")
-                    continue
+                    
+                        title = title_tag.get_text(strip=True)
+                        post_url = "https://gall.dcinside.com" + title_tag.get("href", "")
+                    
+                        # 작성자 정보 추출
+                        writer_td = row.select_one("td.gall_writer")
+                        if not writer_td:
+                            continue
+                    
+                        # 닉네임 추출
+                        nickname_span = writer_td.select_one("span.nickname")
+                        if nickname_span:
+                            author = nickname_span.get_text(strip=True)
+                        else:
+                            author = "익명"
+                    
+                        # UID 추출 (data-uid 속성)
+                        uid = writer_td.get("data-uid", "")
+                        if not uid:
+                            uid = "unknown"
+                    
+                        # 날짜 추출
+                        date_td = row.select_one("td.gall_date")
+                        date = date_td.get("title", date_td.get_text(strip=True)) if date_td else ""
+                    
+                        # 조회수 추출
+                        count_td = row.select_one("td.gall_count")
+                        views = int(count_td.get_text(strip=True)) if count_td and count_td.get_text(strip=True).isdigit() else 0
+                    
+                        # 추천수 추출
+                        recommend_td = row.select_one("td.gall_recommend")
+                        recommends = int(recommend_td.get_text(strip=True)) if recommend_td and recommend_td.get_text(strip=True).isdigit() else 0
+                    
+                        # 점수 계산: 조회수 * 0.3 + 추천수 * 10 (추천수에 더 높은 가중치)
+                        score = (views * 0.3) + (recommends * 10)
+                    
+                        # 게시글 객체 생성
+                        post = GalleryPost(
+                            title=title,
+                            author=author,
+                            uid=uid,
+                            date=date,
+                            views=views,
+                            recommends=recommends,
+                            score=score,
+                            url=post_url,
+                            is_notice=False
+                        )
+                    
+                        posts.append(post)
+                    
+                    except Exception as e:
+                        logging.error(f"게시글 파싱 오류: {e}")
+                        continue
+            
+                # 페이지 간 딜레이 (서버 부담 최소화)
+                await asyncio.sleep(1)
+            
+            except Exception as e:
+                logging.error(f"페이지 {page} 크롤링 오류: {e}")
+                continue
+
+    return posts
+
+def format_pubg_gallery_embed(posts: List[GalleryPost]) -> discord.Embed:
+    # 점수 기준 정렬 및 상위 10개 추출
+    top_posts = sorted(posts, key=lambda p: p.score, reverse=True)[:10]
+
+    # 임베드 생성
+    embed = discord.Embed(
+        title="🎮 배틀그라운드 모바일 갤러리 - 인기글 TOP 10",
+        description="**조회수 + 추천수 기반 실시간 랭킹**",
+        color=0xFF6B00,  # PUBG 오렌지 컬러
+        timestamp=datetime.datetime.now(seoul_tz),
+        url="https://gall.dcinside.com/mgallery/board/lists/?id=battlegroundmobile"
+    )
+
+    # 메달 이모지
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+    for idx, post in enumerate(top_posts):
+        medal = medals[idx] if idx < len(medals) else f"{idx+1}."
     
-        return posts
+        # 제목 길이 제한 (60자)
+        display_title = post.title[:60] + "..." if len(post.title) > 60 else post.title
+    
+        # 필드 추가
+        field_name = f"{medal} {display_title}"
+        field_value = (
+            f"👤 **{post.author}** `({post.uid})`\n"
+            f"👁️ {post.views:,} | 👍 {post.recommends} | 🔥 점수: {post.score:.1f}\n"
+            f"📅 {post.date}\n"
+            f"[게시글 보기]({post.url})"
+        )
+    
+        embed.add_field(name=field_name, value=field_value, inline=False)
 
-    def format_pubg_gallery_embed(posts: List[GalleryPost]) -> discord.Embed:
+    # 푸터
+    embed.set_footer(
+        text="💡 tbBOT3rd X Dcinside",
+        icon_url="https://i.imgur.com/d1Ef9W8.jpeg"
+    )
 
-        # 점수 기준 정렬 및 상위 10개 추출
-        top_posts = sorted(posts, key=lambda p: p.score, reverse=True)[:10]
+    # 썸네일 (PUBG Mobile 로고)
+    embed.set_thumbnail(url="https://i.imgur.com/kJDrG0s.png")
+
+    return embed
+
+@bot.command(name="모배갤", aliases=["모배", "pubgm", "배그모바일"])
+async def pubg_mobile_gallery(ctx):
+    """배틀그라운드 모바일 갤러리 인기글 TOP 10 표시
+    
+    사용법: !모배갤
+    """
+    # 로딩 메시지
+    loading_msg = await ctx.reply("🔍 배틀그라운드 모바일 갤러리를 분석하는 중이에요... 잠시만 기다려주세요!")
+
+    try:
+        # 갤러리 크롤링 
+        posts = await crawl_pubg_mobile_gallery(max_pages=3)
+    
+        if not posts:
+            await loading_msg.edit(content="⚠️ 게시글을 가져오는데 실패했어요. 나중에 다시 시도해주세요!")
+            return
     
         # 임베드 생성
-        embed = discord.Embed(
-            title="🎮 배틀그라운드 모바일 갤러리 - 인기글 TOP 10",
-            description="**조회수 + 추천수 기반 실시간 랭킹**",
-            color=0xFF6B00,  # PUBG 오렌지 컬러
-            timestamp=datetime.datetime.now(seoul_tz),
-            url="https://gall.dcinside.com/mgallery/board/lists/?id=battlegroundmobile"
-        )
+        embed = format_pubg_gallery_embed(posts)
     
-        # 메달 이모지
-        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        # 로딩 메시지 삭제 후 임베드 전송
+        await loading_msg.delete()
+        await ctx.reply(embed=embed)
     
-        for idx, post in enumerate(top_posts):
-            medal = medals[idx] if idx < len(medals) else f"{idx+1}."
-        
-            # 제목 길이 제한 (60자)
-            display_title = post.title[:60] + "..." if len(post.title) > 60 else post.title
-        
-            # 필드 추가
-            field_name = f"{medal} {display_title}"
-            field_value = (
-                f"👤 **{post.author}** `({post.uid})`\n"
-                f"👁️ {post.views:,} | 👍 {post.recommends} | 🔥 점수: {post.score:.1f}\n"
-                f"📅 {post.date}\n"
-                f"[게시글 보기]({post.url})"
-            )
-        
-            embed.add_field(name=field_name, value=field_value, inline=False)
+        logging.info(f"모배갤 명령어 실행: {ctx.author} - {len(posts)}개 게시글 분석 완료")
     
-        # 푸터
-        embed.set_footer(
-            text="💡 tbBOT3rd X Dcinside",
-            icon_url="https://i.imgur.com/d1Ef9W8.jpeg"
-        )
-    
-        # 썸네일 (PUBG Mobile 로고)
-        embed.set_thumbnail(url="https://i.imgur.com/kJDrG0s.png")
-    
-        return embed
-
-    @bot.command(name="모배갤", aliases=["모배", "pubgm", "배그모바일"])
-    async def pubg_mobile_gallery(ctx):
-        
-        # 배틀그라운드 모바일 갤러리 인기글 TOP 10 표시
-    
-        # 사용법: !모배갤
-        
-        # 로딩 메시지
-        loading_msg = await ctx.reply("🔍 배틀그라운드 모바일 갤러리를 분석하는 중이에요... 잠시만 기다려주세요!")
-    
-        try:
-            # 갤러리 크롤링 
-            posts = await crawl_pubg_mobile_gallery(max_pages=3)
-        
-            if not posts:
-                await loading_msg.edit(content="⚠️ 게시글을 가져오는데 실패했어요. 나중에 다시 시도해주세요!")
-                return
-        
-            # 임베드 생성
-            embed = format_pubg_gallery_embed(posts)
-        
-            # 로딩 메시지 삭제 후 임베드 전송
-            await loading_msg.delete()
-            await ctx.reply(embed=embed)
-        
-            logging.info(f"모배갤 명령어 실행: {ctx.author} - {len(posts)}개 게시글 분석 완료")
-        
-        except Exception as e:
-            await loading_msg.edit(content=f"⚠️ 오류가 발생했어요: {str(e)}")
-            logging.error(f"모배갤 명령어 오류: {e}")
+    except Exception as e:
+        await loading_msg.edit(content=f"⚠️ 오류가 발생했어요: {str(e)}")
+        logging.error(f"모배갤 명령어 오류: {e}")
 
 # ────────── 봇 상태 ──────────
 @bot.event
