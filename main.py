@@ -3726,6 +3726,38 @@ def _parse_posts_from_html(html: str) -> List[GalleryPost]:
             continue
     return results
 
+async def _fetch_via_cloudflare_proxy(url: str, params: dict, headers: dict, cookies: dict, timeout: int = 30) -> Optional[str]:
+    # Cloudflare Workers 프록시를 통해 요청 (IP 대역 차단 우회)
+    try:
+        # Cloudflare Workers URL 
+        cf_proxy = "https://dcinside-proxy.volumes-comfort0e.workers.dev"
+        
+        # 파라미터를 URL에 포함
+        from urllib.parse import urlencode
+        if params:
+            target_url = f"{url}?{urlencode(params)}"
+        else:
+            target_url = url
+        
+        # Cloudflare Workers를 통해 요청
+        proxy_url = f"{cf_proxy}?url={target_url}"
+        
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(proxy_url, headers={"Accept": "text/html"})
+            resp.raise_for_status()
+            
+            if len(resp.text) > 1000:
+                logging.info(f"☁️ Cloudflare 프록시 성공 (응답: {len(resp.text)} bytes)")
+                return resp.text
+            else:
+                logging.warning("Cloudflare 프록시도 빈 응답")
+                return None
+                
+    except Exception as e:
+        logging.error(f"Cloudflare 프록시 실패: {e}")
+        # 실패 시 TLS 우회로 폴백
+        return await _fetch_with_tls_client(url, params, headers, cookies, timeout)
+
 async def _fetch_with_tls_client(url: str, params: dict, headers: dict, cookies: dict, timeout: int = 30) -> Optional[str]:
     # curl_cffi를 사용해 실제 브라우저 TLS 지문으로 요청 (비동기 쓰레드 실행)
     # 성공 시 HTML 문자열 반환, 실패 시 None
@@ -3839,18 +3871,18 @@ async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
                     
                     logging.info(f"✅ 페이지 {page} 크롤링 성공 (응답 크기: {len(resp.text)} bytes)")
                 
-                    # 빈 응답 감지 (봇 차단) → TLS 지문 우회로 즉시 재시도
+                    # 빈 응답 감지 (봇 차단) → Cloudflare 프록시로 즉시 재시도
                     if len(resp.text) < 1000:
-                        logging.warning(f"⚠️ 페이지 {page} 빈 응답 감지 (봇 차단 가능성) - TLS 우회 시도")
-                        html = await _fetch_with_tls_client(base_url, params, headers, cookies, timeout=30)
+                        logging.warning(f"⚠️ 페이지 {page} 빈 응답 감지 (IP 차단 가능성) - Cloudflare 프록시 시도")
+                        html = await _fetch_via_cloudflare_proxy(base_url, params, headers, cookies, timeout=30)
                         if html and len(html) > 1000:
                             parsed = _parse_posts_from_html(html)
                             posts.extend(parsed)
-                            logging.info(f"🛡️ TLS-우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
+                            logging.info(f"☁️ Cloudflare 우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
                             await asyncio.sleep(random.uniform(2, 4))
                             continue
                         else:
-                            logging.error(f"TLS-우회도 빈 응답 - 페이지 {page} 건너뜀")
+                            logging.error(f"Cloudflare 우회도 실패 - 페이지 {page} 건너뜀")
                             continue
                 
                     # BeautifulSoup으로 HTML 파싱
@@ -3860,12 +3892,12 @@ async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
                     post_rows = soup.select("tr.ub-content")
                     
                     if not post_rows:
-                        logging.warning(f"페이지 {page}에서 게시글을 찾을 수 없습니다. TLS 우회 재시도...")
-                        html = await _fetch_with_tls_client(base_url, params, headers, cookies, timeout=30)
+                        logging.warning(f"페이지 {page}에서 게시글을 찾을 수 없습니다. Cloudflare 프록시 재시도...")
+                        html = await _fetch_via_cloudflare_proxy(base_url, params, headers, cookies, timeout=30)
                         if html:
                             parsed = _parse_posts_from_html(html)
                             posts.extend(parsed)
-                            logging.info(f"🛡️ TLS-우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
+                            logging.info(f"☁️ Cloudflare 우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
                             await asyncio.sleep(random.uniform(2, 4))
                         continue
                 
@@ -3931,18 +3963,18 @@ async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code in (403, 400, 503):
                         logging.error(f"🚫 페이지 {page} 차단/거부됨 (HTTP {e.response.status_code})")
-                        # 프록시 없이 TLS 지문 우회 재시도
+                        # Cloudflare 프록시로 우회 재시도
                         if not proxy:
-                            logging.info("🔁 TLS 지문 우회로 재시도...")
-                            html = await _fetch_with_tls_client(base_url, params, headers, cookies, timeout=30)
+                            logging.info("🔁 Cloudflare 프록시로 우회 시도...")
+                            html = await _fetch_via_cloudflare_proxy(base_url, params, headers, cookies, timeout=30)
                             if html:
                                 parsed = _parse_posts_from_html(html)
                                 posts.extend(parsed)
-                                logging.info(f"🛡️ TLS-우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
+                                logging.info(f"☁️ Cloudflare 우회 성공: 페이지 {page}에서 {len(parsed)}개 수집")
                                 await asyncio.sleep(2)
                                 continue
                             else:
-                                logging.warning("TLS-우회도 실패")
+                                logging.warning("Cloudflare 우회도 실패")
                                 await asyncio.sleep(3)
                                 continue
                     elif e.response.status_code == 429:
@@ -3955,14 +3987,14 @@ async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
                         
                 except Exception as e:
                     logging.error(f"페이지 {page} 크롤링 오류: {e}")
-                    # 일반 오류 시에도 TLS-우회 한 번 시도
+                    # 일반 오류 시에도 Cloudflare 프록시 한 번 시도
                     if not proxy:
                         try:
-                            html = await _fetch_with_tls_client(base_url, params, headers, cookies, timeout=30)
+                            html = await _fetch_via_cloudflare_proxy(base_url, params, headers, cookies, timeout=30)
                             if html:
                                 parsed = _parse_posts_from_html(html)
                                 posts.extend(parsed)
-                                logging.info(f"🛡️ TLS-우회(예외) 성공: 페이지 {page}에서 {len(parsed)}개 수집")
+                                logging.info(f"☁️ Cloudflare 우회(예외) 성공: 페이지 {page}에서 {len(parsed)}개 수집")
                                 await asyncio.sleep(2)
                                 continue
                         except Exception:
@@ -4100,10 +4132,7 @@ def format_pubg_gallery_embed(posts: List[GalleryPost]) -> discord.Embed:
 
 @bot.command(name="모배갤", aliases=["모배", "pubgm", "배그모바일"])
 async def pubg_mobile_gallery(ctx):
-    """배틀그라운드 모바일 갤러리 인기글 TOP 10 표시
-    
-    사용법: !모배갤
-    """
+
     # 로딩 메시지
     loading_msg = await ctx.reply("🔍 배틀그라운드 모바일 갤러리를 분석하는 중이에요... 잠시만 기다려주세요!")
 
