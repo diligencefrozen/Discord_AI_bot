@@ -23,6 +23,7 @@ from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Set, Tuple
 from discord.errors import NotFound, Forbidden, HTTPException
+from dataclasses import dataclass
 
 # ────────────────────────────────────────────────────────────────────────────
 # 24시간 경험치 시스템 (Daily XP & Rewards)
@@ -470,288 +471,6 @@ def get_achievement_progress(user_id: int) -> str:
     total = len(ACHIEVEMENTS)
     
     return f"{len(unlocked)}/{total} 업적 달성 ({len(unlocked)*100//total}%)"
-
-# ────────────────────────────────────────────────────────────────────────────
-# 디시인사이드 갤러리 인기 게시물 추천 시스템
-# ────────────────────────────────────────────────────────────────────────────
-
-# 갤러리 설정
-GALLERY_CONFIG = {
-    "battlegroundmobile": {
-        "name": "배틀그라운드 모바일",
-        "short_name": "모배",
-        "url": "https://gall.dcinside.com/mgallery/board/lists?id=battlegroundmobile",
-        "gallery_type": "minor",  # "major", "minor", "mini"
-        # 관리자 목록 (게시물 제외) - 닉네임과 UID를 분리하여 정확히 매칭
-        "exclude_admins": {
-            "nicknames": ["Kar98k", "모바일배틀그라운드", "사수나무"],
-            "uids": ["pubgmobile", "pubgm180516", "id696307779"]
-        }
-    }
-}
-
-async def fetch_hot_posts(gallery_id: str, gallery_type: str = "major", limit: int = 30) -> List[dict]:
-    
-    # 디시인사이드 갤러리의 게시물을 가져와서 인기도 순으로 정렬합니다.
-    
-    # Args:
-        # gallery_id: 갤러리 ID
-        # gallery_type: "major" (일반), "minor" (마이너), "mini" (미니)
-        # limit: 반환할 게시글 개수
-    
-    # Returns: [{"no": 게시글번호, "title": 제목, "author": 작성자, "ip": IP, "link": 링크, 
-              # "has_image": 이미지여부, "recommend": 추천수, "view": 조회수, "comment": 댓글수, "hot_score": 인기점수}]
-    
-    
-    # 재시도 로직 추가
-    max_retries = 2
-    retry_delay = 1
-    
-    for attempt in range(max_retries):
-        try:
-            # 갤러리 타입별 URL 설정
-            if gallery_type == "minor":
-                url = f"https://gall.dcinside.com/mgallery/board/lists?id={gallery_id}"
-            elif gallery_type == "mini":
-                url = f"https://gall.dcinside.com/mini/board/lists?id={gallery_id}"
-            else:  # major
-                url = f"https://gall.dcinside.com/board/lists?id={gallery_id}"
-            
-            # 더 상세한 헤더 추가 (실제 브라우저처럼 보이도록)
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Cache-Control": "max-age=0",
-                "Referer": "https://www.dcinside.com/",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Ch-Ua": '"Google Chrome";v="120", "Chromium";v="120", "Not?A_Brand";v="99"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"macOS"'
-            }
-            
-            # httpx로 변경 (더 나은 호환성)
-            # 프록시 설정 (필요시 아래 주석 해제하고 프록시 주소 입력)
-            # proxy_url = "http://proxy-server:port"  # 예: "http://proxy.example.com:8080"
-            proxy_url = None  # 프록시 없이 직접 연결 (헤로쿠에서 차단되면 프록시 필요)
-            
-            async with httpx.AsyncClient(timeout=30.0, verify=False, follow_redirects=True) as client:
-                if proxy_url:
-                    response = await client.get(url, headers=headers, proxy=proxy_url)
-                else:
-                    response = await client.get(url, headers=headers)
-                response.raise_for_status()
-                
-                # 응답 본문 가져오기
-                content_bytes_raw = response.content
-                content_bytes = len(content_bytes_raw)
-                
-                # UTF-8로 디코딩 시도
-                try:
-                    html_content = content_bytes_raw.decode('utf-8')
-                except UnicodeDecodeError:
-                    try:
-                        html_content = content_bytes_raw.decode('euc-kr')
-                    except:
-                        html_content = content_bytes_raw.decode('utf-8', errors='ignore')
-                
-                content_length = len(html_content)
-                logging.info(f"[디시] {gallery_id} - HTTP {response.status_code}, {content_length} chars (시도 {attempt + 1}/{max_retries})")
-                
-                # 응답 길이 체크 완화 (최소 1000자로 낮춤)
-                if content_length < 1000:
-                    logging.warning(f"[디시] {gallery_id} - 응답 크기가 작음 ({content_length} chars)")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(retry_delay * (attempt + 1))
-                        continue
-                
-                soup = BeautifulSoup(html_content, 'html.parser')
-                posts = []
-                
-                # 게시글 목록 파싱 - 여러 셀렉터 시도
-                rows = soup.select('tr.ub-content')
-                if not rows:
-                    rows = soup.select('tbody tr.us-post')
-                if not rows:
-                    # 백업: gall_tit 클래스가 있는 모든 tr
-                    rows = [r for r in soup.select('tbody tr') if r.select_one('td.gall_tit')]
-                
-                logging.info(f"[디시] {gallery_id} - 발견된 행: {len(rows)}개")
-                
-                # 0개일 경우 디버깅 정보 출력
-                if len(rows) == 0:
-                    logging.error(f"[디시] {gallery_id} - 게시글 없음! HTML 첫 1000자:")
-                    logging.error(html_content[:1000])
-                    
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(retry_delay * (attempt + 1))
-                        continue
-                    else:
-                        return []
-                
-                skipped_count = 0
-                parsed_count = 0
-                
-                for row in rows:
-                        try:
-                            # 게시글 번호
-                            num_elem = row.select_one('td.gall_num')
-                            if not num_elem:
-                                skipped_count += 1
-                                continue
-                            
-                            num_text = num_elem.text.strip()
-                            if num_text in ['공지', '설문', 'AD', '-']:
-                                skipped_count += 1
-                                continue
-                            
-                            post_no = int(num_text)
-                            parsed_count += 1
-                            
-                            # 제목 및 링크 (여러 마크업 케이스 대응)
-                            title_elem = row.select_one('td.gall_tit a') or row.select_one('td.gall_tit a.ub-word')
-                            if not title_elem:
-                                continue
-                            
-                            title = title_elem.text.strip()
-                            link_path = title_elem.get('href', '')
-                            
-                            # 이미지 여부
-                            has_image = row.select_one('em.icon_pic, em.icon_recomimg') is not None
-                            
-                            # 댓글 수
-                            comment_elem = row.select_one('span.reply_num')
-                            comment_count = 0
-                            if comment_elem:
-                                comment_text = comment_elem.text.strip().replace('[', '').replace(']', '')
-                                try:
-                                    comment_count = int(comment_text)
-                                except:
-                                    comment_count = 0
-                            
-                            # 추천 수
-                            recommend_elem = row.select_one('td.gall_recommend')
-                            recommend = 0
-                            if recommend_elem:
-                                try:
-                                    recommend = int(recommend_elem.text.strip())
-                                except:
-                                    recommend = 0
-                            
-                            # 조회 수
-                            view_elem = row.select_one('td.gall_count')
-                            view_count = 0
-                            if view_elem:
-                                try:
-                                    view_count = int(view_elem.text.strip())
-                                except:
-                                    view_count = 0
-                            
-                            # 작성자 정보
-                            writer_elem = row.select_one('td.gall_writer')
-                            author_nick = ""
-                            author_ip = ""
-                            
-                            if writer_elem:
-                                # 닉네임
-                                nick_elem = writer_elem.select_one('span.nickname em')
-                                if nick_elem:
-                                    author_nick = nick_elem.text.strip()
-                                
-                                # IP 또는 UID
-                                ip_elem = writer_elem.select_one('span.ip')
-                                if ip_elem:
-                                    author_ip = ip_elem.text.strip()
-                                else:
-                                    # UID인 경우
-                                    uid = writer_elem.get('data-uid', '')
-                                    if uid:
-                                        author_ip = f"UID:{uid}"
-                            
-                            # 전체 링크 생성
-                            if gallery_type == "minor":
-                                full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mgallery/board/view/?id={gallery_id}&no={post_no}"
-                            elif gallery_type == "mini":
-                                full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/mini/board/view/?id={gallery_id}&no={post_no}"
-                            else:  # major
-                                full_link = f"https://gall.dcinside.com{link_path}" if link_path.startswith('/') else f"https://gall.dcinside.com/board/view/?id={gallery_id}&no={post_no}"
-                            
-                            # 인기 점수 계산 (추천 * 5 + 댓글 * 2 + 조회수 / 10)
-                            hot_score = (recommend * 5) + (comment_count * 2) + (view_count / 10)
-                            
-                            posts.append({
-                                "no": post_no,
-                                "title": title,
-                                "author": author_nick,
-                                "ip": author_ip,
-                                "link": full_link,
-                                "has_image": has_image,
-                                "recommend": recommend,
-                                "view": view_count,
-                                "comment": comment_count,
-                                "hot_score": hot_score
-                            })
-                            
-                        except Exception as e:
-                            logging.error(f"[디시] 게시글 파싱 오류: {e}")
-                            continue
-                
-                # 파싱 요약 로그
-                logging.info(f"[디시] {gallery_id} - 파싱 완료: {len(posts)}개 게시글")
-                
-                # 관리자 게시물 필터링 (간소화)
-                config_data = GALLERY_CONFIG.get(gallery_id, {})
-                exclude_admins = config_data.get("exclude_admins", {})
-                
-                if exclude_admins and posts:
-                    admin_nicknames = set(exclude_admins.get("nicknames", []))
-                    admin_uids = set(exclude_admins.get("uids", []))
-                    
-                    filtered_posts = []
-                    excluded_count = 0
-                    
-                    for post in posts:
-                        is_admin = False
-                        
-                        # 닉네임 체크
-                        if post["author"] in admin_nicknames:
-                            is_admin = True
-                            excluded_count += 1
-                        
-                        # UID 체크
-                        elif post["ip"].startswith("UID:"):
-                            post_uid = post["ip"][4:]  # "UID:" 제거
-                            if post_uid in admin_uids:
-                                is_admin = True
-                                excluded_count += 1
-                        
-                        if not is_admin:
-                            filtered_posts.append(post)
-                    
-                    posts = filtered_posts
-                    logging.info(f"[디시] {gallery_id} - 관리자 제외: {excluded_count}개, 남은 게시글: {len(posts)}개")
-                
-                # 인기 점수 순으로 정렬
-                posts.sort(key=lambda x: x["hot_score"], reverse=True)
-                
-                logging.info(f"[디시] {gallery_id} 성공: {len(posts)}개 반환")
-                return posts[:limit]
-                
-        except Exception as e:
-            logging.error(f"[디시] {gallery_id} 불러오기 실패 (시도 {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay * (attempt + 1))
-            else:
-                logging.error(f"[디시] {gallery_id} 최종 실패")
-                return []
-    
-    # 모든 재시도 실패
-    return []
 
 def is_weekend() -> bool:
     # 주말 여부 확인 (금요일, 토요일, 일요일)
@@ -3866,74 +3585,6 @@ def fix_code(chunks: List[str]) -> List[str]:
         fixed.append(ch)
     return fixed
 
-# ────────── 디시인사이드 갤러리 인기글 명령어 ──────────
-@bot.command(name="모배갤", aliases=["모배", "battleground", "bg"], help="!모배갤 — 배틀그라운드 모바일 갤러리 인기 게시물")
-async def gallery_hot_posts(ctx: commands.Context, limit: int = 10):
-    # 배틀그라운드 모바일 갤러리의 인기 게시물 추천
-    if limit > 15:
-        limit = 15
-    elif limit < 1:
-        limit = 10
-    
-    async with ctx.typing():
-        gallery_id = "battlegroundmobile"
-        config = GALLERY_CONFIG.get(gallery_id)
-        
-        if not config:
-            await ctx.reply("❌ 갤러리 설정을 찾을 수 없습니다.")
-            return
-        
-        # 인기 게시물 가져오기
-        posts = await fetch_hot_posts(gallery_id, config.get("gallery_type", "major"), limit=30)
-        
-        if not posts:
-            await ctx.reply("❌ 갤러리에서 게시물을 가져올 수 없습니다.")
-            return
-        
-        # 상위 게시물만 선택
-        hot_posts = posts[:limit]
-        
-        embed = discord.Embed(
-            title=f"😊 {config['name']} 갤러리 인기글 TOP {limit}",
-            description=f"추천수와 조회수 기반 인기 게시물입니다!",
-            color=0xFF6B6B,
-            timestamp=datetime.datetime.now(seoul_tz)
-        )
-        
-        for idx, post in enumerate(hot_posts, 1):
-            # 제목 (너무 길면 자르기)
-            title = post['title']
-            if len(title) > 80:
-                title = title[:77] + "..."
-            
-            # 아이콘
-            icon = "📝" if post['has_image'] else "📝"
-            medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"**{idx}.**"
-            
-            # 작성자 정보
-            author_info = post['author']
-            if post['ip']:
-                author_info += f" `{post['ip']}`"
-            
-            # 통계 정보
-            stats = f"😊 {post['recommend']} | 👀 {post['view']:,} | 💬 {post['comment']}"
-            
-            field_value = (
-                f"**작성자**: {author_info}\n"
-                f"**통계**: {stats}\n"
-                f"[🔗 게시글 보기]({post['link']})"
-            )
-            
-            embed.add_field(
-                name=f"{medal} {icon} {title}",
-                value=field_value,
-                inline=False
-            )
-        
-        embed.set_footer(text=f"디시인사이드 {config['name']} 갤러리 X tbBot3rd")
-        
-        await ctx.reply(embed=embed)
-
 @bot.command(name="ask", help="!ask <질문>")
 async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
     if prompt is None:
@@ -3962,6 +3613,200 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
     for part in fix_code(split_paragraphs(answer)):
         await ctx.reply(part)
         await asyncio.sleep(0.1)
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # 배틀그라운드 모바일 갤러리 크롤링 - 인기글 TOP 10
+    # ────────────────────────────────────────────────────────────────────────────
+
+    @dataclass
+    class GalleryPost:
+        # 갤러리 게시글 데이터 클래스
+        title: str
+        author: str
+        uid: str
+        date: str
+        views: int
+        recommends: int
+        score: float  # 조회수 + 추천수 기반 점수
+        url: str
+        is_notice: bool = False
+
+    async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
+
+        base_url = "https://gall.dcinside.com/mgallery/board/lists/"
+        gallery_id = "battlegroundmobile"
+        posts = []
+    
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://gall.dcinside.com/",
+        }
+    
+        async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
+            for page in range(1, max_pages + 1):
+                try:
+                    params = {"id": gallery_id, "page": page}
+                    resp = await client.get(base_url, params=params)
+                    resp.raise_for_status()
+                
+                    # BeautifulSoup으로 HTML 파싱
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                
+                    # 게시글 목록 테이블 찾기
+                    post_rows = soup.select("tr.ub-content")
+                
+                    for row in post_rows:
+                        try:
+                            # 공지 여부 확인 (td.gall_subject에 <b>공지</b>가 있으면 건너뛰기)
+                            subject_td = row.select_one("td.gall_subject")
+                            if subject_td and subject_td.select_one("b"):
+                                continue  # 공지 게시글은 제외
+                        
+                            # 제목 추출
+                            title_tag = row.select_one("td.gall_tit a")
+                            if not title_tag:
+                                continue
+                        
+                            title = title_tag.get_text(strip=True)
+                            post_url = "https://gall.dcinside.com" + title_tag.get("href", "")
+                        
+                            # 작성자 정보 추출
+                            writer_td = row.select_one("td.gall_writer")
+                            if not writer_td:
+                                continue
+                        
+                            # 닉네임 추출
+                            nickname_span = writer_td.select_one("span.nickname")
+                            if nickname_span:
+                                author = nickname_span.get_text(strip=True)
+                            else:
+                                author = "익명"
+                        
+                            # UID 추출 (data-uid 속성)
+                            uid = writer_td.get("data-uid", "")
+                            if not uid:
+                                uid = "unknown"
+                        
+                            # 날짜 추출
+                            date_td = row.select_one("td.gall_date")
+                            date = date_td.get("title", date_td.get_text(strip=True)) if date_td else ""
+                        
+                            # 조회수 추출
+                            count_td = row.select_one("td.gall_count")
+                            views = int(count_td.get_text(strip=True)) if count_td and count_td.get_text(strip=True).isdigit() else 0
+                        
+                            # 추천수 추출
+                            recommend_td = row.select_one("td.gall_recommend")
+                            recommends = int(recommend_td.get_text(strip=True)) if recommend_td and recommend_td.get_text(strip=True).isdigit() else 0
+                        
+                            # 점수 계산: 조회수 * 0.3 + 추천수 * 10 (추천수에 더 높은 가중치)
+                            score = (views * 0.3) + (recommends * 10)
+                        
+                            # 게시글 객체 생성
+                            post = GalleryPost(
+                                title=title,
+                                author=author,
+                                uid=uid,
+                                date=date,
+                                views=views,
+                                recommends=recommends,
+                                score=score,
+                                url=post_url,
+                                is_notice=False
+                            )
+                        
+                            posts.append(post)
+                        
+                        except Exception as e:
+                            logging.error(f"게시글 파싱 오류: {e}")
+                            continue
+                
+                    # 페이지 간 딜레이 (서버 부담 최소화)
+                    await asyncio.sleep(1)
+                
+                except Exception as e:
+                    logging.error(f"페이지 {page} 크롤링 오류: {e}")
+                    continue
+    
+        return posts
+
+    def format_pubg_gallery_embed(posts: List[GalleryPost]) -> discord.Embed:
+
+        # 점수 기준 정렬 및 상위 10개 추출
+        top_posts = sorted(posts, key=lambda p: p.score, reverse=True)[:10]
+    
+        # 임베드 생성
+        embed = discord.Embed(
+            title="🎮 배틀그라운드 모바일 갤러리 - 인기글 TOP 10",
+            description="**조회수 + 추천수 기반 실시간 랭킹**",
+            color=0xFF6B00,  # PUBG 오렌지 컬러
+            timestamp=datetime.datetime.now(seoul_tz),
+            url="https://gall.dcinside.com/mgallery/board/lists/?id=battlegroundmobile"
+        )
+    
+        # 메달 이모지
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    
+        for idx, post in enumerate(top_posts):
+            medal = medals[idx] if idx < len(medals) else f"{idx+1}."
+        
+            # 제목 길이 제한 (60자)
+            display_title = post.title[:60] + "..." if len(post.title) > 60 else post.title
+        
+            # 필드 추가
+            field_name = f"{medal} {display_title}"
+            field_value = (
+                f"👤 **{post.author}** `({post.uid})`\n"
+                f"👁️ {post.views:,} | 👍 {post.recommends} | 🔥 점수: {post.score:.1f}\n"
+                f"📅 {post.date}\n"
+                f"[게시글 보기]({post.url})"
+            )
+        
+            embed.add_field(name=field_name, value=field_value, inline=False)
+    
+        # 푸터
+        embed.set_footer(
+            text="💡 tbBOT3rd X Dcinside",
+            icon_url="https://i.imgur.com/d1Ef9W8.jpeg"
+        )
+    
+        # 썸네일 (PUBG Mobile 로고)
+        embed.set_thumbnail(url="https://i.imgur.com/kJDrG0s.png")
+    
+        return embed
+
+    @bot.command(name="모배갤", aliases=["모배", "pubgm", "배그모바일"])
+    async def pubg_mobile_gallery(ctx):
+        
+        # 배틀그라운드 모바일 갤러리 인기글 TOP 10 표시
+    
+        # 사용법: !모배갤
+        
+        # 로딩 메시지
+        loading_msg = await ctx.reply("🔍 배틀그라운드 모바일 갤러리를 분석하는 중이에요... 잠시만 기다려주세요!")
+    
+        try:
+            # 갤러리 크롤링 
+            posts = await crawl_pubg_mobile_gallery(max_pages=3)
+        
+            if not posts:
+                await loading_msg.edit(content="⚠️ 게시글을 가져오는데 실패했어요. 나중에 다시 시도해주세요!")
+                return
+        
+            # 임베드 생성
+            embed = format_pubg_gallery_embed(posts)
+        
+            # 로딩 메시지 삭제 후 임베드 전송
+            await loading_msg.delete()
+            await ctx.reply(embed=embed)
+        
+            logging.info(f"모배갤 명령어 실행: {ctx.author} - {len(posts)}개 게시글 분석 완료")
+        
+        except Exception as e:
+            await loading_msg.edit(content=f"⚠️ 오류가 발생했어요: {str(e)}")
+            logging.error(f"모배갤 명령어 오류: {e}")
 
 # ────────── 봇 상태 ──────────
 @bot.event
