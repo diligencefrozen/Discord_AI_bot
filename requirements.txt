@@ -1,17 +1,21 @@
 discord.py==2.3.2
-beautifulsoup4==4.9.3
+beautifulsoup4>=4.12.2
 requests==2.25.1
 urllib3==1.26.2
 pynacl==1.4.0
 lxml
-pytz
+pytz>=2023.3
 schedule==1.2.0
 huggingface_hub>=0.23.0
-httpx>=0.27.0
+httpx[http2]>=0.27.0
 python-dotenv>=1.0.1
 deep-translator>=1.11.4
 Pillow==10.3.0
 duckduckgo-search<5.0 
+curl_cffi>=0.7.0
+
+
+
 
 
 
