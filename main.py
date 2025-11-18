@@ -2544,16 +2544,15 @@ async def on_message(message: discord.Message):
                 
                 # 서브타이틀을 author 필드로 표시 (더 눈에 띄게)
                 if cfg.get("subtitle"):
-                    embed.set_author(
-                        name=cfg["subtitle"],
-                        icon_url=cfg.get("icon_url", "https://cdn.discordapp.com/emojis/1234567890.png")
-                    )
+                    author_kwargs = {"name": cfg["subtitle"]}
+                    if cfg.get("icon_url"):
+                        author_kwargs["icon_url"] = cfg["icon_url"]
+                    embed.set_author(**author_kwargs)
                 
                 embed.set_thumbnail(url=cfg["thumb"])
                 embed.set_image(url=cfg["banner"])
                 embed.set_footer(
-                    text=cfg.get("footer", "Join millions of players worldwide"),
-                    icon_url="https://cdn.discordapp.com/emojis/1234567890.png"
+                    text=cfg.get("footer", "Join millions of players worldwide")
                 )
                 
                 # 모던한 버튼 스타일로 개선
