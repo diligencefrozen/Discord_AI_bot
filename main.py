@@ -4086,8 +4086,14 @@ async def crawl_pubg_mobile_gallery(max_pages: int = 3) -> List[GalleryPost]:
     return posts
 
 def format_pubg_gallery_embed(posts: List[GalleryPost]) -> discord.Embed:
+    # URL 기준 중복 제거 (같은 게시물이 여러 번 수집된 경우)
+    unique_posts = {}
+    for post in posts:
+        if post.url not in unique_posts or post.score > unique_posts[post.url].score:
+            unique_posts[post.url] = post
+    
     # 점수 기준 정렬 및 상위 10개 추출
-    top_posts = sorted(posts, key=lambda p: p.score, reverse=True)[:10]
+    top_posts = sorted(unique_posts.values(), key=lambda p: p.score, reverse=True)[:10]
 
     # 임베드 생성
     embed = discord.Embed(
