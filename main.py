@@ -2168,6 +2168,11 @@ async def on_message(message: discord.Message):
     ch_id    = message.channel.id
     user_id  = message.author.id
 
+    # (중요) 명령어가 있으면 우선 처리하고 나머지 로직은 실행하지 않음
+    if message.content.startswith(('!', '/')):
+        await bot.process_commands(message)
+        return
+
     # ───── 경험치 획득 (봇이 아닌 경우만) ─────
     if not message.author.bot:
         xp, leveled_up, new_tier_idx, new_achievements = add_xp(user_id)
