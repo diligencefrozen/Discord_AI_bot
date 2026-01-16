@@ -10,3 +10,7 @@
 ## Invite blurb (super-short)
 
 “Moderation, emoji magic & AI answers – all in one cute package.”<br>
+
+## Origin code
+
+<a href="https://github.com/diligencefrozen/discordbot-main">https://github.com/diligencefrozen/discordbot-main</a>
