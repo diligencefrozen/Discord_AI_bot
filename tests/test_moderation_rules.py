@@ -26,8 +26,9 @@ class ModerationRulesTests(unittest.TestCase):
         self.assertIn("fuck", BAD_ROOTS)
         self.assertIn("ㅗ", BAD_ROOTS)
 
-    def test_unknown_prefixed_text_is_still_moderated(self):
-        self.assertFalse(should_moderate_message("!ask hello", {"ask"}))
+    def test_all_prefixed_text_is_moderated_before_dispatch(self):
+        self.assertTrue(should_moderate_message("!ask hello", {"ask"}))
+        self.assertTrue(should_moderate_message("!xp 씨발", {"xp"}))
         self.assertTrue(should_moderate_message("!unknown 씨발", {"ask"}))
         self.assertTrue(should_moderate_message("/ 씨발", {"ask"}))
 

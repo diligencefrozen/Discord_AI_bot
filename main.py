@@ -22,8 +22,8 @@ from bs4 import BeautifulSoup
 from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Set, Tuple
-from discord.errors import NotFound, Forbidden, HTTPException
 from dataclasses import dataclass
+from moderation_delete import delete_message
 from bot_storage import PickleStore
 from bot_metrics import MetricsStore
 from ai_providers import (
@@ -33,10 +33,9 @@ from ai_providers import (
     generate_horde_text,
 )
 from moderation_rules import (
-    extract_command_argument,
     find_badroot as find_badroot_strict,
     lookup_exemption as lookup_rule_exemption,
-    should_moderate_message,
+    parse_command,
 )
 from bot_ui import (
     FeatureMenuView,
@@ -798,52 +797,77 @@ def use_profanity_pass(user_id: int):
     # Explicitly consume a counted pass only after a moderation decision.
     _consume_legacy_exemption(user_id, "profanity")
 
-# 금칙어 검열 기능의 버그를 해결하기 위한 임기응변 
-async def safe_delete(message: discord.Message):
-    try:
-        await message.delete()
-    except (NotFound, Forbidden, HTTPException):
-        pass
+async def safe_delete(message: discord.Message, *, reason: str = "moderation") -> bool:
+    """Delete a moderation target and log every failure without message text."""
+
+    return await delete_message(message, reason=reason)
 
 
-async def _moderate_ai_prompt_message(message: discord.Message, prompt: str) -> bool:
-    """Apply link/profanity rules before dispatching a prefix AI prompt.
-
-    Registered prefix commands intentionally skip the general message path, so
-    their free-form arguments need an explicit moderation boundary.  Returning
-    ``False`` means the command must not be dispatched.
-    """
+async def _moderate_message_content(message: discord.Message) -> bool:
+    """Run link and profanity enforcement before all message side effects."""
 
     channel_id = getattr(getattr(message, "channel", None), "id", 0)
     user_id = getattr(getattr(message, "author", None), "id", 0)
-    if LINK_REGEX.search(prompt) and channel_id not in ALLOWED_CHANNELS:
-        if not is_user_exempt_from_profanity(user_id):
-            await safe_delete(message)
-            await message.channel.send(
-                embed=discord.Embed(
-                    description=(
-                        f"{message.author.mention} AI 질문/그림 프롬프트의 링크는 허용되지 않아요."
-                    ),
-                    color=0xFF0000,
-                ),
-                delete_after=8,
-            )
-            return False
-        use_profanity_pass(user_id)
+    content = getattr(message, "content", "")
 
-    root = find_badroot(prompt)
-    if root and channel_id not in EXEMPT_PROFANITY_CHANNEL_IDS:
-        if not is_user_exempt_from_profanity(user_id):
-            await safe_delete(message)
-            await message.channel.send(
-                embed=discord.Embed(
-                    description=f"{message.author.mention} AI 프롬프트를 순화해 주세요. (**금칙어:** {root})",
-                    color=0xFF0000,
-                ),
-                delete_after=8,
+    link_violation = LINK_REGEX.search(content) and channel_id not in ALLOWED_CHANNELS
+    root = find_badroot(content)
+    profanity_violation = root and channel_id not in EXEMPT_PROFANITY_CHANNEL_IDS
+    if link_violation or profanity_violation:
+        if is_user_exempt_from_profanity(user_id):
+            # A single message consumes at most one pass even when it contains
+            # both a blocked link and a configured profanity root.
+            use_profanity_pass(user_id)
+            if link_violation:
+                try:
+                    await message.add_reaction("🔗")
+                except Exception:
+                    logging.warning(
+                        "[MODERATION_LINK_EXEMPT] reaction_failed message_id=%s",
+                        getattr(message, "id", None),
+                    )
+                logging.info(
+                    "[LINK_EXEMPT] message_id=%s user_id=%s",
+                    getattr(message, "id", None),
+                    user_id,
+                )
+            if link_violation:
+                await message.channel.send(
+                    f"✨ {message.author.mention} 님의 링크 검열 면제권이 사용되었습니다!",
+                    delete_after=5,
+                )
+            else:
+                await message.channel.send(
+                    embed=discord.Embed(
+                        description=f"✨ {message.author.mention} 님의 금칙어 면제권이 사용되었습니다!",
+                        color=0xFFD700,
+                    ),
+                    delete_after=5,
+                )
+        else:
+            reason = "link+profanity" if link_violation and profanity_violation else (
+                "profanity" if profanity_violation else "link"
             )
+            await safe_delete(message, reason=reason)
+            if link_violation:
+                await message.channel.send(
+                    embed=discord.Embed(
+                        description=(
+                            f"{message.author.mention} 이런; 규칙을 위반하지 마세요.\n\n"
+                            "💡 **팁**: 경험치를 모아 면제권을 받으면 링크도 올릴 수 있습니다!"
+                        ),
+                        color=0xFF0000,
+                    ),
+                    delete_after=8,
+                )
+            else:
+                await message.channel.send(
+                    embed=discord.Embed(
+                        description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:** {root})",
+                        color=0xFF0000,
+                    )
+                )
             return False
-        use_profanity_pass(user_id)
     return True
 
 # 공통 예외 로깅 도우미
@@ -2331,26 +2355,24 @@ async def on_message(message: discord.Message):
     ch_id    = message.channel.id
     user_id  = message.author.id
 
-    # Registered prefix commands keep their historical behavior. Unknown or
-    # malformed prefixed text must continue through moderation so command
-    # syntax cannot bypass the filter.
-    if message.content.startswith(('!', '/')):
-        if not should_moderate_message(message.content, bot.all_commands):
-            ai_prompt = extract_command_argument(message.content)
-            if ai_prompt is not None and not await _moderate_ai_prompt_message(message, ai_prompt):
-                return
-            await bot.process_commands(message)
-            return
+    # Enforce link/profanity policy before XP, attachments, mentions, spam
+    # handling, game cards, or any other side effect. Prefix commands are
+    # deliberately not exempt: their full content is moderated first.
+    if not await _moderate_message_content(message):
+        return
 
-    # Do not award XP to messages that will be removed by the link/profanity
-    # filters. The exemption lookup is read-only; consumption happens only in
-    # the later moderation branch after the message is accepted.
+    # Preserve the historical clean-command dispatch behavior only after the
+    # complete message has passed moderation. This prevents `!xp 씨발` and
+    # similar arguments from becoming a command-based filter bypass.
+    command = parse_command(message.content)
+    known_commands = {str(name).casefold().lstrip("!/") for name in bot.all_commands}
+    if command is not None and command in known_commands:
+        await bot.process_commands(message)
+        return
+
+    # Reaching this point means the message was accepted by moderation and may
+    # participate in the existing XP/reward flow.
     xp_eligible = True
-    if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:
-        xp_eligible = is_user_exempt_from_profanity(user_id)
-    detected_root = find_badroot(message.content)
-    if detected_root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
-        xp_eligible = is_user_exempt_from_profanity(user_id)
 
     # ───── 경험치 획득 (봇이 아닌 경우만) ─────
     if not message.author.bot and xp_eligible:
@@ -2561,14 +2583,11 @@ async def on_message(message: discord.Message):
         # (b) 일반 채널: 미디어/이모지/스티커 감지 시 삭제 + 경고
         if _message_has_blocked_media_or_emoji(message):
             _dbg("non-exempt channel & media detected → delete")
-            try:
-                await message.delete()
-            except Exception as e:
-                _dbg("delete failed:", repr(e))
+            deleted = await safe_delete(message, reason="blocked_media")
 
             embed, view = make_surveillance_embed(
                 message.author,
-                deleted=True,
+                deleted=deleted,
                 guild_id=guild_id,
                 exempt_ch_id=PRIMARY_EXEMPT_MEDIA_CH_ID,
             )
@@ -2679,10 +2698,7 @@ async def on_message(message: discord.Message):
                 
                 async def delayed_delete():
                     await asyncio.sleep(delay)
-                    try:
-                        await message.delete()
-                    except Exception:
-                        pass
+                    await safe_delete(message, reason="spam")
                 
                 asyncio.create_task(delayed_delete())
                 
@@ -2800,54 +2816,7 @@ async def on_message(message: discord.Message):
                 )
                 return
             
-    # 3) 링크 삭제 
-    if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:
-
-        if not is_user_exempt_from_profanity(user_id):
-            await safe_delete(message)
-            await message.channel.send(
-                embed=discord.Embed(
-                    description=f"{message.author.mention} 이런; 규칙을 위반하지 마세요.\n\n💡 **팁**: 경험치를 모아 면제권을 받으면 링크도 올릴 수 있습니다!",
-                    color=0xFF0000,
-                ),
-                delete_after=8
-            )
-            return
-        else:
-            # 면제권 있음 - 링크 허용 (간단한 알림)
-            use_profanity_pass(user_id)
-            await message.add_reaction("🔗")  # 링크 이모지 반응
-            await message.channel.send(
-                f"✨ {message.author.mention} 님의 링크 검열 면제권이 사용되었습니다!",
-                delete_after=5
-            )
-            logging.info(f"[LINK_EXEMPT] {message.author} (ID:{user_id}) - 링크 검열 면제권으로 링크 허용")
-
-    # 4) 금칙어 
-    root = find_badroot(message.content)
-    if root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
-        # 금칙어 면제권 체크
-        if is_user_exempt_from_profanity(user_id):
-            use_profanity_pass(user_id)
-            await message.channel.send(
-                embed=discord.Embed(
-                    description=f"✨ {message.author.mention} 님의 금칙어 면제권이 사용되었습니다!",
-                    color=0xFFD700,
-                ),
-                delete_after=5
-            )
-            # 금칙어 필터 통과
-        else:
-            await safe_delete(message)
-            await message.channel.send(
-                embed=discord.Embed(
-                    description=f"{message.author.mention} 이런; 말을 순화하세요. (**금칙어:** {root})",
-                    color=0xFF0000,
-                )
-            )
-            return
-
-    # 5) 웃음 상호작용
+    # 3) 웃음 상호작용 (moderation already completed above)
     if any(k in message.content for k in LAUGH_KEYWORDS):
         await message.channel.send(
             embed=discord.Embed(

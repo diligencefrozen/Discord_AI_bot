@@ -143,20 +143,14 @@ def should_moderate_message(
     known_commands: Optional[Iterable[str]] = None,
     prefixes: Sequence[str] = ("!", "/"),
 ) -> bool:
-    """Whether normal moderation must run for a message.
+    """Return whether a message must enter moderation before dispatch.
 
-    Only a recognized command may skip normal message handling.  Unknown or
-    malformed prefixed text remains subject to moderation, preventing command
-    syntax from becoming a filter bypass.
+    Command metadata is retained for API compatibility, but recognized
+    commands no longer bypass moderation.  Their complete content, including
+    arguments, must be checked before ``process_commands`` is called.
     """
 
-    command = parse_command(content, prefixes)
-    if command is None:
-        return True
-    if known_commands is None:
-        return True
-    known = {str(item).casefold().lstrip("!/") for item in known_commands}
-    return command not in known
+    return True
 
 
 @dataclass(frozen=True)
