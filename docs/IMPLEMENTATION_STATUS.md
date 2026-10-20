@@ -25,6 +25,8 @@ The repository now contains the first complete incremental implementation of the
 - Discord UI smoke checks passed: exactly four intro buttons in a 2×2 layout and four administrator buttons.
 - Offline regression suite passed: 19 tests covering Pickle recovery/concurrency, moderation normalization/command bypass/exemption separation, administrator authorization, privacy-safe metrics, and slash-sync retry behavior.
 - State files keep their historical names and Pickle structures. Set `DATA_DIR` to the mounted Northflank volume path (or `STATE_DIR` as an alias) to persist XP, achievements, typing cooldowns, and aggregate metrics; when unset, the historical current-working-directory behavior is retained.
+- CPython 3.13 manylinux dependency resolution passed for all 47 artifacts after pinning Pillow 12.2.0; a clean Python 3.12 environment also passed `pip check`, main import, Bot construction, and slash registration.
+- A temporary-volume smoke test verified that a legacy CWD Pickle is copied into `DATA_DIR` without changing its bytes.
 
 ## Still requiring an external environment
 
