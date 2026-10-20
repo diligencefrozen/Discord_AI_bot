@@ -23,7 +23,8 @@ The repository now contains the first complete incremental implementation of the
 - Main module import and token-free Bot construction passed with dummy environment values.
 - Slash command registration passed for 시작, 질문, 그림, 내정보, and 관리.
 - Discord UI smoke checks passed: exactly four intro buttons in a 2×2 layout and four administrator buttons.
-- Offline regression suite passed: 17 tests covering Pickle recovery/concurrency, moderation normalization/command bypass/exemption separation, administrator authorization, and privacy-safe metrics.
+- Offline regression suite passed: 19 tests covering Pickle recovery/concurrency, moderation normalization/command bypass/exemption separation, administrator authorization, privacy-safe metrics, and slash-sync retry behavior.
+- State files keep their historical names and Pickle structures. Set `DATA_DIR` to the mounted Northflank volume path (or `STATE_DIR` as an alias) to persist XP, achievements, typing cooldowns, and aggregate metrics; when unset, the historical current-working-directory behavior is retained.
 
 ## Still requiring an external environment
 

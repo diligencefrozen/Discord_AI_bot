@@ -397,6 +397,36 @@ def register_slash_commands(
     return registered
 
 
+class SlashCommandRegistrationState:
+    """Track slash registration separately from gateway synchronization.
+
+    Command objects must only be added to the tree once, while a failed sync
+    must remain retryable after reconnect.  ``ensure`` therefore remembers
+    tree registration even when ``sync`` fails and only marks the operation
+    complete after a successful sync.
+    """
+
+    def __init__(self) -> None:
+        self.commands_registered = False
+        self.synced = False
+        self.last_error: Exception | None = None
+
+    async def ensure(self, register: Callable[[], Any], sync: Callable[[], Awaitable[Any]]) -> bool:
+        if self.synced:
+            return False
+        if not self.commands_registered:
+            register()
+            self.commands_registered = True
+        try:
+            await sync()
+        except Exception as error:
+            self.last_error = error
+            return False
+        self.synced = True
+        self.last_error = None
+        return True
+
+
 def typing_intro_payload(user: Any) -> dict[str, Any]:
     """Build the public typing notice while constraining mentions to one user."""
     mention = getattr(user, "mention", "")
@@ -411,5 +441,5 @@ def typing_intro_payload(user: Any) -> dict[str, Any]:
 __all__ = [
     "SPECIAL_ADMIN_USER_ID", "IntroView", "QuestionModal", "ImageModal", "ModerationTestModal", "AdminPanelView",
     "admin_panel_response", "is_admin_authorized", "is_authorized_admin", "is_admin_user",
-    "register_slash_commands", "typing_intro_payload",
+    "register_slash_commands", "SlashCommandRegistrationState", "typing_intro_payload",
 ]

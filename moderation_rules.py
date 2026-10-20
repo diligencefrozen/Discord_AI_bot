@@ -167,5 +167,3 @@ def consume_exemption(
         if entry["count"] <= 0:
             user_state["rewards_active"].pop(found.key, None)
     return found
-
-\n

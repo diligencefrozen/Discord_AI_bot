@@ -10,7 +10,7 @@ huggingface_hub>=0.23.0
 httpx[http2]>=0.27.0
 python-dotenv>=1.0.1
 deep-translator>=1.11.4
-Pillow==12.3.0
+Pillow==12.2.0
 duckduckgo-search<5.0 
 curl_cffi>=0.7.0
 

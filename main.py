@@ -3,7 +3,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 # 기본 모듈,라이브러리 로드
 # ────────────────────────────────────────────────────────────────────────────
-import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json, aiohttp, h2
+import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json, aiohttp, h2, shutil
 from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
@@ -35,16 +35,51 @@ from bot_ui import (
     IntroView,
     is_admin_authorized,
     register_slash_commands,
+    SlashCommandRegistrationState,
     typing_intro_payload,
 )
+
+# Load local development settings before resolving state paths. Northflank
+# injects environment variables directly, while local `.env` users get the
+# same DATA_DIR/STATE_DIR behavior.
+load_dotenv()
 
 # ────────────────────────────────────────────────────────────────────────────
 # 24시간 경험치 시스템 (Daily XP & Rewards)
 # ────────────────────────────────────────────────────────────────────────────
 
-XP_DATA_FILE = "daily_xp_data.pkl"
+def _state_path(filename: str) -> Path:
+    """Return a state path while preserving the historical CWD default.
+
+    Northflank deployments can mount a persistent volume and set ``DATA_DIR``
+    (or the backwards-compatible ``STATE_DIR`` alias).  With neither set,
+    files remain in the process working directory exactly as before.
+    """
+    configured = os.getenv("DATA_DIR") or os.getenv("STATE_DIR")
+    root = Path(configured) if configured else Path(".")
+    target = root / filename
+    legacy = Path(filename)
+    # One-time migration for deployments that previously wrote to CWD. Copy
+    # the primary and adjacent backup generations only when their target is
+    # absent, preserving existing mounted-volume data and Pickle bytes.
+    if configured and target != legacy:
+        candidates = [legacy, *legacy.parent.glob(f"{legacy.name}.bak.*")]
+        for source in candidates:
+            destination = root / source.name
+            if not source.exists() or destination.exists():
+                continue
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                logging.info("Migrated legacy state file %s to %s", source, destination)
+            except OSError:
+                logging.exception("Could not migrate legacy state file %s", source)
+    return target
+
+
+XP_DATA_FILE = _state_path("daily_xp_data.pkl")
 XP_STORE = PickleStore(XP_DATA_FILE, max_backups=3, validator=lambda value: isinstance(value, dict))
-METRICS = MetricsStore()
+METRICS = MetricsStore(_state_path("bot_metrics.json"))
 seoul_tz = timezone("Asia/Seoul")
 
 # 경험치 설정
@@ -70,7 +105,7 @@ user_xp_data: Dict[int, dict] = {}
 # 업적 시스템 (Achievement System)
 # ────────────────────────────────────────────────────────────────────────────
 
-ACHIEVEMENTS_FILE = "achievements_data.pkl"
+ACHIEVEMENTS_FILE = _state_path("achievements_data.pkl")
 ACHIEVEMENTS_STORE = PickleStore(
     ACHIEVEMENTS_FILE, max_backups=3, validator=lambda value: isinstance(value, dict)
 )
@@ -1297,9 +1332,6 @@ async def apply_timeout(member: Union[discord.Member, discord.User], minutes: in
         return False, f"exception:{type(e).__name__}"
 
 
-# ────── 환경 변수 로드 ──────
-load_dotenv()                            # .env → os.environ 으로 주입
-
 # ─── 검색 엔진 설정 ──────────────────────────────────
 # Wikipedia API (안정적, 무료, 무제한)
 
@@ -1395,7 +1427,7 @@ _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
 # 12시간 쿨다운과 마지막 안내 시각(UTC timestamp) 저장용
 TYPE_REMINDER_COOLDOWN = 60 * 60 * 12
-TYPE_REMINDER_COOLDOWN_FILE = Path("typing_cooldowns.json")
+TYPE_REMINDER_COOLDOWN_FILE = _state_path("typing_cooldowns.json")
 
 def _load_typing_cooldowns() -> Dict[str, float]:
     try:
@@ -4166,6 +4198,7 @@ async def pubg_mobile_gallery(ctx):
 
 # ────────── 버튼/슬래시 서비스 어댑터 ──────────
 _slash_registered = False
+_slash_registration_state = SlashCommandRegistrationState()
 _runtime_tasks_started = False
 
 
@@ -4302,21 +4335,28 @@ async def _register_slash_commands_once():
     global _slash_registered
     if _slash_registered:
         return
-    register_slash_commands(
-        bot,
-        start_service=_start_interaction_service,
-        question_service=_question_interaction_service,
-        image_service=_image_interaction_service,
-        growth_service=_growth_interaction_service,
-        admin_service=_admin_action_service,
-        admin_test_service=_admin_test_service,
-    )
-    _slash_registered = True
-    try:
+
+    def _register() -> None:
+        register_slash_commands(
+            bot,
+            start_service=_start_interaction_service,
+            question_service=_question_interaction_service,
+            image_service=_image_interaction_service,
+            growth_service=_growth_interaction_service,
+            admin_service=_admin_action_service,
+            admin_test_service=_admin_test_service,
+        )
+
+    async def _sync() -> list[object]:
         synced = await bot.tree.sync()
         logging.info("Synced %d slash commands", len(synced))
-    except Exception:
-        logging.exception("Slash command sync failed")
+        return synced
+
+    synced_ok = await _slash_registration_state.ensure(_register, _sync)
+    if synced_ok:
+        _slash_registered = True
+    elif not _slash_registration_state.synced:
+        logging.error("Slash command sync failed: %s", _slash_registration_state.last_error)
 
 
 # ────────── 봇 상태 ──────────
