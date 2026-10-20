@@ -3,7 +3,9 @@ import unittest
 from moderation_rules import (
     BAD_ROOTS,
     consume_exemption,
+    extract_command_argument,
     find_badroot,
+    is_ai_prompt_command,
     lookup_exemption,
     normalize_text,
     should_moderate_message,
@@ -28,6 +30,13 @@ class ModerationRulesTests(unittest.TestCase):
         self.assertFalse(should_moderate_message("!ask hello", {"ask"}))
         self.assertTrue(should_moderate_message("!unknown 씨발", {"ask"}))
         self.assertTrue(should_moderate_message("/ 씨발", {"ask"}))
+
+    def test_ai_prompt_commands_are_parsed_for_explicit_moderation(self):
+        self.assertTrue(is_ai_prompt_command("!ask hello"))
+        self.assertTrue(is_ai_prompt_command("/img a sunset"))
+        self.assertEqual(extract_command_argument("!ask hello world"), "hello world")
+        self.assertIsNone(extract_command_argument("!ask"))
+        self.assertIsNone(extract_command_argument("!xp 씨발"))
 
     def test_exemption_lookup_does_not_consume(self):
         state = {"rewards_active": {"achievement_profanity": {"type": "profanity", "count": 2}}}

@@ -5,7 +5,7 @@
 • It auto-deletes rule-breaking links or slurs, logs deleted messages, <br>and even warns about gaming addiction – all in a warm, humorous tone.<br>
 
 • It enlarges custom emoji codes ( `:01:`-`:50:` , `:dccon:` ) on the fly, reacts to laughter, <br>highlights trending keywords in the last few messages, <br>and lets users query “!ask <topic>” to get AI-powered answers summarised in 4 Korean lines or less.
-<br>Powered by HuggingFace Inference (DeepSeek-R1-Qwen3-8B) and built for seamless Korean/English servers alike.<br>
+<br>Powered by the free AI Horde service by default, with the preserved Hugging Face integration available by explicit configuration.<br>
 
 ## Invite blurb (super-short)
 
@@ -18,9 +18,13 @@
 ## Local setup
 
 The target runtime is Python 3.13. Copy `.env.example` to `.env`, fill in the
-Discord and Hugging Face tokens, and keep `SPECIAL_ADMIN_USER_ID` set only for
-the confirmed special administrator account. The server owner is always checked
-from the current guild at interaction time.
+Discord token, and keep `SPECIAL_ADMIN_USER_ID` set only for the confirmed
+special administrator account. AI Horde is the default free provider and can
+run with its anonymous key; set `HORDE_API_KEY` only when an operator has a
+Horde account key. The preserved Hugging Face integration is opt-in with
+`AI_PROVIDER=huggingface`, `HF_TOKEN`, and `HF_IMG_TOKEN`; the bot never
+silently switches to a paid provider. The server owner is always checked from
+the current guild at interaction time.
 
 ```powershell
 python -m venv .venv

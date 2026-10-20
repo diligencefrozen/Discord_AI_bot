@@ -26,7 +26,14 @@ from discord.errors import NotFound, Forbidden, HTTPException
 from dataclasses import dataclass
 from bot_storage import PickleStore
 from bot_metrics import MetricsStore
+from ai_providers import (
+    AIProviderError,
+    HordeConfig,
+    generate_horde_image,
+    generate_horde_text,
+)
 from moderation_rules import (
+    extract_command_argument,
     find_badroot as find_badroot_strict,
     lookup_exemption as lookup_rule_exemption,
     should_moderate_message,
@@ -797,6 +804,47 @@ async def safe_delete(message: discord.Message):
     except (NotFound, Forbidden, HTTPException):
         pass
 
+
+async def _moderate_ai_prompt_message(message: discord.Message, prompt: str) -> bool:
+    """Apply link/profanity rules before dispatching a prefix AI prompt.
+
+    Registered prefix commands intentionally skip the general message path, so
+    their free-form arguments need an explicit moderation boundary.  Returning
+    ``False`` means the command must not be dispatched.
+    """
+
+    channel_id = getattr(getattr(message, "channel", None), "id", 0)
+    user_id = getattr(getattr(message, "author", None), "id", 0)
+    if LINK_REGEX.search(prompt) and channel_id not in ALLOWED_CHANNELS:
+        if not is_user_exempt_from_profanity(user_id):
+            await safe_delete(message)
+            await message.channel.send(
+                embed=discord.Embed(
+                    description=(
+                        f"{message.author.mention} AI 질문/그림 프롬프트의 링크는 허용되지 않아요."
+                    ),
+                    color=0xFF0000,
+                ),
+                delete_after=8,
+            )
+            return False
+        use_profanity_pass(user_id)
+
+    root = find_badroot(prompt)
+    if root and channel_id not in EXEMPT_PROFANITY_CHANNEL_IDS:
+        if not is_user_exempt_from_profanity(user_id):
+            await safe_delete(message)
+            await message.channel.send(
+                embed=discord.Embed(
+                    description=f"{message.author.mention} AI 프롬프트를 순화해 주세요. (**금칙어:** {root})",
+                    color=0xFF0000,
+                ),
+                delete_after=8,
+            )
+            return False
+        use_profanity_pass(user_id)
+    return True
+
 # 공통 예외 로깅 도우미
 def log_ex(ctx: str, e: Exception) -> None:
     try:
@@ -1492,28 +1540,47 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
     finally:
         _typing_tasks.pop(key, None)
 
-# ────────── HF / Discord 설정 ──────────
-HF_TOKEN      = os.environ.get("HF_TOKEN")        # 반드시 설정해야 함
-PROVIDER      = "novita"
-MODEL         = "openai/gpt-oss-20b"
+# ────────── AI / Discord 설정 ──────────
+# AI Horde is the free default.  Hugging Face remains available only when an
+# operator explicitly selects it; there is no paid-provider auto-fallback.
+AI_PROVIDER   = (os.environ.get("AI_PROVIDER") or "aihorde").strip().lower()
+if AI_PROVIDER in {"horde", "ai-horde", "ai_horde"}:
+    AI_PROVIDER = "aihorde"
+elif AI_PROVIDER in {"hf", "huggingface", "novita"}:
+    AI_PROVIDER = "huggingface"
+elif AI_PROVIDER != "aihorde":
+    raise RuntimeError("AI_PROVIDER must be 'aihorde' or 'huggingface'")
+
+HF_TOKEN      = os.environ.get("HF_TOKEN")
+PROVIDER      = os.environ.get("HF_PROVIDER", "novita")
+MODEL         = os.environ.get("HF_MODEL", "openai/gpt-oss-20b")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 MAX_TOKENS = 512
 MAX_MSG   = 1900
 FILE_TH   = 6000
 HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
-IMG_MODEL    = "stabilityai/stable-diffusion-xl-base-1.0" 
+IMG_MODEL    = os.environ.get("HF_IMG_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+HORDE_CONFIG = HordeConfig.from_env()
 # 새로운 Inference Providers API 엔드포인트 사용 (2025년 11월 1일부터 필수)
 ENDPOINT     = f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}"
-HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"}
+HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"} if HF_IMG_TOKEN else {}
 # InferenceClient - 새 API 엔드포인트로 모델 URL 직접 지정
-img_client  = InferenceClient(model=f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}", token=HF_IMG_TOKEN)
+img_client  = (
+    InferenceClient(model=f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}", token=HF_IMG_TOKEN)
+    if HF_IMG_TOKEN
+    else None
+)
 
 # macOS 일부 환경에서 기본 CA 경로 인식 실패 대응
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
-if not (HF_TOKEN and DISCORD_TOKEN and HF_IMG_TOKEN):
-    raise RuntimeError("환경변수(HF_TOKEN, DISCORD_TOKEN, HF_IMG_TOKEN)가 비었습니다. .env 확인")
+if not DISCORD_TOKEN:
+    raise RuntimeError("환경변수(DISCORD_TOKEN)가 비었습니다. .env 확인")
+if AI_PROVIDER == "huggingface" and not (HF_TOKEN and HF_IMG_TOKEN):
+    raise RuntimeError(
+        "AI_PROVIDER=huggingface 인 경우 HF_TOKEN과 HF_IMG_TOKEN이 필요합니다"
+    )
 
 # 매달 5만 token(=입력+출력)을 넘지 않도록 간단히 차단
 TOKEN_BUDGET = 50_000          # novita 무료 월 한도
@@ -1913,9 +1980,61 @@ SYS_PROMPT = (
     'Now go forth and charm the world! 🚀💖'
 )
 
-# Hugging Face InferenceClient
-# provider를 사용할 때는 base_url 불필요 (provider가 자동으로 엔드포인트 설정)
-hf = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN)
+# Hugging Face InferenceClient.  It is intentionally optional so an AI Horde
+# deployment does not need to configure or pay for a Hugging Face provider.
+hf = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN) if HF_TOKEN else None
+
+
+async def _generate_text_response(prompt: str) -> str:
+    """Generate text through the selected provider without implicit fallback."""
+
+    if AI_PROVIDER == "aihorde":
+        return await generate_horde_text(
+            prompt,
+            system_prompt=SYS_PROMPT,
+            max_tokens=MAX_TOKENS,
+            temperature=0.3,
+            config=HORDE_CONFIG,
+        )
+    if hf is None:
+        raise AIProviderError("HF_TOKEN is required when AI_PROVIDER=huggingface")
+    result = await asyncio.to_thread(
+        hf.chat.completions.create,
+        model=MODEL,
+        messages=[{"role": "system", "content": SYS_PROMPT}, {"role": "user", "content": prompt}],
+        max_tokens=MAX_TOKENS,
+        temperature=0.3,
+    )
+    return result.choices[0].message.content
+
+
+async def _generate_image_bytes(prompt: str) -> bytes:
+    """Generate image bytes through the selected provider without fallback."""
+
+    if AI_PROVIDER == "aihorde":
+        return await generate_horde_image(prompt, config=HORDE_CONFIG)
+    if not HF_IMG_TOKEN:
+        raise AIProviderError("HF_IMG_TOKEN is required when AI_PROVIDER=huggingface")
+    async with httpx.AsyncClient(timeout=120) as ac:
+        response = await ac.post(
+            ENDPOINT,
+            headers=HEADERS,
+            json={
+                "inputs": prompt,
+                "options": {"wait_for_model": True},
+                "parameters": {
+                    "negative_prompt": " ",
+                    "num_inference_steps": 40,
+                    "guidance_scale": 7.0,
+                    "width": 1024,
+                    "height": 1024,
+                },
+            },
+        )
+    response.raise_for_status()
+    if not response.headers.get("content-type", "").startswith("image"):
+        raise AIProviderError(f"Image provider returned a non-image response: {response.text[:300]}")
+    return response.content
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2183,6 +2302,9 @@ async def on_message(message: discord.Message):
     # syntax cannot bypass the filter.
     if message.content.startswith(('!', '/')):
         if not should_moderate_message(message.content, bot.all_commands):
+            ai_prompt = extract_command_argument(message.content)
+            if ai_prompt is not None and not await _moderate_ai_prompt_message(message, ai_prompt):
+                return
             await bot.process_commands(message)
             return
 
@@ -2843,26 +2965,7 @@ async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
 
     async with ctx.typing():
         try:
-            async with httpx.AsyncClient(timeout=120) as ac:
-                r = await ac.post(
-                    ENDPOINT,
-                    headers=HEADERS,
-                    json={
-                        "inputs": prompt,
-                        "options": {"wait_for_model": True},
-                        "parameters": {
-                            "negative_prompt": " ",  #검열 기능 (예 : nsfw, lowres, jpeg artifacts, bad anatomy)
-                            "num_inference_steps": 40,   # XL Base 권장 30~50
-                            "guidance_scale": 7.0,
-                            "width": 1024,
-                            "height": 1024,
-                        },
-                    },
-                )
-            r.raise_for_status()
-            if not r.headers.get("content-type", "").startswith("image"):
-                raise RuntimeError(f"API 오류: {r.text}")
-            img_bytes = r.content
+            img_bytes = await _generate_image_bytes(prompt)
         except Exception as e:
             logging.exception("Image generation failed")
             await ctx.reply(f"⚠️ 이미지 생성 실패: {e}")
@@ -3626,15 +3729,7 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
         preface = ""
     async with ctx.typing():
         try:
-            comp = await asyncio.to_thread(
-                hf.chat.completions.create,
-                model=MODEL,
-                messages=[{"role": "system", "content": SYS_PROMPT},
-                          {"role": "user", "content": prompt}],
-                max_tokens=MAX_TOKENS,
-                temperature=0.3,
-            )
-            answer = preface + keep_last_paragraph(comp.choices[0].message.content)
+            answer = preface + keep_last_paragraph(await _generate_text_response(prompt))
         except Exception as e:
             answer = f"⚠️ 오류: {e}"
     if len(answer) > FILE_TH:
@@ -4248,6 +4343,27 @@ def _intro_view() -> IntroView:
     )
 
 
+async def _moderate_ai_prompt_interaction(interaction, prompt: str) -> bool:
+    """Apply the same prompt policy to buttons and slash-command modals."""
+
+    user = getattr(interaction, "user", None)
+    user_id = getattr(user, "id", 0)
+    channel_id = getattr(getattr(interaction, "channel", None), "id", 0)
+    if LINK_REGEX.search(prompt) and channel_id not in ALLOWED_CHANNELS:
+        if not is_user_exempt_from_profanity(user_id):
+            await _interaction_send(interaction, "⚠️ AI 질문/그림 프롬프트에는 링크를 넣을 수 없습니다.")
+            return False
+        use_profanity_pass(user_id)
+
+    root = find_badroot(prompt)
+    if root and channel_id not in EXEMPT_PROFANITY_CHANNEL_IDS:
+        if not is_user_exempt_from_profanity(user_id):
+            await _interaction_send(interaction, "⚠️ AI 프롬프트를 순화해 주세요.")
+            return False
+        use_profanity_pass(user_id)
+    return True
+
+
 async def _start_interaction_service(interaction):
     await _interaction_send(
         interaction,
@@ -4257,17 +4373,13 @@ async def _start_interaction_service(interaction):
 
 
 async def _question_interaction_service(interaction, prompt: str):
+    if not await _moderate_ai_prompt_interaction(interaction, prompt):
+        _metric("feature_failed")
+        return
     _metric("modal_submitted")
     await _interaction_defer(interaction)
     try:
-        comp = await asyncio.to_thread(
-            hf.chat.completions.create,
-            model=MODEL,
-            messages=[{"role": "system", "content": SYS_PROMPT}, {"role": "user", "content": prompt}],
-            max_tokens=MAX_TOKENS,
-            temperature=0.3,
-        )
-        answer = keep_last_paragraph(comp.choices[0].message.content)
+        answer = keep_last_paragraph(await _generate_text_response(prompt))
         await interaction.followup.send(answer[:MAX_MSG], ephemeral=True)
         _metric("feature_succeeded")
     except Exception:
@@ -4277,19 +4389,14 @@ async def _question_interaction_service(interaction, prompt: str):
 
 
 async def _image_interaction_service(interaction, prompt: str):
+    if not await _moderate_ai_prompt_interaction(interaction, prompt):
+        _metric("feature_failed")
+        return
     _metric("modal_submitted")
     await _interaction_defer(interaction)
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                ENDPOINT,
-                headers=HEADERS,
-                json={"inputs": prompt, "options": {"wait_for_model": True}, "parameters": {"num_inference_steps": 40, "guidance_scale": 7.0, "width": 1024, "height": 1024}},
-            )
-        response.raise_for_status()
-        if not response.headers.get("content-type", "").startswith("image"):
-            raise RuntimeError("image provider returned a non-image response")
-        await interaction.followup.send(file=discord.File(io.BytesIO(response.content), "generated.png"), ephemeral=True)
+        image_bytes = await _generate_image_bytes(prompt)
+        await interaction.followup.send(file=discord.File(io.BytesIO(image_bytes), "generated.png"), ephemeral=True)
         _metric("feature_succeeded")
     except Exception:
         logging.exception("Interaction image generation failed")

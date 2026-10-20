@@ -21,7 +21,9 @@ The state format remains Pickle and the historical filenames remain unchanged. T
 
 ## Secrets and rollout
 
-Configure `DISCORD_TOKEN`, `HF_TOKEN`, `HF_IMG_TOKEN`, and `SPECIAL_ADMIN_USER_ID=855749166764654653` as runtime secrets. Add `SPECIAL_ADMIN_GUILD_IDS` if the special account must be limited to particular guilds.
+Configure `DISCORD_TOKEN` and `SPECIAL_ADMIN_USER_ID=855749166764654653` as runtime secrets. AI Horde is the default free provider: leave `AI_PROVIDER` unset (or set it to `aihorde`) and optionally provide `HORDE_API_KEY`, `HORDE_TEXT_MODEL`, and `HORDE_IMAGE_MODEL`. The anonymous Horde key is used when `HORDE_API_KEY` is empty. The preserved Hugging Face provider is opt-in only: set `AI_PROVIDER=huggingface` and provide both `HF_TOKEN` and `HF_IMG_TOKEN`; an AI provider failure never triggers a paid fallback. Add `SPECIAL_ADMIN_GUILD_IDS` if the special account must be limited to particular guilds.
+
+Rotate any provider token that has appeared in logs, chat, screenshots, or source history before configuring the Northflank secret. Do not copy a real token into `.env.example`, this document, or test fixtures.
 
 For a rollback, stop the candidate service, verify the volume is mounted at the same path, restore the primary Pickle files from the last known-good backup if they were quarantined, and deploy the previous commit. Do not run old and new bot processes concurrently.
 

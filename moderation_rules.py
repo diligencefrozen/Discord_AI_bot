@@ -32,6 +32,11 @@ BAD_ROOTS = frozenset(
     }
 )
 
+# Prefix commands whose free-form argument is sent to an AI provider.  These
+# are checked explicitly because registered prefix commands are dispatched
+# before the normal message moderation path in ``main.py``.
+AI_PROMPT_COMMANDS = frozenset(("ask", "img"))
+
 # Zero-width formatting characters are removed before matching.  The filler
 # set is intentionally small and a maximum gap is enforced; arbitrary junk
 # between every character caused the old pattern to over-match normal prose.
@@ -85,6 +90,52 @@ def parse_command(content: str, prefixes: Sequence[str] = ("!", "/")) -> Optiona
             match = re.match(r"[!/][\w가-힣-]+", value)
             return match.group(0)[1:].casefold() if match else None
     return None
+
+
+def is_ai_prompt_command(
+    content: str,
+    commands: Iterable[str] = AI_PROMPT_COMMANDS,
+    prefixes: Sequence[str] = ("!", "/"),
+) -> bool:
+    """Return whether *content* invokes a free-form AI prompt command.
+
+    The command name is parsed independently from its prompt so callers can
+    apply the same moderation policy to both ``!`` and slash-style prefixes.
+    The default set intentionally contains only the two existing AI commands;
+    other historical commands keep their prior dispatch behavior.
+    """
+
+    command = parse_command(content, prefixes)
+    if command is None:
+        return False
+    known = {str(item).casefold().lstrip("!/") for item in commands}
+    return command in known
+
+
+def extract_command_argument(
+    content: str,
+    commands: Iterable[str] = AI_PROMPT_COMMANDS,
+    prefixes: Sequence[str] = ("!", "/"),
+) -> Optional[str]:
+    """Return the free-form argument of an AI prompt command.
+
+    The parser deliberately returns ``None`` for non-AI commands and for an
+    empty argument.  Keeping this helper pure lets the gateway handler and
+    offline tests apply identical moderation rules before dispatching a
+    prompt to an external provider.
+    """
+
+    value = str(content).lstrip()
+    command = parse_command(value, prefixes)
+    if command is None or command not in {
+        str(item).casefold().lstrip("!/") for item in commands
+    }:
+        return None
+    match = re.match(r"[!/][\w가-힣-]+(?:\s+(.*))?$", value, re.DOTALL)
+    if not match:
+        return None
+    argument = (match.group(1) or "").strip()
+    return argument or None
 
 
 def should_moderate_message(
