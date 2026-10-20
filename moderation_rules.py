@@ -168,3 +168,4 @@ def consume_exemption(
             user_state["rewards_active"].pop(found.key, None)
     return found
 
+\n
