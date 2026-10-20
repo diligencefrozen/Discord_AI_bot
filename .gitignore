@@ -9,3 +9,5 @@ achievements_data.pkl.bak.*
 *.corrupt.*
 typing_cooldowns.json
 typing_cooldowns.tmp
+bot_metrics.json
+bot_metrics.json.tmp

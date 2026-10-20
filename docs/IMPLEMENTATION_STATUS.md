@@ -12,6 +12,7 @@ The repository now contains the first complete incremental implementation of the
 - `main.py`: storage integration, strict moderation matcher, unknown-command moderation path, explicit exemption consumption, persisted typing-reminder cooldowns, four-button typing reminder, asynchronous AI interaction work, slash command sync, and idempotent reconnect tasks.
 - XP awards now avoid counting filtered link/profanity messages and achievement bonus XP no longer consumes the normal message cooldown or creates a second message event.
 - `.env.example`: required secrets and the v6 administrator ID configuration.
+- `bot_metrics.py`: privacy-minimized aggregate UX counters stored in a JSON file, with no prompts, message content, or user IDs.
 - `.python-version` and dependency pins target Python 3.13 and discord.py 2.7.1. The original requests/urllib3, PyNaCl, and Pillow pins were replaced after a fresh-environment import failure or Python 3.13 support review.
 
 ## Verification

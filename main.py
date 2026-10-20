@@ -25,6 +25,7 @@ from typing import Dict, Set, Tuple
 from discord.errors import NotFound, Forbidden, HTTPException
 from dataclasses import dataclass
 from bot_storage import PickleStore
+from bot_metrics import MetricsStore
 from moderation_rules import (
     find_badroot as find_badroot_strict,
     lookup_exemption as lookup_rule_exemption,
@@ -43,6 +44,7 @@ from bot_ui import (
 
 XP_DATA_FILE = "daily_xp_data.pkl"
 XP_STORE = PickleStore(XP_DATA_FILE, max_backups=3, validator=lambda value: isinstance(value, dict))
+METRICS = MetricsStore()
 seoul_tz = timezone("Asia/Seoul")
 
 # 경험치 설정
@@ -1452,6 +1454,7 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
         )
         await channel.send(embed=embed, **payload)
 
+        _metric("intro_viewed")
         _last_typing_notice[scope_key] = now_ts
         _save_typing_cooldowns()
     finally:
@@ -1828,7 +1831,7 @@ def find_badroot(text: str) -> Optional[str]:
     # Keep the legacy function name while using the bounded, Unicode-aware
     # matcher. The original index remains available for compatibility with
     # callers that inspect or rebuild it.
-    return find_badroot_strict(text)
+    return find_badroot_strict(text, BAD_ROOTS)
 
 rebuild_bad_index()
 
@@ -2157,7 +2160,7 @@ async def on_message(message: discord.Message):
     xp_eligible = True
     if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:
         xp_eligible = is_user_exempt_from_profanity(user_id)
-    detected_root = find_badroot_strict(message.content)
+    detected_root = find_badroot(message.content)
     if detected_root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
         xp_eligible = is_user_exempt_from_profanity(user_id)
 
@@ -4166,6 +4169,13 @@ _slash_registered = False
 _runtime_tasks_started = False
 
 
+def _metric(event: str) -> None:
+    try:
+        METRICS.increment(event)
+    except Exception:
+        logging.exception("Metric write failed: %s", event)
+
+
 async def _interaction_send(interaction, content=None, *, ephemeral=True, **kwargs):
     response = getattr(interaction, "response", None)
     is_done = response.is_done() if response and hasattr(response, "is_done") else False
@@ -4214,6 +4224,7 @@ async def _start_interaction_service(interaction):
 
 
 async def _question_interaction_service(interaction, prompt: str):
+    _metric("modal_submitted")
     await _interaction_defer(interaction)
     try:
         comp = await asyncio.to_thread(
@@ -4225,12 +4236,15 @@ async def _question_interaction_service(interaction, prompt: str):
         )
         answer = keep_last_paragraph(comp.choices[0].message.content)
         await interaction.followup.send(answer[:MAX_MSG], ephemeral=True)
+        _metric("feature_succeeded")
     except Exception:
         logging.exception("Interaction question failed")
         await interaction.followup.send("⚠️ 질문 처리 중 오류가 발생했습니다.", ephemeral=True)
+        _metric("feature_failed")
 
 
 async def _image_interaction_service(interaction, prompt: str):
+    _metric("modal_submitted")
     await _interaction_defer(interaction)
     try:
         async with httpx.AsyncClient(timeout=120) as client:
@@ -4243,16 +4257,20 @@ async def _image_interaction_service(interaction, prompt: str):
         if not response.headers.get("content-type", "").startswith("image"):
             raise RuntimeError("image provider returned a non-image response")
         await interaction.followup.send(file=discord.File(io.BytesIO(response.content), "generated.png"), ephemeral=True)
+        _metric("feature_succeeded")
     except Exception:
         logging.exception("Interaction image generation failed")
         await interaction.followup.send("⚠️ 그림 생성 중 오류가 발생했습니다.", ephemeral=True)
+        _metric("feature_failed")
 
 
 async def _growth_interaction_service(interaction):
+    _metric("intro_button_clicked")
     await _interaction_send(interaction, embed=_growth_embed(interaction.user))
 
 
 async def _menu_interaction_service(interaction):
+    _metric("intro_button_clicked")
     await _interaction_send(
         interaction,
         "🧭 기능 메뉴\n`/질문` AI 질문 · `/그림` AI 그림 · `/내정보` 성장 · `!web` 검색 · `!trending` 트렌드 · `!모배갤` 모배 소식",
@@ -4275,7 +4293,7 @@ async def _admin_test_service(interaction, content: str):
     if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
         await _interaction_send(interaction, "⛔ 관리 권한이 없습니다.")
         return
-    detected = find_badroot_strict(content)
+    detected = find_badroot(content)
     result = f"탐지됨: `{detected}`" if detected else "탐지되지 않았습니다."
     await _interaction_send(interaction, result)
 
