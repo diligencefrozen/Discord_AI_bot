@@ -14,3 +14,22 @@
 ## Origin code
 
 <a href="https://github.com/diligencefrozen/discordbot-main">https://github.com/diligencefrozen/discordbot-main</a>
+
+## Local setup
+
+The target runtime is Python 3.13. Copy `.env.example` to `.env`, fill in the
+Discord and Hugging Face tokens, and keep `SPECIAL_ADMIN_USER_ID` set only for
+the confirmed special administrator account. The server owner is always checked
+from the current guild at interaction time.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+The legacy `!` commands remain available. The modern entry points are the four
+buttons on the typing reminder and the `/시작`, `/질문`, `/그림`, `/내정보`, and
+`/관리` slash commands. `daily_xp_data.pkl` and `achievements_data.pkl` remain
+the authoritative user-state files; the storage layer adds backups and atomic
+replacement without introducing a database.

@@ -1,0 +1,11 @@
+.env
+.venv*/
+__pycache__/
+*.py[cod]
+daily_xp_data.pkl
+daily_xp_data.pkl.bak.*
+achievements_data.pkl
+achievements_data.pkl.bak.*
+*.corrupt.*
+typing_cooldowns.json
+typing_cooldowns.tmp

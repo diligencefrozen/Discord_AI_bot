@@ -1,9 +1,9 @@
-# main.py (Python 3.9 호환)
+# main.py (Python 3.13 target)
 
 # ────────────────────────────────────────────────────────────────────────────
 # 기본 모듈,라이브러리 로드
 # ────────────────────────────────────────────────────────────────────────────
-import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json, aiohttp, pickle, h2                       
+import asyncio, io, httpx, discord, random, re, datetime, logging, os, certifi, ssl, itertools, string, time, json, aiohttp, h2
 from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
@@ -24,12 +24,25 @@ from pathlib import Path
 from typing import Dict, Set, Tuple
 from discord.errors import NotFound, Forbidden, HTTPException
 from dataclasses import dataclass
+from bot_storage import PickleStore
+from moderation_rules import (
+    find_badroot as find_badroot_strict,
+    lookup_exemption as lookup_rule_exemption,
+    should_moderate_message,
+)
+from bot_ui import (
+    IntroView,
+    is_admin_authorized,
+    register_slash_commands,
+    typing_intro_payload,
+)
 
 # ────────────────────────────────────────────────────────────────────────────
 # 24시간 경험치 시스템 (Daily XP & Rewards)
 # ────────────────────────────────────────────────────────────────────────────
 
 XP_DATA_FILE = "daily_xp_data.pkl"
+XP_STORE = PickleStore(XP_DATA_FILE, max_backups=3, validator=lambda value: isinstance(value, dict))
 seoul_tz = timezone("Asia/Seoul")
 
 # 경험치 설정
@@ -56,6 +69,9 @@ user_xp_data: Dict[int, dict] = {}
 # ────────────────────────────────────────────────────────────────────────────
 
 ACHIEVEMENTS_FILE = "achievements_data.pkl"
+ACHIEVEMENTS_STORE = PickleStore(
+    ACHIEVEMENTS_FILE, max_backups=3, validator=lambda value: isinstance(value, dict)
+)
 
 # 업적 정의 (24시간 하드리셋 기반)
 ACHIEVEMENTS = {
@@ -248,10 +264,9 @@ def load_achievements_data():
     # 업적 데이터 로드
     global achievements_data
     try:
-        if os.path.exists(ACHIEVEMENTS_FILE):
-            with open(ACHIEVEMENTS_FILE, "rb") as f:
-                achievements_data = pickle.load(f)
-            logging.info(f"업적 데이터 로드 완료: {len(achievements_data)}명")
+        loaded = ACHIEVEMENTS_STORE.load(default={})
+        achievements_data = loaded if isinstance(loaded, dict) else {}
+        logging.info(f"업적 데이터 로드 완료: {len(achievements_data)}명")
     except Exception as e:
         logging.error(f"업적 데이터 로드 실패: {e}")
         achievements_data = {}
@@ -259,8 +274,7 @@ def load_achievements_data():
 def save_achievements_data():
     # 업적 데이터 저장
     try:
-        with open(ACHIEVEMENTS_FILE, "wb") as f:
-            pickle.dump(achievements_data, f)
+        ACHIEVEMENTS_STORE.save(achievements_data)
     except Exception as e:
         logging.error(f"업적 데이터 저장 실패: {e}")
 
@@ -405,7 +419,7 @@ def check_achievements(user_id: int, event_type: str = None, **kwargs) -> List[s
             # 업적 달성 시 보너스 XP 지급
             bonus_xp = ach.get("reward_xp", 0)
             if bonus_xp > 0:
-                add_xp(user_id, bonus_xp)
+                add_xp(user_id, bonus_xp, record_message=False)
             
             # 업적 보상 효과 적용
             reward_effect = ach.get("reward_effect")
@@ -482,10 +496,9 @@ def load_xp_data():
     # 경험치 데이터 로드
     global user_xp_data
     try:
-        if os.path.exists(XP_DATA_FILE):
-            with open(XP_DATA_FILE, "rb") as f:
-                user_xp_data = pickle.load(f)
-            logging.info(f"XP 데이터 로드 완료: {len(user_xp_data)}명")
+        loaded = XP_STORE.load(default={})
+        user_xp_data = loaded if isinstance(loaded, dict) else {}
+        logging.info(f"XP 데이터 로드 완료: {len(user_xp_data)}명")
     except Exception as e:
         logging.error(f"XP 데이터 로드 실패: {e}")
         user_xp_data = {}
@@ -493,8 +506,7 @@ def load_xp_data():
 def save_xp_data():
     # 경험치 데이터 저장
     try:
-        with open(XP_DATA_FILE, "wb") as f:
-            pickle.dump(user_xp_data, f)
+        XP_STORE.save(user_xp_data)
     except Exception as e:
         logging.error(f"XP 데이터 저장 실패: {e}")
 
@@ -539,7 +551,7 @@ def reset_daily_xp():
         }
     save_achievements_data()
 
-def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int, list]:
+def add_xp(user_id: int, amount: int = None, *, record_message: bool = True) -> tuple[int, bool, int, list]:
     # 경험치 추가
     # Returns: (현재 xp, 레벨업 여부, 새 티어 인덱스 or None, 새로 달성한 업적 리스트)
     
@@ -573,7 +585,7 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int, list]:
         data["rewards_active"] = {}
     
     # 쿨다운 체크
-    if now - data["last_msg"] < XP_CONFIG["msg_cooldown"]:
+    if record_message and now - data["last_msg"] < XP_CONFIG["msg_cooldown"]:
         return data["xp"], False, None, []
     
     # 이전 XP
@@ -581,7 +593,8 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int, list]:
     
     # XP 추가
     data["xp"] += amount
-    data["last_msg"] = now
+    if record_message:
+        data["last_msg"] = now
     
     # 새 티어 도달 체크 및 VIP Winner 플래그
     leveled_up = False
@@ -613,8 +626,10 @@ def add_xp(user_id: int, amount: int = None) -> tuple[int, bool, int, list]:
     if new_tier_idx is not None:
         new_achievements.extend(check_achievements(user_id, "tier_reached", tier_idx=new_tier_idx))
     
-    # 업적: 메시지 전송
-    new_achievements.extend(check_achievements(user_id, "message"))
+    # Count a real message once. Achievement XP bonuses do not consume the
+    # message cooldown or create a second message event.
+    if record_message:
+        new_achievements.extend(check_achievements(user_id, "message"))
 
     save_xp_data()
     return data["xp"], leveled_up, new_tier_idx, new_achievements
@@ -677,128 +692,66 @@ def claim_reward(user_id: int, tier_idx: int) -> bool:
     save_xp_data()
     return True
 
-def is_user_exempt_from_spam(user_id: int) -> bool:
-    # 도배 방지 면제 체크 (티어 보상 + 업적 보상)
+def _legacy_exemption_state(user_id: int) -> dict:
+    """Expose legacy reward entries to the pure exemption policy."""
     data = get_user_xp(user_id)
-    now = time.time()
-    rewards = data.get("rewards_active", {})
-    
-    # 전설 체험 중인지 확인
-    trial = rewards.get("trial")
-    if trial and trial.get("expires_at", 0) > now:
-        return True
-    
-    # 티어 보상: antispam 효과
-    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
-        effect = tier.get("effect", {})
-        if effect.get("type") == "antispam":
-            reward = rewards.get(str(tier_idx))
-            if reward and reward.get("expires_at", 0) > now:
-                return True
-    
-    # 티어 보상: all 효과 (전체 면제)
-    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
-        effect = tier.get("effect", {})
-        if effect.get("type") == "all":
-            reward = rewards.get(str(tier_idx))
-            if reward and reward.get("expires_at", 0) > now:
-                return True
-    
-    # 업적 보상: antispam 면제 횟수
-    ach_antispam = rewards.get("achievement_antispam")
-    if ach_antispam and ach_antispam.get("count", 0) > 0:
-        # 횟수 차감
-        ach_antispam["count"] -= 1
-        if ach_antispam["count"] <= 0:
-            del rewards["achievement_antispam"]
+    rewards = data.get("rewards_active", {}) or {}
+    adapted = {}
+    for key, entry in rewards.items():
+        if not isinstance(entry, dict):
+            continue
+        copy = dict(entry)
+        if "type" not in copy and str(key).isdigit():
+            try:
+                copy["type"] = XP_CONFIG["reward_tiers"][int(key)].get("effect", {}).get("type")
+            except (IndexError, TypeError, ValueError):
+                pass
+        adapted[str(key)] = copy
+    return {"rewards_active": adapted}
+
+
+def _lookup_legacy_exemption(user_id: int, kind: str):
+    return lookup_rule_exemption(_legacy_exemption_state(user_id), kind)
+
+
+def _consume_legacy_exemption(user_id: int, kind: str) -> bool:
+    data = user_xp_data.get(user_id)
+    if not isinstance(data, dict):
+        return False
+    found = _lookup_legacy_exemption(user_id, kind)
+    if found is None:
+        return False
+    entry = data.setdefault("rewards_active", {}).get(found.key)
+    if isinstance(entry, dict) and "count" in entry:
+        entry["count"] = int(entry.get("count", 0)) - 1
+        if entry["count"] <= 0:
+            data["rewards_active"].pop(found.key, None)
         save_xp_data()
-        return True
-    
-    # 업적 보상: all 효과 (전체 면제)
-    ach_all = rewards.get("achievement_all")
-    if ach_all and ach_all.get("expires_at", 0) > now:
-        return True
-    
-    return False
+    return True
+
+
+def is_user_exempt_from_spam(user_id: int) -> bool:
+    return _lookup_legacy_exemption(user_id, "antispam") is not None
+
+
+def use_spam_pass(user_id: int) -> bool:
+    return _consume_legacy_exemption(user_id, "antispam")
+
 
 def is_user_exempt_from_media(user_id: int) -> bool:
-    # 이미지 제한 면제 체크 (영구 제한 사용자는 제외)
-    # 영구 제한 사용자는 면제 불가
+    # Permanent media restrictions remain in force.
     if user_id in BLOCK_MEDIA_USER_IDS:
         return False
-    data = get_user_xp(user_id)
-    now = time.time()
-    rewards = data.get("rewards_active", {})
-    # Check for active media effect
-    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
-        effect = tier.get("effect", {})
-        if effect.get("type") == "media":
-            reward = rewards.get(str(tier_idx))
-            if reward and reward.get("expires_at", 0) > now:
-                return True
-    # Also check for all-type effect (full exemption)
-    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
-        effect = tier.get("effect", {})
-        if effect.get("type") == "all":
-            reward = rewards.get(str(tier_idx))
-            if reward and reward.get("expires_at", 0) > now:
-                return True
-    return False
+    return _lookup_legacy_exemption(user_id, "media") is not None
+
 
 def is_user_exempt_from_profanity(user_id: int) -> bool:
-    # 금칙어 필터 면제 체크 (티어 보상 + 업적 보상)
-    data = get_user_xp(user_id)
-    now = time.time()
-    rewards = data.get("rewards_active", {})
-    
-    # 전설 체험 중인지 확인
-    trial = rewards.get("trial")
-    if trial and trial.get("expires_at", 0) > now:
-        return True
-    
-    # 티어 보상: profanity 효과 (횟수 기반)
-    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
-        effect = tier.get("effect", {})
-        if effect.get("type") == "profanity":
-            reward = rewards.get(str(tier_idx))
-            if reward and reward.get("count", 0) > 0:
-                # 횟수 차감
-                reward["count"] -= 1
-                if reward["count"] <= 0:
-                    del rewards[str(tier_idx)]
-                save_xp_data()
-                return True
-    
-    # 티어 보상: all 효과 (전체 면제)
-    for tier_idx, tier in enumerate(XP_CONFIG["reward_tiers"]):
-        effect = tier.get("effect", {})
-        if effect.get("type") == "all":
-            reward = rewards.get(str(tier_idx))
-            if reward and reward.get("expires_at", 0) > now:
-                return True
-    
-    # 업적 보상: profanity 면제 횟수
-    ach_profanity = rewards.get("achievement_profanity")
-    if ach_profanity and ach_profanity.get("count", 0) > 0:
-        # 횟수 차감
-        ach_profanity["count"] -= 1
-        if ach_profanity["count"] <= 0:
-            del rewards["achievement_profanity"]
-        save_xp_data()
-        return True
-    
-    # 업적 보상: all 효과 (전체 면제)
-    ach_all = rewards.get("achievement_all")
-    if ach_all and ach_all.get("expires_at", 0) > now:
-        return True
-    
-    return False
+    return _lookup_legacy_exemption(user_id, "profanity") is not None
+
 
 def use_profanity_pass(user_id: int):
-    # 금칙어 면제권 사용
-    if user_id in user_xp_data:
-        user_xp_data[user_id]["profanity_used"] = True
-        save_xp_data()
+    # Explicitly consume a counted pass only after a moderation decision.
+    _consume_legacy_exemption(user_id, "profanity")
 
 # 금칙어 검열 기능의 버그를 해결하기 위한 임기응변 
 async def safe_delete(message: discord.Message):
@@ -1439,46 +1392,68 @@ UserT    = Union[discord.Member, discord.User]
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
 # 12시간 쿨다운과 마지막 안내 시각(UTC timestamp) 저장용
-TYPE_REMINDER_COOLDOWN = 60 * 60 * 12  # 12 hours
-_last_typing_notice: Dict[int, float] = {}
+TYPE_REMINDER_COOLDOWN = 60 * 60 * 12
+TYPE_REMINDER_COOLDOWN_FILE = Path("typing_cooldowns.json")
+
+def _load_typing_cooldowns() -> Dict[str, float]:
+    try:
+        raw = json.loads(TYPE_REMINDER_COOLDOWN_FILE.read_text(encoding="utf-8"))
+        return {str(key): float(value) for key, value in raw.items()}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_typing_cooldowns() -> None:
+    temp = TYPE_REMINDER_COOLDOWN_FILE.with_suffix(".tmp")
+    try:
+        temp.write_text(json.dumps(_last_typing_notice), encoding="utf-8")
+        os.replace(temp, TYPE_REMINDER_COOLDOWN_FILE)
+    except OSError:
+        logging.exception("Could not persist typing reminder cooldowns")
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_last_typing_notice: Dict[str, float] = _load_typing_cooldowns()
+
+def _typing_scope_key(channel: ChannelT, user: UserT) -> str:
+    guild = getattr(channel, "guild", None)
+    guild_id = getattr(guild, "id", 0)
+    return f"{guild_id}:{channel.id}:{user.id}"
+
 
 async def _send_typing_reminder(channel: ChannelT, user: UserT,
                                 key: tuple[int, int], started_at: float):
-
+    scope_key = _typing_scope_key(channel, user)
     try:
-        # 시작하자마자 쿨다운 체크(이미 최근에 보냈으면 즉시 종료)
         now_ts = time.time()
-        last_ts = _last_typing_notice.get(user.id)
+        last_ts = _last_typing_notice.get(scope_key)
         if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
             return
 
         await asyncio.sleep(5)
 
-        # 최근 5 초 사이에 해당 사용자가 메시지를 올렸으면 안내 건너뜀
-        async for msg in channel.history(limit=1,
-                                         after=datetime.datetime.fromtimestamp(started_at)):
+        async for msg in channel.history(limit=1, after=datetime.datetime.fromtimestamp(started_at)):
             if msg.author.id == user.id:
                 return
 
-        # 전송 직전 한 번 더 쿨다운 체크(경쟁 상태 방지)
         now_ts = time.time()
-        last_ts = _last_typing_notice.get(user.id)
+        last_ts = _last_typing_notice.get(scope_key)
         if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
             return
 
-        await channel.send(
-            embed=discord.Embed(
-                description=(
-                    f"⌨️  **{user.mention}** 님, 글을 쓰던 중이셨군요!\n\n"
-                    f"**👉 `!ask`** 로 궁금한 점을 바로 물어보세요! 💡"
-                ),
-                color=0x00E5FF,
-            )
+        payload = typing_intro_payload(user)
+        payload["view"] = _intro_view()
+        embed = discord.Embed(
+            description=payload.pop("embed_description"),
+            color=0x00E5FF,
         )
+        await channel.send(embed=embed, **payload)
 
-        # 실제로 전송했으면 마지막 안내 시각 갱신
-        _last_typing_notice[user.id] = now_ts
-
+        _last_typing_notice[scope_key] = now_ts
+        _save_typing_cooldowns()
     finally:
         _typing_tasks.pop(key, None)
 
@@ -1833,6 +1808,7 @@ FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
 BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD_ROOTS]
 
 BANNED_INDEX = []     
+EXEMPT_PROFANITY_CHANNEL_IDS = set()
 
 def rebuild_bad_index(words: Optional[set] = None) -> None:
 
@@ -1849,11 +1825,10 @@ def rebuild_bad_index(words: Optional[set] = None) -> None:
     BANNED_PATTERNS = [p for _, p in idx]  # (기존 for p in BANNED_PATTERNS: 루프 호환용)
 
 def find_badroot(text: str) -> Optional[str]:
-
-    for root, pat in BANNED_INDEX:
-        if pat.search(text):
-            return root
-    return None
+    # Keep the legacy function name while using the bounded, Unicode-aware
+    # matcher. The original index remains available for compatibility with
+    # callers that inspect or rebuild it.
+    return find_badroot_strict(text)
 
 rebuild_bad_index()
 
@@ -2139,12 +2114,12 @@ GAME_CARDS: dict[str, dict] = {
 # ────────── 메인 on_message ──────────
 @bot.event
 async def on_typing(channel: ChannelT, user: UserT, when):
-    if user.bot or not isinstance(channel, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+    if user.bot or not isinstance(channel, (discord.TextChannel, discord.Thread)):
         return
 
     # 쿨다운 중이면 태스크 자체를 만들지 않음 (불필요한 작업 방지)
     now_ts = time.time()
-    last_ts = _last_typing_notice.get(user.id)
+    last_ts = _last_typing_notice.get(_typing_scope_key(channel, user))
     if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
         return
 
@@ -2161,20 +2136,33 @@ async def on_typing(channel: ChannelT, user: UserT, when):
 @bot.event
 async def on_message(message: discord.Message):
     # 1 자기 자신 무시
-    if message.author.id == bot.user.id:
+    if bot.user is not None and message.author.id == bot.user.id:
         return
 
     guild_id = message.guild.id if message.guild else 0
     ch_id    = message.channel.id
     user_id  = message.author.id
 
-    # (중요) 명령어가 있으면 우선 처리하고 나머지 로직은 실행하지 않음
+    # Registered prefix commands keep their historical behavior. Unknown or
+    # malformed prefixed text must continue through moderation so command
+    # syntax cannot bypass the filter.
     if message.content.startswith(('!', '/')):
-        await bot.process_commands(message)
-        return
+        if not should_moderate_message(message.content, bot.all_commands):
+            await bot.process_commands(message)
+            return
+
+    # Do not award XP to messages that will be removed by the link/profanity
+    # filters. The exemption lookup is read-only; consumption happens only in
+    # the later moderation branch after the message is accepted.
+    xp_eligible = True
+    if LINK_REGEX.search(message.content) and message.channel.id not in ALLOWED_CHANNELS:
+        xp_eligible = is_user_exempt_from_profanity(user_id)
+    detected_root = find_badroot_strict(message.content)
+    if detected_root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
+        xp_eligible = is_user_exempt_from_profanity(user_id)
 
     # ───── 경험치 획득 (봇이 아닌 경우만) ─────
-    if not message.author.bot:
+    if not message.author.bot and xp_eligible:
         xp, leveled_up, new_tier_idx, new_achievements = add_xp(user_id)
         
         # 업적 달성 알림 (상세 보상 정보 포함)
@@ -2462,8 +2450,13 @@ async def on_message(message: discord.Message):
             log_ex("mention/reply", e)
     
     # ───── Anti-Spam 선처리 (점진적 제한 시스템 + 경험치 면제) ─────
-    if SPAM_ENABLED and not _is_exempt(message.author, message.channel) and not is_user_exempt_from_spam(user_id):
-        reason = check_spam_and_reason(message)
+    if SPAM_ENABLED and not _is_exempt(message.author, message.channel):
+        spam_pass = is_user_exempt_from_spam(user_id)
+        if spam_pass:
+            use_spam_pass(user_id)
+            reason = None
+        else:
+            reason = check_spam_and_reason(message)
         if reason:
             uid = message.author.id
             
@@ -2631,6 +2624,7 @@ async def on_message(message: discord.Message):
             return
         else:
             # 면제권 있음 - 링크 허용 (간단한 알림)
+            use_profanity_pass(user_id)
             await message.add_reaction("🔗")  # 링크 이모지 반응
             await message.channel.send(
                 f"✨ {message.author.mention} 님의 링크 검열 면제권이 사용되었습니다!",
@@ -2639,7 +2633,6 @@ async def on_message(message: discord.Message):
             logging.info(f"[LINK_EXEMPT] {message.author} (ID:{user_id}) - 링크 검열 면제권으로 링크 허용")
 
     # 4) 금칙어 
-    EXEMPT_PROFANITY_CHANNEL_IDS = set()  
     root = find_badroot(message.content)
     if root and message.channel.id not in EXEMPT_PROFANITY_CHANNEL_IDS:
         # 금칙어 면제권 체크
@@ -2917,7 +2910,7 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
     
     # 주말 보너스 표시
     if is_weekend():
-        footer_text = "🎊 주말 보너스! 메시지당 35 XP | 5초 쿨다운"
+        footer_text = f"🎊 주말 보너스! 메시지당 {XP_CONFIG['msg_xp_weekend']} XP | 5초 쿨다운"
     else:
         footer_text = "메시지당 25 XP | 5초 쿨다운 | 자정 리셋"
     
@@ -3598,7 +3591,8 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
         preface = ""
     async with ctx.typing():
         try:
-            comp = hf.chat.completions.create(
+            comp = await asyncio.to_thread(
+                hf.chat.completions.create,
                 model=MODEL,
                 messages=[{"role": "system", "content": SYS_PROMPT},
                           {"role": "user", "content": prompt}],
@@ -4167,13 +4161,162 @@ async def pubg_mobile_gallery(ctx):
         await loading_msg.edit(content=f"⚠️ 오류가 발생했어요: {str(e)}")
         logging.error(f"모배갤 명령어 오류: {e}")
 
+# ────────── 버튼/슬래시 서비스 어댑터 ──────────
+_slash_registered = False
+_runtime_tasks_started = False
+
+
+async def _interaction_send(interaction, content=None, *, ephemeral=True, **kwargs):
+    response = getattr(interaction, "response", None)
+    is_done = response.is_done() if response and hasattr(response, "is_done") else False
+    if is_done:
+        return await interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
+    return await response.send_message(content, ephemeral=ephemeral, **kwargs)
+
+
+async def _interaction_defer(interaction, *, ephemeral=True):
+    response = getattr(interaction, "response", None)
+    if response and hasattr(response, "is_done") and not response.is_done():
+        await response.defer(ephemeral=ephemeral, thinking=True)
+
+
+def _growth_embed(user) -> discord.Embed:
+    data = get_user_xp(user.id)
+    xp = data.get("xp", 0)
+    current = next((tier for tier in reversed(XP_CONFIG["reward_tiers"]) if xp >= tier["xp"]), None)
+    next_tier = next((tier for tier in XP_CONFIG["reward_tiers"] if xp < tier["xp"]), None)
+    detail = f"다음 목표: {next_tier['name']} ({next_tier['xp'] - xp} XP)" if next_tier else "최고 등급을 달성했습니다."
+    embed = discord.Embed(
+        title=f"🏆 {getattr(user, 'display_name', '사용자')}님의 성장",
+        description=f"현재 XP: **{xp}**\n등급: **{current['name'] if current else '🥚 알'}**\n{detail}",
+        color=0x00E5FF,
+    )
+    progress = get_achievement_progress(user.id)
+    embed.add_field(name="업적", value=progress, inline=False)
+    return embed
+
+
+def _intro_view() -> IntroView:
+    return IntroView(
+        question_service=_question_interaction_service,
+        image_service=_image_interaction_service,
+        growth_service=_growth_interaction_service,
+        menu_service=_menu_interaction_service,
+    )
+
+
+async def _start_interaction_service(interaction):
+    await _interaction_send(
+        interaction,
+        "💡 아래 버튼에서 원하는 기능을 바로 선택하세요.",
+        view=_intro_view(),
+    )
+
+
+async def _question_interaction_service(interaction, prompt: str):
+    await _interaction_defer(interaction)
+    try:
+        comp = await asyncio.to_thread(
+            hf.chat.completions.create,
+            model=MODEL,
+            messages=[{"role": "system", "content": SYS_PROMPT}, {"role": "user", "content": prompt}],
+            max_tokens=MAX_TOKENS,
+            temperature=0.3,
+        )
+        answer = keep_last_paragraph(comp.choices[0].message.content)
+        await interaction.followup.send(answer[:MAX_MSG], ephemeral=True)
+    except Exception:
+        logging.exception("Interaction question failed")
+        await interaction.followup.send("⚠️ 질문 처리 중 오류가 발생했습니다.", ephemeral=True)
+
+
+async def _image_interaction_service(interaction, prompt: str):
+    await _interaction_defer(interaction)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                ENDPOINT,
+                headers=HEADERS,
+                json={"inputs": prompt, "options": {"wait_for_model": True}, "parameters": {"num_inference_steps": 40, "guidance_scale": 7.0, "width": 1024, "height": 1024}},
+            )
+        response.raise_for_status()
+        if not response.headers.get("content-type", "").startswith("image"):
+            raise RuntimeError("image provider returned a non-image response")
+        await interaction.followup.send(file=discord.File(io.BytesIO(response.content), "generated.png"), ephemeral=True)
+    except Exception:
+        logging.exception("Interaction image generation failed")
+        await interaction.followup.send("⚠️ 그림 생성 중 오류가 발생했습니다.", ephemeral=True)
+
+
+async def _growth_interaction_service(interaction):
+    await _interaction_send(interaction, embed=_growth_embed(interaction.user))
+
+
+async def _menu_interaction_service(interaction):
+    await _interaction_send(
+        interaction,
+        "🧭 기능 메뉴\n`/질문` AI 질문 · `/그림` AI 그림 · `/내정보` 성장 · `!web` 검색 · `!trending` 트렌드 · `!모배갤` 모배 소식",
+    )
+
+
+async def _admin_action_service(interaction, action_id):
+    if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
+        await _interaction_send(interaction, "⛔ 관리 권한이 없습니다.")
+        return
+    messages = {
+        "admin:rules": f"현재 금칙어 규칙 {len(BAD_ROOTS)}개가 활성화되어 있습니다.",
+        "admin:logs": "관리 로그는 민감한 원문을 저장하지 않는 운영 로그만 사용합니다.",
+        "admin:settings": "운영 설정은 환경변수와 기존 Pickle 파일 정책을 따릅니다.",
+    }
+    await _interaction_send(interaction, messages.get(action_id, "관리 작업을 선택해 주세요."))
+
+
+async def _admin_test_service(interaction, content: str):
+    if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
+        await _interaction_send(interaction, "⛔ 관리 권한이 없습니다.")
+        return
+    detected = find_badroot_strict(content)
+    result = f"탐지됨: `{detected}`" if detected else "탐지되지 않았습니다."
+    await _interaction_send(interaction, result)
+
+
+async def _register_slash_commands_once():
+    global _slash_registered
+    if _slash_registered:
+        return
+    register_slash_commands(
+        bot,
+        start_service=_start_interaction_service,
+        question_service=_question_interaction_service,
+        image_service=_image_interaction_service,
+        growth_service=_growth_interaction_service,
+        admin_service=_admin_action_service,
+        admin_test_service=_admin_test_service,
+    )
+    _slash_registered = True
+    try:
+        synced = await bot.tree.sync()
+        logging.info("Synced %d slash commands", len(synced))
+    except Exception:
+        logging.exception("Slash command sync failed")
+
+
 # ────────── 봇 상태 ──────────
 @bot.event
 async def on_ready():
-    # 경험치 데이터 로드
-    load_xp_data()
-    # 업적 데이터 로드
-    load_achievements_data()
+    global _runtime_tasks_started
+    await _register_slash_commands_once()
+    # Load persisted state once; reconnects must not overwrite in-memory writes.
+    if not _runtime_tasks_started:
+        load_xp_data()
+        load_achievements_data()
+    else:
+        logging.info("Reconnected without reloading in-memory state")
+
+    if _runtime_tasks_started:
+        logging.info(f"Logged in as {bot.user} (reconnected)")
+        return
+    _runtime_tasks_started = True
     
     # 자정 리셋 태스크
     async def daily_reset_task():
@@ -4191,7 +4334,7 @@ async def on_ready():
             reset_daily_xp()
             logging.info("일일 경험치 리셋 완료!")
     
-    bot.loop.create_task(daily_reset_task())
+    asyncio.create_task(daily_reset_task())
     
     # 상태 메시지 로테이션
     presences = cycle([
@@ -4214,7 +4357,7 @@ async def on_ready():
             msg = next(presences)
             await bot.change_presence(activity=discord.Game(msg))
             await asyncio.sleep(30)   # 30초 간격
-    bot.loop.create_task(rotate())
+    asyncio.create_task(rotate())
 
     logging.info(f"Logged in as {bot.user} (ID {bot.user.id})")
     logging.info(f"경험치 시스템 활성화 - {len(user_xp_data)}명 데이터 로드됨")
@@ -4223,6 +4366,7 @@ async def on_ready():
 @bot.event
 async def on_disconnect():
     save_xp_data()
+    save_achievements_data()
     logging.info("경험치 데이터 저장 완료")
 
 # ────────── 실행 ──────────
@@ -4235,3 +4379,4 @@ if __name__ == "__main__":
         logging.info("경험치 데이터 저장 완료")
     finally:
         save_xp_data()
+        save_achievements_data()
