@@ -39,6 +39,7 @@ from moderation_rules import (
     should_moderate_message,
 )
 from bot_ui import (
+    FeatureMenuView,
     IntroView,
     is_admin_authorized,
     register_slash_commands,
@@ -1475,6 +1476,7 @@ _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
 # 12시간 쿨다운과 마지막 안내 시각(UTC timestamp) 저장용
 TYPE_REMINDER_COOLDOWN = 60 * 60 * 12
+TYPE_REMINDER_CHANNEL_COOLDOWN = 60
 TYPE_REMINDER_COOLDOWN_FILE = _state_path("typing_cooldowns.json")
 
 def _load_typing_cooldowns() -> Dict[str, float]:
@@ -1499,6 +1501,8 @@ def _save_typing_cooldowns() -> None:
 
 
 _last_typing_notice: Dict[str, float] = _load_typing_cooldowns()
+_last_typing_channel_notice: Dict[int, float] = {}
+_typing_notice_send_lock = asyncio.Lock()
 
 def _typing_scope_key(channel: ChannelT, user: UserT) -> str:
     guild = getattr(channel, "guild", None)
@@ -1521,22 +1525,22 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
             if msg.author.id == user.id:
                 return
 
-        now_ts = time.time()
-        last_ts = _last_typing_notice.get(scope_key)
-        if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
-            return
-
         payload = typing_intro_payload(user)
         payload["view"] = _intro_view()
-        embed = discord.Embed(
-            description=payload.pop("embed_description"),
-            color=0x00E5FF,
-        )
-        await channel.send(embed=embed, **payload)
+        async with _typing_notice_send_lock:
+            now_ts = time.time()
+            last_ts = _last_typing_notice.get(scope_key)
+            if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
+                return
+            channel_last_ts = _last_typing_channel_notice.get(channel.id)
+            if channel_last_ts is not None and (now_ts - channel_last_ts) < TYPE_REMINDER_CHANNEL_COOLDOWN:
+                return
+            await channel.send(**payload)
 
-        _metric("intro_viewed")
-        _last_typing_notice[scope_key] = now_ts
-        _save_typing_cooldowns()
+            _metric("intro_viewed")
+            _last_typing_notice[scope_key] = now_ts
+            _last_typing_channel_notice[channel.id] = now_ts
+            _save_typing_cooldowns()
     finally:
         _typing_tasks.pop(key, None)
 
@@ -1594,6 +1598,10 @@ def charge(tokens):
         
 # ────────── 로깅 ──────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(message)s")
+if not (os.getenv("SPECIAL_ADMIN_USER_ID") or "").strip():
+    logging.warning(
+        "SPECIAL_ADMIN_USER_ID is not configured; administrator access is owner-only"
+    )
 
 # ────────── 토큰 예산 ──────────
 TOKEN_BUDGET = 50_000
@@ -1984,6 +1992,30 @@ SYS_PROMPT = (
 # deployment does not need to configure or pay for a Hugging Face provider.
 hf = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN) if HF_TOKEN else None
 
+AI_IMAGE_FAILURE_MESSAGE = "무료 이미지 서버가 혼잡해요. 잠시 뒤 다시 시도해 주세요."
+try:
+    _image_concurrency_limit = max(1, int(os.getenv("IMAGE_CONCURRENCY_LIMIT", "2")))
+except (TypeError, ValueError):
+    _image_concurrency_limit = 2
+try:
+    IMAGE_REQUEST_COOLDOWN = max(1.0, float(os.getenv("IMAGE_REQUEST_COOLDOWN", "20")))
+except (TypeError, ValueError):
+    IMAGE_REQUEST_COOLDOWN = 20.0
+_image_generation_semaphore = asyncio.Semaphore(_image_concurrency_limit)
+_image_request_lock = asyncio.Lock()
+_last_image_request: Dict[int, float] = {}
+
+
+async def _reserve_image_request(requester_id: Optional[int]) -> None:
+    if requester_id is None:
+        return
+    now = time.monotonic()
+    async with _image_request_lock:
+        previous = _last_image_request.get(requester_id)
+        if previous is not None and now - previous < IMAGE_REQUEST_COOLDOWN:
+            raise AIProviderError("image request cooldown")
+        _last_image_request[requester_id] = now
+
 
 async def _generate_text_response(prompt: str) -> str:
     """Generate text through the selected provider without implicit fallback."""
@@ -2008,33 +2040,35 @@ async def _generate_text_response(prompt: str) -> str:
     return result.choices[0].message.content
 
 
-async def _generate_image_bytes(prompt: str) -> bytes:
+async def _generate_image_bytes(prompt: str, *, requester_id: Optional[int] = None) -> bytes:
     """Generate image bytes through the selected provider without fallback."""
 
-    if AI_PROVIDER == "aihorde":
-        return await generate_horde_image(prompt, config=HORDE_CONFIG)
-    if not HF_IMG_TOKEN:
-        raise AIProviderError("HF_IMG_TOKEN is required when AI_PROVIDER=huggingface")
-    async with httpx.AsyncClient(timeout=120) as ac:
-        response = await ac.post(
-            ENDPOINT,
-            headers=HEADERS,
-            json={
-                "inputs": prompt,
-                "options": {"wait_for_model": True},
-                "parameters": {
-                    "negative_prompt": " ",
-                    "num_inference_steps": 40,
-                    "guidance_scale": 7.0,
-                    "width": 1024,
-                    "height": 1024,
+    await _reserve_image_request(requester_id)
+    async with _image_generation_semaphore:
+        if AI_PROVIDER == "aihorde":
+            return await generate_horde_image(prompt, config=HORDE_CONFIG)
+        if not HF_IMG_TOKEN:
+            raise AIProviderError("HF_IMG_TOKEN is required when AI_PROVIDER=huggingface")
+        async with httpx.AsyncClient(timeout=120) as ac:
+            response = await ac.post(
+                ENDPOINT,
+                headers=HEADERS,
+                json={
+                    "inputs": prompt,
+                    "options": {"wait_for_model": True},
+                    "parameters": {
+                        "negative_prompt": " ",
+                        "num_inference_steps": 40,
+                        "guidance_scale": 7.0,
+                        "width": 512,
+                        "height": 512,
+                    },
                 },
-            },
-        )
-    response.raise_for_status()
-    if not response.headers.get("content-type", "").startswith("image"):
-        raise AIProviderError(f"Image provider returned a non-image response: {response.text[:300]}")
-    return response.content
+            )
+        response.raise_for_status()
+        if not response.headers.get("content-type", "").startswith("image"):
+            raise AIProviderError("Hugging Face returned a non-image response")
+        return response.content
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2965,10 +2999,10 @@ async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
 
     async with ctx.typing():
         try:
-            img_bytes = await _generate_image_bytes(prompt)
-        except Exception as e:
+            img_bytes = await _generate_image_bytes(prompt, requester_id=ctx.author.id)
+        except Exception:
             logging.exception("Image generation failed")
-            await ctx.reply(f"⚠️ 이미지 생성 실패: {e}")
+            await ctx.reply(AI_IMAGE_FAILURE_MESSAGE)
             return
 
     await ctx.reply(file=discord.File(io.BytesIO(img_bytes), "generated.png"))
@@ -3730,8 +3764,9 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
     async with ctx.typing():
         try:
             answer = preface + keep_last_paragraph(await _generate_text_response(prompt))
-        except Exception as e:
-            answer = f"⚠️ 오류: {e}"
+        except Exception:
+            logging.exception("Prefix question failed")
+            answer = "⚠️ 질문 처리 중 문제가 발생했어요. 잠시 뒤 다시 시도해 주세요."
     if len(answer) > FILE_TH:
         await ctx.reply(
             "📄 답변이 길어 파일로 첨부했어요!",
@@ -4295,6 +4330,7 @@ async def pubg_mobile_gallery(ctx):
 _slash_registered = False
 _slash_registration_state = SlashCommandRegistrationState()
 _runtime_tasks_started = False
+_intro_view_registered = False
 
 
 def _metric(event: str) -> None:
@@ -4395,12 +4431,32 @@ async def _image_interaction_service(interaction, prompt: str):
     _metric("modal_submitted")
     await _interaction_defer(interaction)
     try:
-        image_bytes = await _generate_image_bytes(prompt)
-        await interaction.followup.send(file=discord.File(io.BytesIO(image_bytes), "generated.png"), ephemeral=True)
+        requester = getattr(interaction, "user", None)
+        requester_id = getattr(requester, "id", None)
+        image_bytes = await _generate_image_bytes(prompt, requester_id=requester_id)
+        channel = getattr(interaction, "channel", None)
+        if channel is None or not hasattr(channel, "send"):
+            raise AIProviderError("image result channel unavailable")
+        mention = getattr(requester, "mention", "요청자")
+        await channel.send(
+            content=f"🎨 {mention}님이 만든 그림이에요.",
+            file=discord.File(io.BytesIO(image_bytes), "generated.png"),
+            allowed_mentions=discord.AllowedMentions(
+                users=[requester] if requester is not None else [],
+                everyone=False,
+                roles=False,
+            ),
+        )
+        try:
+            await interaction.followup.send("✅ 그림을 채널에 올렸어요.", ephemeral=True)
+        except Exception:
+            # The public result is already delivered; do not claim generation
+            # failed or retry the upload if only the private acknowledgement fails.
+            logging.warning("Image completion acknowledgement failed", exc_info=True)
         _metric("feature_succeeded")
     except Exception:
         logging.exception("Interaction image generation failed")
-        await interaction.followup.send("⚠️ 그림 생성 중 오류가 발생했습니다.", ephemeral=True)
+        await interaction.followup.send(AI_IMAGE_FAILURE_MESSAGE, ephemeral=True)
         _metric("feature_failed")
 
 
@@ -4413,7 +4469,12 @@ async def _menu_interaction_service(interaction):
     _metric("intro_button_clicked")
     await _interaction_send(
         interaction,
-        "🧭 기능 메뉴\n`/질문` AI 질문 · `/그림` AI 그림 · `/내정보` 성장 · `!web` 검색 · `!trending` 트렌드 · `!모배갤` 모배 소식",
+        "🧭 원하는 기능을 선택하세요.",
+        view=FeatureMenuView(
+            question_service=_question_interaction_service,
+            image_service=_image_interaction_service,
+            growth_service=_growth_interaction_service,
+        ),
     )
 
 
@@ -4469,8 +4530,13 @@ async def _register_slash_commands_once():
 # ────────── 봇 상태 ──────────
 @bot.event
 async def on_ready():
-    global _runtime_tasks_started
+    global _runtime_tasks_started, _intro_view_registered
     await _register_slash_commands_once()
+    if not _intro_view_registered:
+        # The typing reminder view is persistent and must be registered once
+        # after reconnects so buttons on older public messages keep working.
+        bot.add_view(_intro_view())
+        _intro_view_registered = True
     # Load persisted state once; reconnects must not overwrite in-memory writes.
     if not _runtime_tasks_started:
         load_xp_data()

@@ -7,6 +7,7 @@ keeps the existing ``main.py`` services backwards compatible.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable
@@ -29,6 +30,38 @@ def _configured_special_user_id() -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def admin_authorization_reason(actor: Any, guild: Any) -> str | None:
+    """Return a private diagnostic category for an authorization decision.
+
+    The category intentionally contains no user, guild, token, or role values;
+    callers can log it internally without exposing server configuration.
+    """
+
+    if guild is None:
+        return "guild_missing"
+    if actor is None or getattr(actor, "id", None) is None:
+        return "actor_missing"
+    if getattr(actor, "id", None) == getattr(guild, "owner_id", None):
+        return None
+
+    raw_special = os.getenv(SPECIAL_ADMIN_USER_ID_ENV)
+    if raw_special is None or not raw_special.strip():
+        return "special_id_unconfigured"
+    try:
+        special_id = int(raw_special.strip())
+    except (TypeError, ValueError):
+        return "special_id_invalid"
+    if special_id <= 0:
+        return "special_id_invalid"
+    if getattr(actor, "id", None) != special_id:
+        return "special_id_mismatch"
+
+    allowed_guilds = _configured_guild_ids()
+    if allowed_guilds is not None and getattr(guild, "id", None) not in allowed_guilds:
+        return "guild_scope_denied"
+    return None
 
 
 def _configured_guild_ids() -> set[int] | None:
@@ -62,19 +95,11 @@ def is_admin_authorized(actor: Any, guild: Any) -> bool:
     interactions, roles, and Discord Administrator permissions are never used as
     authorization evidence.
     """
-    if guild is None or actor is None:
+    reason = admin_authorization_reason(actor, guild)
+    if reason is not None:
+        logging.info("Administrator authorization denied: %s", reason)
         return False
-    user_id = getattr(actor, "id", None)
-    guild_id = getattr(guild, "id", None)
-    if user_id is None or guild_id is None:
-        return False
-    if user_id == getattr(guild, "owner_id", None):
-        return True
-    special_id = _configured_special_user_id()
-    if special_id is None or user_id != special_id:
-        return False
-    allowed_guilds = _configured_guild_ids()
-    return allowed_guilds is None or guild_id in allowed_guilds
+    return True
 
 
 # Explicit aliases make the policy easy to reuse from cogs and service modules.
@@ -238,9 +263,9 @@ class ModerationTestModal(_ModalBase):
 
 
 class IntroView(_ViewBase):
-    """The four public buttons required by v6 typing guidance."""
+    """Persistent four-button public intro view for typing reminders."""
 
-    BUTTON_LABELS = ("💬 AI 질문하기", "🎨 그림 만들기", "🏆 내 성장", "🧭 전체 기능")
+    BUTTON_LABELS = ("💬 AI 질문", "🎨 그림 만들기", "🏆 내 성장", "🧭 전체 메뉴")
 
     def __init__(
         self,
@@ -249,7 +274,9 @@ class IntroView(_ViewBase):
         growth_service: Callable[..., Awaitable[Any]] | None = None,
         menu_service: Callable[..., Awaitable[Any]] | None = None,
     ):
-        super().__init__(timeout=300)
+        # Typing reminders are public messages that can remain in channel
+        # history.  A persistent view avoids leaving dead buttons behind.
+        super().__init__(timeout=None)
         self.question_service = question_service
         self.image_service = image_service
         self.growth_service = growth_service
@@ -258,14 +285,14 @@ class IntroView(_ViewBase):
             self._add_buttons()
         else:
             # Keep the four-button contract visible to dependency-free tests.
-            self.children = [type("ButtonStub", (), {"label": label, "custom_id": custom_id})() for label, custom_id in (("💬 AI 질문하기", "ui:question"), ("🎨 그림 만들기", "ui:image"), ("🏆 내 성장", "ui:growth"), ("🧭 전체 기능", "ui:menu"))]
+            self.children = [type("ButtonStub", (), {"label": label, "custom_id": custom_id})() for label, custom_id in zip(self.BUTTON_LABELS, ("ui:question", "ui:image", "ui:growth", "ui:menu"))]
 
     def _add_buttons(self) -> None:
         specs = (
-            ("💬 AI 질문하기", "ui:question", discord.ButtonStyle.primary, self.question),
-            ("🎨 그림 만들기", "ui:image", discord.ButtonStyle.primary, self.image),
-            ("🏆 내 성장", "ui:growth", discord.ButtonStyle.success, self.growth),
-            ("🧭 전체 기능", "ui:menu", discord.ButtonStyle.secondary, self.menu),
+            ("💬 AI 질문", "ui:question", discord.ButtonStyle.secondary, self.question),
+            ("🎨 그림 만들기", "ui:image", discord.ButtonStyle.secondary, self.image),
+            ("🏆 내 성장", "ui:growth", discord.ButtonStyle.secondary, self.growth),
+            ("🧭 전체 메뉴", "ui:menu", discord.ButtonStyle.secondary, self.menu),
         )
         for label, custom_id, style, callback in specs:
             button = discord.ui.Button(label=label, custom_id=custom_id, style=style, row=0 if label in self.BUTTON_LABELS[:2] else 1)
@@ -295,6 +322,53 @@ class IntroView(_ViewBase):
             await self.menu_service(interaction)
         else:
             await _ephemeral(interaction, "기능 메뉴가 준비되지 않았습니다.")
+
+
+class FeatureMenuView(_ViewBase):
+    """Private, click-through feature menu used by the public intro button."""
+
+    def __init__(
+        self,
+        *,
+        question_service: Callable[..., Awaitable[Any]] | None = None,
+        image_service: Callable[..., Awaitable[Any]] | None = None,
+        growth_service: Callable[..., Awaitable[Any]] | None = None,
+    ):
+        super().__init__(timeout=300)
+        self.question_service = question_service
+        self.image_service = image_service
+        self.growth_service = growth_service
+        if DISCORD_AVAILABLE:
+            select = discord.ui.Select(
+                custom_id="ui:feature-menu",
+                placeholder="기능을 선택하세요",
+                min_values=1,
+                max_values=1,
+                options=(
+                    discord.SelectOption(label="AI 질문", value="question", emoji="💬"),
+                    discord.SelectOption(label="그림 만들기", value="image", emoji="🎨"),
+                    discord.SelectOption(label="내 성장", value="growth", emoji="🏆"),
+                ),
+            )
+            select.callback = self._select_callback
+            self.add_item(select)
+        else:
+            self.children = [type("SelectStub", (), {"custom_id": "ui:feature-menu"})()]
+
+    async def _select_callback(self, interaction: Any) -> None:
+        data = getattr(interaction, "data", {}) or {}
+        values = data.get("values", []) if isinstance(data, dict) else []
+        selected = values[0] if values else ""
+        if selected == "question" and self.question_service is not None:
+            await interaction.response.send_modal(QuestionModal(self.question_service))
+            return
+        if selected == "image" and self.image_service is not None:
+            await interaction.response.send_modal(ImageModal(self.image_service))
+            return
+        if selected == "growth" and self.growth_service is not None:
+            await self.growth_service(interaction)
+            return
+        await _ephemeral(interaction, "이 기능은 현재 사용할 수 없습니다.")
 
 
 class AdminPanelView(_ViewBase):
@@ -431,15 +505,14 @@ def typing_intro_payload(user: Any) -> dict[str, Any]:
     """Build the public typing notice while constraining mentions to one user."""
     mention = getattr(user, "mention", "")
     return {
-        "content": f"{mention}님, 채팅을 작성 중이셨군요! ⌨️",
-        "embed_description": "💡 도리봇으로 이런 것도 할 수 있어요!\n궁금한 것을 질문하거나 AI 그림을 만들어 보세요. 내 XP와 업적도 확인할 수 있어요.",
+        "content": f"{mention}님, 채팅을 작성 중이셨군요! ⌨️\n도리봇으로 무엇을 해볼까요?",
         "view": IntroView(),
         "allowed_mentions": discord.AllowedMentions(users=[user], everyone=False, roles=False),
     }
 
 
 __all__ = [
-    "SPECIAL_ADMIN_USER_ID", "IntroView", "QuestionModal", "ImageModal", "ModerationTestModal", "AdminPanelView",
-    "admin_panel_response", "is_admin_authorized", "is_authorized_admin", "is_admin_user",
+    "SPECIAL_ADMIN_USER_ID", "IntroView", "FeatureMenuView", "QuestionModal", "ImageModal", "ModerationTestModal", "AdminPanelView",
+    "admin_panel_response", "admin_authorization_reason", "is_admin_authorized", "is_authorized_admin", "is_admin_user",
     "register_slash_commands", "SlashCommandRegistrationState", "typing_intro_payload",
 ]

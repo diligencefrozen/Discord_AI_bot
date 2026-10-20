@@ -11,13 +11,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import io
 import logging
 import os
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
 import httpx
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - requirements install Pillow in production
+    Image = None
 
 
 class AIProviderError(RuntimeError):
@@ -37,11 +44,13 @@ class HordeConfig:
     api_key: str = "0000000000"
     text_model: str | None = None
     image_model: str | None = None
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 140.0
     poll_interval_seconds: float = 2.0
-    image_width: int = 1024
-    image_height: int = 1024
+    image_width: int = 512
+    image_height: int = 512
     image_steps: int = 30
+    max_image_bytes: int = 8_000_000
+    image_hosts: tuple[str, ...] = ("aihorde.net", "stablehorde.net")
 
     @classmethod
     def from_env(cls) -> "HordeConfig":
@@ -82,6 +91,14 @@ class HordeConfig:
             image_width=_positive_int("HORDE_IMAGE_WIDTH", cls.image_width),
             image_height=_positive_int("HORDE_IMAGE_HEIGHT", cls.image_height),
             image_steps=_positive_int("HORDE_IMAGE_STEPS", cls.image_steps),
+            max_image_bytes=_positive_int("HORDE_MAX_IMAGE_BYTES", cls.max_image_bytes),
+            image_hosts=tuple(
+                host.strip().lower().lstrip(".")
+                for host in os.getenv(
+                    "HORDE_IMAGE_HOSTS", ",".join(cls.image_hosts)
+                ).split(",")
+                if host.strip()
+            ) or cls.image_hosts,
         )
 
 
@@ -113,11 +130,14 @@ async def _request_json(
     *,
     headers: Mapping[str, str],
     json: Mapping[str, Any] | None = None,
+    stage: str = "request",
 ) -> Mapping[str, Any]:
     try:
         response = await client.request(method, url, headers=headers, json=json)
     except httpx.HTTPError as exc:
-        raise AIProviderError(f"AI Horde network error: {exc}") from exc
+        logging.warning("AI Horde stage=%s network_error=%s", stage, type(exc).__name__)
+        raise AIProviderError(f"AI Horde network error during {stage}") from exc
+    logging.info("AI Horde stage=%s status=%s", stage, response.status_code)
     if response.is_error:
         raise AIProviderError(f"AI Horde HTTP {response.status_code}: {_error_text(response)}")
     try:
@@ -142,12 +162,23 @@ async def _poll_job(
     *,
     config: HordeConfig,
     headers: Mapping[str, str],
+    stage: str = "poll",
 ) -> Mapping[str, Any]:
     """Poll a Horde job at least once per second until it completes."""
 
     deadline = time.monotonic() + config.timeout_seconds
     while True:
-        payload = await _request_json(client, "GET", url, headers=headers)
+        payload = await _request_json(client, "GET", url, headers=headers, stage=stage)
+        logging.info(
+            "AI Horde stage=%s done=%s is_possible=%s queue=%s processing=%s",
+            stage,
+            payload.get("done"),
+            payload.get("is_possible"),
+            payload.get("queue_position"),
+            payload.get("processing"),
+        )
+        if payload.get("is_possible") is False:
+            raise AIProviderError(f"AI Horde {stage} request is not possible")
         if payload.get("fault") or payload.get("faulted"):
             detail = payload.get("fault") or payload.get("message") or "generation faulted"
             raise AIProviderError(str(detail))
@@ -173,12 +204,25 @@ async def _poll_image_job(
     check_url = f"{config.base_url}/v2/generate/check/{request_id}"
     status_url = f"{config.base_url}/v2/generate/status/{request_id}"
     while True:
-        payload = await _request_json(client, "GET", check_url, headers=headers)
+        payload = await _request_json(
+            client, "GET", check_url, headers=headers, stage="image_check"
+        )
+        logging.info(
+            "AI Horde stage=image_check done=%s is_possible=%s queue=%s processing=%s",
+            payload.get("done"),
+            payload.get("is_possible"),
+            payload.get("queue_position"),
+            payload.get("processing"),
+        )
+        if payload.get("is_possible") is False:
+            raise AIProviderError("AI Horde image request is not possible")
         if payload.get("fault") or payload.get("faulted"):
             detail = payload.get("fault") or payload.get("message") or "generation faulted"
             raise AIProviderError(str(detail))
         if payload.get("done") is True:
-            return await _request_json(client, "GET", status_url, headers=headers)
+            return await _request_json(
+                client, "GET", status_url, headers=headers, stage="image_status"
+            )
         if time.monotonic() >= deadline:
             raise AIProviderError("AI Horde image request timed out")
         await asyncio.sleep(max(1.0, config.poll_interval_seconds))
@@ -227,24 +271,65 @@ async def generate_horde_text(
             f"{config.base_url}/v2/generate/text/async",
             headers=headers,
             json=request,
+            stage="text_submit",
         )
         result = await _poll_job(
             client,
             f"{config.base_url}/v2/generate/text/status/{_job_id(submitted)}",
             config=config,
             headers=headers,
+            stage="text_status",
         )
     return _generation_text(result)
 
 
-def _decode_image(value: str) -> bytes | None:
+def _trusted_image_host(url: str, hosts: tuple[str, ...]) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"https"} or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    return any(host == allowed or host.endswith(f".{allowed}") for allowed in hosts)
+
+
+def _validate_image_bytes(data: bytes, *, max_bytes: int) -> bytes:
+    if not data:
+        raise AIProviderError("AI Horde returned an empty image")
+    if len(data) > max_bytes:
+        raise AIProviderError("AI Horde image exceeded the configured size limit")
+
+    # Pillow gives us a full container/format check.  The signature fallback
+    # keeps the adapter importable in minimal test tooling while production
+    # still installs Pillow from requirements.txt.
+    if Image is not None:
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image.verify()
+                if image.format not in {"PNG", "JPEG", "WEBP"}:
+                    raise AIProviderError("AI Horde returned an unsupported image format")
+        except AIProviderError:
+            raise
+        except Exception as exc:
+            raise AIProviderError("AI Horde returned an invalid image") from exc
+    elif not (
+        data.startswith(b"\x89PNG\r\n\x1a\n")
+        or data.startswith(b"\xff\xd8\xff")
+        or data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+    ):
+        raise AIProviderError("AI Horde returned an invalid image")
+    return data
+
+
+def _decode_image(value: str, *, max_bytes: int) -> bytes | None:
     if value.startswith("data:") and "," in value:
         value = value.split(",", 1)[1]
     value = "".join(value.split())
+    if len(value) > ((max_bytes + 2) * 4 // 3):
+        raise AIProviderError("AI Horde image exceeded the configured size limit")
     try:
-        return base64.b64decode(value, validate=True)
+        decoded = base64.b64decode(value, validate=True)
     except (ValueError, binascii.Error):
         return None
+    return _validate_image_bytes(decoded, max_bytes=max_bytes)
 
 
 async def generate_horde_image(
@@ -267,6 +352,10 @@ async def generate_horde_image(
         },
         "nsfw": False,
         "censor_nsfw": True,
+        # Prefer the inline result so signed worker/R2 hosts do not need to be
+        # guessed or added to the allowlist.  URL responses remain supported
+        # only for explicitly trusted HTTPS hosts.
+        "r2": False,
     }
     if config.image_model:
         request["models"] = [config.image_model]
@@ -279,6 +368,7 @@ async def generate_horde_image(
             f"{config.base_url}/v2/generate/async",
             headers=headers,
             json=request,
+            stage="image_submit",
         )
         result = await _poll_image_job(
             client,
@@ -292,15 +382,52 @@ async def generate_horde_image(
         image = generations[0].get("img") if isinstance(generations[0], Mapping) else None
         if not isinstance(image, str) or not image:
             raise AIProviderError("AI Horde returned an invalid image")
-        decoded = _decode_image(image)
-        if decoded:
-            return decoded
-        if image.startswith(("http://", "https://")):
+        if image.startswith("data:") or not image.startswith(("http://", "https://")):
+            decoded = _decode_image(image, max_bytes=config.max_image_bytes)
+            if decoded:
+                logging.info("AI Horde stage=image_decode bytes=%s", len(decoded))
+                return decoded
+            raise AIProviderError("AI Horde returned unsupported image data")
+        if not _trusted_image_host(image, config.image_hosts):
+            host = urlparse(image).hostname or "unknown"
+            logging.warning("AI Horde stage=image_download untrusted_host=%s", host)
+            raise AIProviderError("AI Horde returned an untrusted image host")
+        if image.startswith(("https://",)):
             try:
-                response = await client.get(image, headers=headers)
+                response = await client.get(
+                    image,
+                    headers={"Accept": "image/*"},
+                    follow_redirects=True,
+                )
             except httpx.HTTPError as exc:
-                raise AIProviderError(f"AI Horde image download failed: {exc}") from exc
+                logging.warning(
+                    "AI Horde stage=image_download network_error=%s",
+                    type(exc).__name__,
+                )
+                raise AIProviderError("AI Horde image download failed") from exc
+            final_url = str(getattr(response, "url", image))
+            if not _trusted_image_host(final_url, config.image_hosts):
+                host = urlparse(final_url).hostname or "unknown"
+                logging.warning("AI Horde stage=image_download untrusted_host=%s", host)
+                raise AIProviderError("AI Horde redirected to an untrusted image host")
             if response.is_error or not response.content:
-                raise AIProviderError(f"AI Horde image download failed: HTTP {response.status_code}")
-            return response.content
+                logging.warning(
+                    "AI Horde stage=image_download status=%s content_type=%s",
+                    response.status_code,
+                    response.headers.get("content-type", ""),
+                )
+                raise AIProviderError("AI Horde image download failed")
+            try:
+                announced_size = int(response.headers.get("content-length", "0"))
+            except (TypeError, ValueError):
+                announced_size = 0
+            if announced_size > config.max_image_bytes:
+                raise AIProviderError("AI Horde image exceeded the configured size limit")
+            logging.info(
+                "AI Horde stage=image_download status=%s content_type=%s bytes=%s",
+                response.status_code,
+                response.headers.get("content-type", ""),
+                len(response.content),
+            )
+            return _validate_image_bytes(response.content, max_bytes=config.max_image_bytes)
     raise AIProviderError("AI Horde returned an unsupported image value")

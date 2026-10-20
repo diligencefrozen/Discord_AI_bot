@@ -82,7 +82,9 @@ class HordeProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0][2]["headers"]["apikey"], "0000000000")
 
     async def test_image_accepts_horde_base64_generation(self):
-        image_bytes = b"fake-png"
+        image_bytes = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
         encoded = base64.b64encode(image_bytes).decode()
         client = _Client([
             _Response({"id": "image-job"}),
@@ -103,6 +105,7 @@ class HordeProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, image_bytes)
         self.assertEqual(slept, [2.0])
         self.assertEqual(client.calls[0][1], "https://example.test/api/v2/generate/async")
+        self.assertFalse(client.calls[0][2]["json"]["r2"])
         self.assertEqual(client.calls[1][1], "https://example.test/api/v2/generate/check/image-job")
         self.assertEqual(client.calls[2][1], "https://example.test/api/v2/generate/check/image-job")
         self.assertEqual(client.calls[3][1], "https://example.test/api/v2/generate/status/image-job")
@@ -119,6 +122,20 @@ class HordeProviderTests(unittest.IsolatedAsyncioTestCase):
                 client_factory=lambda **_kwargs: client,
             )
 
+    async def test_image_rejects_untrusted_signed_url(self):
+        client = _Client([
+            _Response({"id": "image-job"}),
+            _Response({"done": True}),
+            _Response({"generations": [{"img": "https://evil.example/image.png"}]}),
+        ])
+        with self.assertRaisesRegex(AIProviderError, "untrusted image host"):
+            await generate_horde_image(
+                "a bear",
+                config=HordeConfig(base_url="https://example.test/api"),
+                client_factory=lambda **_kwargs: client,
+            )
+        self.assertEqual(len(client.calls), 3)
+
     def test_from_env_clamps_poll_interval_and_supports_explicit_key(self):
         with patch.dict(
             os.environ,
@@ -131,6 +148,9 @@ class HordeProviderTests(unittest.IsolatedAsyncioTestCase):
             config = HordeConfig.from_env()
         self.assertEqual(config.api_key, "test-key")
         self.assertEqual(config.poll_interval_seconds, 1.0)
+        self.assertEqual(config.image_width, 512)
+        self.assertEqual(config.image_height, 512)
+        self.assertEqual(config.max_image_bytes, 8_000_000)
 
 
 if __name__ == "__main__":

@@ -37,3 +37,8 @@ buttons on the typing reminder and the `/시작`, `/질문`, `/그림`, `/내정
 `/관리` slash commands. `daily_xp_data.pkl` and `achievements_data.pkl` remain
 the authoritative user-state files; the storage layer adds backups and atomic
 replacement without introducing a database.
+
+Typing reminders use a short Korean message with a persistent neutral button
+view. AI questions, growth information, feature menus, and administrator
+controls are private interactions; successful images from the button or
+`/그림` are posted to the channel only after the provider result is validated.
