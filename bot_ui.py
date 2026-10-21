@@ -17,6 +17,7 @@ SPECIAL_ADMIN_USER_ID = 855749166764654653
 SPECIAL_ADMIN_USER_ID_ENV = "SPECIAL_ADMIN_USER_ID"
 SPECIAL_ADMIN_USER_IDS_ENV = "SPECIAL_ADMIN_USER_IDS"
 SPECIAL_ADMIN_GUILD_IDS_ENV = "SPECIAL_ADMIN_GUILD_IDS"
+_COMMAND_ADAPTER_MARKER = "doribot_ui_adapter"
 UNAUTHORIZED_ADMIN_MESSAGE = (
     "권한이 없습니다. 이 기능은 서버 소유자 또는 도리봇 파딱만 사용할 수 있어요."
 )
@@ -624,47 +625,81 @@ def register_slash_commands(
         )
 
     callbacks = (("시작", "도리봇 기능을 시작합니다.", _start), ("질문", "AI에게 질문합니다. 답변은 이 채널에 공개됩니다.", _question), ("그림", "AI 그림을 만듭니다.", _image), ("내정보", "내 성장 정보를 봅니다.", _growth), ("관리", "도리봇 파딱 패널입니다.", _admin))
+    # Validate all names before mutating the global tree. A failed earlier
+    # registration can safely resume using this adapter's command objects,
+    # while foreign commands must never be replaced or silently skipped.
+    if DISCORD_AVAILABLE and hasattr(app_commands, "Command"):
+        getter = getattr(tree, "get_command", None)
+        existing_commands = {
+            name: getter(name) if getter is not None else None
+            for name, _, _ in callbacks
+        }
+        for name, existing in existing_commands.items():
+            if existing is not None and getattr(existing, "extras", {}).get(_COMMAND_ADAPTER_MARKER) is not True:
+                raise app_commands.CommandAlreadyRegistered(name, None)
+    else:
+        existing_commands = {}
+
+    pending: list[Any] = []
     for name, description, callback in callbacks:
         if DISCORD_AVAILABLE and hasattr(app_commands, "Command"):
+            existing = existing_commands[name]
+            if existing is not None:
+                registered.append(existing)
+                continue
             if name == "관리" and hasattr(app_commands, "guild_only"):
                 callback = app_commands.guild_only()(callback)
-            command = app_commands.Command(name=name, description=description, callback=callback)
-            tree.add_command(command)
+            command = app_commands.Command(
+                name=name, description=description, callback=callback,
+                extras={_COMMAND_ADAPTER_MARKER: True},
+            )
+            pending.append(command)
         else:
             command = callback
             setattr(command, "name", name)
         registered.append(command)
+    for command in pending:
+        tree.add_command(command)
     return registered
 
 
 class SlashCommandRegistrationState:
     """Track slash registration separately from gateway synchronization.
 
-    Command objects must only be added to the tree once, while a failed sync
-    must remain retryable after reconnect.  ``ensure`` therefore remembers
-    tree registration even when ``sync`` fails and only marks the operation
-    complete after a successful sync.
+    Local registration is independent from optional Discord synchronization.
+    Failed synchronization remains retryable on a deliberate call, while a
+    successful synchronization is skipped for the rest of this process.
     """
 
     def __init__(self) -> None:
         self.commands_registered = False
         self.synced = False
         self.last_error: Exception | None = None
+        self.sync_attempts = 0
+        self._lock = asyncio.Lock()
 
-    async def ensure(self, register: Callable[[], Any], sync: Callable[[], Awaitable[Any]]) -> bool:
-        if self.synced:
-            return False
-        if not self.commands_registered:
-            register()
-            self.commands_registered = True
-        try:
-            await sync()
-        except Exception as error:
-            self.last_error = error
-            return False
-        self.synced = True
-        self.last_error = None
-        return True
+    async def ensure(self, register: Callable[[], Any], sync: Callable[[], Awaitable[Any]] | None = None) -> bool:
+        """Return True only when this call completes a requested remote sync.
+
+        Registration errors propagate, so an incomplete tree cannot be synced.
+        Sync errors are retained without logging their potentially sensitive
+        text. Cancellation propagates and releases the lock for a later retry.
+        """
+        async with self._lock:
+            if not self.commands_registered:
+                register()
+                self.commands_registered = True
+            if sync is None or self.synced:
+                return False
+            self.sync_attempts += 1
+            try:
+                await sync()
+            except Exception as error:
+                self.last_error = error
+                return False
+            self.synced = True
+            self.last_error = None
+            return True
 
 
 def typing_intro_payload(user: Any, **services: Any) -> dict[str, Any]:

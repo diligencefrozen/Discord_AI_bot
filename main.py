@@ -2007,8 +2007,18 @@ async def _generate_image_bytes(prompt: str, *, requester_id: Optional[int] = No
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.typing = True  
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.typing = True
+
+
+class Doribot(commands.Bot):
+    async def setup_hook(self):
+        # setup_hook runs after login, before the gateway and on_ready events.
+        # Register local handlers every process, publish only on explicit opt-in.
+        await _register_slash_commands_once(sync=_slash_sync_requested())
+        _register_intro_views_once()
+
+
+bot = Doribot(command_prefix="!", intents=intents)
 
 # ────────────────────────────────────────────────────────────────────────────
 # 삭제한 메세지를 저장할 채팅방을 설정함.
@@ -4204,7 +4214,6 @@ async def pubg_mobile_gallery(ctx):
         logging.error(f"모배갤 명령어 오류: {e}")
 
 # ────────── 버튼/슬래시 서비스 어댑터 ──────────
-_slash_registered = False
 _slash_registration_state = SlashCommandRegistrationState()
 _runtime_tasks_started = False
 _intro_view_registered = False
@@ -4416,11 +4425,18 @@ async def _admin_test_service(interaction, content: str):
     await _interaction_send(interaction, result)
 
 
-async def _register_slash_commands_once():
-    global _slash_registered
-    if _slash_registered:
-        return
+SLASH_COMMAND_NAMES = frozenset(("시작", "질문", "그림", "내정보", "관리"))
 
+
+def _slash_sync_requested() -> bool:
+    value = os.getenv("SLASH_SYNC_ON_STARTUP", "0").strip()
+    if value not in {"0", "1"}:
+        logging.warning("event=slash_sync_skipped scope=global reason=invalid_configuration")
+        return False
+    return value == "1"
+
+
+async def _register_slash_commands_once(*, sync=False):
     def _register() -> None:
         register_slash_commands(
             bot,
@@ -4431,35 +4447,63 @@ async def _register_slash_commands_once():
             admin_service=_admin_action_service,
             admin_test_service=_admin_test_service,
         )
+        registered = bot.tree.get_commands()
+        logging.info(
+            "event=slash_registered scope=global count=%d names=%s",
+            len(registered), ",".join(sorted(command.name for command in registered)),
+        )
 
     async def _sync() -> list[object]:
+        # Global sync replaces a scope's complete remote command set. Never
+        # publish an incomplete tree or silently replace foreign commands.
+        names = frozenset(command.name for command in bot.tree.get_commands())
+        if names != SLASH_COMMAND_NAMES:
+            logging.error("event=slash_sync_rejected scope=global reason=unexpected_local_commands count=%d", len(names))
+            raise RuntimeError("unexpected_slash_command_set")
         synced = await bot.tree.sync()
-        logging.info("Synced %d slash commands", len(synced))
+        logging.info(
+            "event=slash_sync_success scope=global count=%d names=%s application_id=%s bot_id=%s",
+            len(synced), ",".join(sorted(command.name for command in synced)),
+            bot.application_id, getattr(bot.user, "id", None),
+        )
         return synced
 
-    synced_ok = await _slash_registration_state.ensure(_register, _sync)
-    if synced_ok:
-        _slash_registered = True
-    elif not _slash_registration_state.synced:
-        logging.error("Slash command sync failed: %s", _slash_registration_state.last_error)
+    await _slash_registration_state.ensure(_register, _sync if sync else None)
+    error = _slash_registration_state.last_error
+    if sync and error is not None:
+        status = getattr(error, "status", None)
+        logging.error(
+            "event=slash_sync_failed scope=global error_type=%s status=%s application_id=%s bot_id=%s",
+            type(error).__name__, status if type(status) is int else None,
+            bot.application_id, getattr(bot.user, "id", None),
+        )
+    elif not sync:
+        logging.info("event=slash_sync_skipped scope=global reason=not_requested")
+
+
+def _register_intro_views_once():
+    global _intro_view_registered
+    if _intro_view_registered:
+        return
+    bot.add_view(_intro_view())
+    bot.add_view(TypingIntroView(
+        question_service=_question_interaction_service,
+        image_service=_image_interaction_service,
+        growth_service=_growth_interaction_service,
+        menu_service=_menu_interaction_service,
+    ))
+    _intro_view_registered = True
 
 
 # ────────── 봇 상태 ──────────
 @bot.event
 async def on_ready():
-    global _runtime_tasks_started, _intro_view_registered
-    await _register_slash_commands_once()
-    if not _intro_view_registered:
-        # The typing reminder view is persistent and must be registered once
-        # after reconnects so buttons on older public messages keep working.
-        bot.add_view(_intro_view())
-        bot.add_view(TypingIntroView(
-            question_service=_question_interaction_service,
-            image_service=_image_interaction_service,
-            growth_service=_growth_interaction_service,
-            menu_service=_menu_interaction_service,
-        ))
-        _intro_view_registered = True
+    global _runtime_tasks_started
+    logging.info(
+        "event=discord_ready application_id=%s bot_id=%s slash_registered=%s slash_synced=%s",
+        bot.application_id, getattr(bot.user, "id", None),
+        _slash_registration_state.commands_registered, _slash_registration_state.synced,
+    )
     # Load persisted state once; reconnects must not overwrite in-memory writes.
     if not _runtime_tasks_started:
         load_xp_data()

@@ -23,10 +23,16 @@ Gemini의 로컬 요청 카운터만 메모리에 있어 프로세스 재시작 
 TEXT_AI_PROVIDER=gemini
 GEMINI_TEXT_MODEL=gemini-3.5-flash-lite
 GEMINI_API_KEY=
+GEMINI_TIMEOUT_SECONDS=60
 AI_PROVIDER=aihorde
 SPECIAL_ADMIN_USER_ID=855749166764654653
 SPECIAL_ADMIN_USER_IDS=855749166764654653,491239880005910538
 ```
+
+이번 명령 동기화 배포에는 `SLASH_SYNC_ON_STARTUP=1`도 명시합니다. 성공을 확인한 뒤
+다음 일반 배포/재시작 설정은 `0`으로 돌립니다. 새 설치나 명령 정의 변경 시에만 다시 `1`을
+명시하세요. 미설정 기본값은 `0`으로, 로컬 핸들러는 등록하되 Discord 원격 명령은 갱신하지 않습니다.
+동기화 실패 시 재연결로 재시도하지 않으며 원인을 확인한 뒤 의도한 한 번의 재시작으로 재시도합니다.
 
 `GEMINI_API_KEY`의 실제 값은 운영자가 Northflank secret에 직접 입력합니다.
 `tbBot` 무료 프로젝트에 연결된 키를 사용하고 Billing은 활성화하지 않습니다.
@@ -36,10 +42,11 @@ Gemini API 자체에는 이 코드가 결제 상태를 강제로 잠그는 옵�
 
 | 변수 | 기본값/처리 |
 | --- | --- |
-| `GEMINI_TIMEOUT_SECONDS` | 30초 |
+| `GEMINI_TIMEOUT_SECONDS` | 운영 권장 60초, 미설정 코드 기본값 30초; 각 HTTP 단계 제한 |
 | `GEMINI_RPM_LIMIT` | 전체 프로세스 15회/롤링 60초 |
 | `GEMINI_RPD_LIMIT` | 전체 프로세스 500회/태평양 날짜, IANA 시간대가 없으면 보수적 롤링 24시간 |
 | `GEMINI_USER_COOLDOWN_SECONDS` | 사용자별 10초 |
+| `SLASH_SYNC_ON_STARTUP` | `0` 기본, `1`로 명시한 프로세스 시작에서만 전역 명령 동기화 |
 | `SPECIAL_ADMIN_GUILD_IDS` | 비어 있으면 파딱 서버 제한 없음; 쉼표 구분 서버 ID로 제한 가능 |
 | `HORDE_API_KEY` | 비어 있으면 익명 Horde 키 |
 | `HORDE_IMAGE_MODEL` | 선택 이미지 모델, 비어 있으면 기존 worker 선택 |
@@ -82,6 +89,42 @@ DM·Administrator 역할·이름 변경으로는 권한이 생기지 않습니�
 [공식 한도 설명](https://ai.google.dev/gemini-api/docs/rate-limits)에 따라 프로젝트 전체가 한도를 공유하고
 일별 한도는 태평양 자정에 초기화됩니다. 로컬 카운터는 다른 앱·replica·재시작·TPM을 통제하지 않습니다.
 429·인증 오류·타임아웃·차단/빈 응답은 안전한 오류로 처리하며 재시도하지 않습니다.
+
+## Gemini 시간 초과와 명령 outdated 진단
+
+실제 운영 로그를 확인하기 전에는 Google 모델 지연·네트워크·연결 풀·프록시 중 원인을 확정하지 않습니다.
+`GEMINI_TIMEOUT_SECONDS=60`은 임시 완화이며 속도 개선이나 성공을 보장하지 않습니다.
+httpx timeout은 connect/read/write/pool의 단계별 제한이고 전체 요청의 절대 시간 제한이 아닙니다.
+기존 RPM/RPD와 사용자 쿨다운은 유지되며 실패한 요청도 예약을 환불하거나 자동 재시도하지 않습니다.
+
+Gemini 호출 로그는 시작 `event=gemini_request_start`와 종료 `event=gemini_request_end`로 남습니다.
+`elapsed_ms`는 단조 시계로 잰 해당 호출의 실제 소요 시간이며 `model`, `result`, 가능한 `http_status`를 포함합니다.
+시간 초과는 `timeout_phase=connect|read|write|pool|unspecified`로 구분합니다.
+`result=quota`는 429/로컬 사용량 제한, `authentication`은 400/401/403,
+`model_unavailable`은 404, `server`는 5xx, `network`는 기타 HTTP 전송 실패입니다.
+키·프롬프트·시스템 지침·사용자 메시지·응답 원문·예외 원문은 로그에 기록하지 않습니다.
+
+Discord의 `This command is outdated`는 클라이언트/서버 단계에서 나오는 메시지이며,
+파딱 권한 부족 안내와 다릅니다. 봇 코드에서 가로채 비공개 안내로 바꿀 수 없고 이 패치로 즉시 해결을 보장하지 않습니다.
+한 replica와 구/신 버전 동시 실행 여부를 확인한 뒤 아래 로그를 확인합니다.
+
+- `event=slash_registered scope=global count=5`: 로컬 다섯 명령 등록.
+- `event=slash_sync_success scope=global count=5`: Discord 응답의 실제 명령 이름·개수와 Application ID·Bot ID.
+- `event=slash_sync_failed`: 예외 종류/HTTP 상태만 기록. 상세 원문이나 토큰은 출력하지 않음.
+- `event=slash_sync_skipped reason=not_requested|invalid_configuration`: 의도적으로 원격 쓰기 생략.
+- `event=discord_ready`: 실행 중인 Application ID·Bot ID·로컬 등록/동기화 상태.
+
+Developer Portal의 실제 봇 Application ID와 로그의 ID를 비교하고 올바른 서비스에 토큰이 연결됐는지 확인합니다.
+ID는 토큰 자체가 아닙니다. 같은 봇을 사용하는 다른 복제 인스턴스가 명령 정의를 덮어쓰는지도 확인하세요.
+`setup_hook`에서 명령을 한 번 등록하고 명시적 설정이 있을 때만 전역 `tree.sync()`를 호출합니다.
+`on_ready`는 재연결 때 동기화하지 않습니다. 전체 로컬 명령 집합이 정확히 다섯 개인지 확인한 뒤 게시하고,
+명령 삭제·`clear_commands`·길드 복사·전역/길드 양쪽 자동 등록은 하지 않습니다.
+`/관리`의 `guild_only`는 서버에서만 실행 가능하다는 뜻이며 명령 자체의 등록 범위는 전역입니다.
+[공식 sync 설명](https://discordpy.readthedocs.io/en/stable/interactions/api.html#discord.app_commands.CommandTree.sync).
+
+동기화 성공 후에도 stale 캐시가 남으면 Discord 클라이언트를 다시 실행하고 명령을 새로 선택한 뒤 전파를 기다립니다.
+반복 배포나 명령 삭제/재생성으로 해결하려 하지 않습니다. `/시작`, `/질문`, `/그림`, `/내정보`, `/관리`를
+서버 소유자·두 파딱·일반 사용자로 확인하고, 권한 거부/DM 거부와 기존 활성 목록·페이지·탐지 테스트를 유지합니다.
 
 ## 스테이징 검증과 배포
 

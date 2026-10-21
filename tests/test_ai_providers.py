@@ -6,7 +6,7 @@ import os
 import traceback
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 try:
     import ai_providers
@@ -124,7 +124,7 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
         ]:
             with self.subTest(status=status):
                 client = _Client([_Response({"error": "private-prompt fake-key https://secret.example/"}, status_code=status)])
-                with self.assertNoLogs(level="INFO"):
+                with self.assertLogs(level="INFO") as logs:
                     with self.assertRaises(GeminiProviderError) as caught:
                         await generate_gemini_text(
                             "private-prompt", config=GeminiConfig(api_key="fake-key"),
@@ -132,30 +132,50 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
                         )
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(len(client.calls), 1)
+                self.assertEqual([record.event for record in logs.records], ["gemini_request_start", "gemini_request_end"])
+                self.assertEqual(logs.records[-1].result, "server" if code == "http" else code)
+                self.assertEqual(logs.records[-1].http_status, status)
                 for secret in ["private-prompt", "fake-key", "https://", "error"]:
                     self.assertNotIn(secret, str(caught.exception))
+                    self.assertNotIn(secret, " ".join(logs.output))
 
     async def test_timeout_and_network_errors_discard_sensitive_exception_chain(self):
-        for exception, code in [
-            (ai_providers.httpx.ReadTimeout("private-prompt fake-key https://secret.example/"), "timeout"),
-            (ai_providers.httpx.ConnectError("private-prompt fake-key https://secret.example/"), "network"),
+        for exception, code, phase in [
+            (ai_providers.httpx.ConnectTimeout("private-prompt fake-key https://secret.example/"), "timeout", "connect"),
+            (ai_providers.httpx.ReadTimeout("private-prompt fake-key https://secret.example/"), "timeout", "read"),
+            (ai_providers.httpx.WriteTimeout("private-prompt fake-key https://secret.example/"), "timeout", "write"),
+            (ai_providers.httpx.PoolTimeout("private-prompt fake-key https://secret.example/"), "timeout", "pool"),
+            (ai_providers.httpx.TimeoutException("private-prompt fake-key https://secret.example/"), "timeout", "unspecified"),
+            (ai_providers.httpx.ConnectError("private-prompt fake-key https://secret.example/"), "network", None),
         ]:
-            with self.subTest(code=code):
+            with self.subTest(code=code, phase=phase):
                 client = _Client([exception])
-                try:
-                    await generate_gemini_text(
-                        "private-prompt", config=GeminiConfig(api_key="fake-key"),
-                        client_factory=lambda **_kwargs: client,
-                    )
-                except GeminiProviderError as error:
-                    self.assertEqual(error.code, code)
-                    rendered = "".join(traceback.format_exception_only(type(error), error))
-                    self.assertTrue(error.__suppress_context__)
-                    for secret in ["private-prompt", "fake-key", "https://"]:
-                        self.assertNotIn(secret, rendered)
-                else:
-                    self.fail("expected provider error")
+                with self.assertLogs(level="INFO") as logs, patch.object(ai_providers, "monotonic", side_effect=[100.0, 101.75]):
+                    try:
+                        await generate_gemini_text(
+                            "private-prompt", config=GeminiConfig(api_key="fake-key"),
+                            client_factory=lambda **_kwargs: client,
+                        )
+                    except GeminiProviderError as error:
+                        self.assertEqual(error.code, code)
+                        rendered = "".join(traceback.format_exception_only(type(error), error))
+                        self.assertTrue(error.__suppress_context__)
+                        for secret in ["private-prompt", "fake-key", "https://"]:
+                            self.assertNotIn(secret, rendered)
+                    else:
+                        self.fail("expected provider error")
                 self.assertEqual(len(client.calls), 1)
+                self.assertEqual([record.event for record in logs.records], ["gemini_request_start", "gemini_request_end"])
+                end = logs.records[-1]
+                self.assertEqual(end.result, code)
+                self.assertEqual(end.elapsed_ms, 1750)
+                self.assertEqual(getattr(end, "timeout_phase", None), phase)
+                self.assertFalse(hasattr(end, "http_status"))
+                for record in logs.records:
+                    self.assertEqual(record.model, "gemini-3.5-flash-lite")
+                    self.assertIsNone(record.exc_info)
+                for secret in ["private-prompt", "fake-key", "https://", "ConnectError", "ReadTimeout"]:
+                    self.assertNotIn(secret, " ".join(logs.output))
 
     async def test_empty_blocked_and_malformed_responses_are_safe(self):
         cases = [
@@ -172,14 +192,19 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
         for payload, code in cases:
             with self.subTest(code=code, payload=type(payload).__name__):
                 client = _Client([_Response(payload)])
-                with self.assertRaises(GeminiProviderError) as caught:
-                    await generate_gemini_text(
-                        "secret-prompt", config=GeminiConfig(api_key="fake-key"),
-                        client_factory=lambda **_kwargs: client,
-                    )
+                with self.assertLogs(level="INFO") as logs:
+                    with self.assertRaises(GeminiProviderError) as caught:
+                        await generate_gemini_text(
+                            "secret-prompt", config=GeminiConfig(api_key="fake-key"),
+                            client_factory=lambda **_kwargs: client,
+                        )
                 self.assertEqual(caught.exception.code, code)
+                self.assertEqual(logs.records[-1].result, "empty" if code == "invalid_response" else code)
+                self.assertEqual(logs.records[-1].http_status, 200)
                 self.assertNotIn("secret-prompt", str(caught.exception))
                 self.assertNotIn("fake-key", str(caught.exception))
+                self.assertNotIn("secret-prompt", " ".join(logs.output))
+                self.assertNotIn("fake-key", " ".join(logs.output))
                 self.assertEqual(len(client.calls), 1)
 
     async def test_missing_key_wrong_provider_wrong_model_and_empty_prompt_do_not_call_http(self):
@@ -193,9 +218,12 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
         for config, prompt, code in cases:
             with self.subTest(code=code, model=config.text_model):
                 client = _Client([])
-                with self.assertRaises(GeminiProviderError) as caught:
-                    await generate_gemini_text(prompt, config=config, client_factory=lambda **_kwargs: client)
+                with self.assertLogs(level="INFO") as logs:
+                    with self.assertRaises(GeminiProviderError) as caught:
+                        await generate_gemini_text(prompt, config=config, client_factory=lambda **_kwargs: client)
                 self.assertEqual(caught.exception.code, code)
+                self.assertEqual(logs.records[-1].result, "config")
+                self.assertFalse(hasattr(logs.records[-1], "http_status"))
                 self.assertEqual(client.calls, [])
 
     def test_env_config_uses_new_text_settings_and_hides_key(self):
@@ -222,6 +250,8 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
         for name, value in [
             ("GEMINI_RPM_LIMIT", "private-prompt"), ("GEMINI_RPM_LIMIT", "0"),
             ("GEMINI_RPD_LIMIT", "-1"), ("GEMINI_TIMEOUT_SECONDS", "nan"),
+            ("GEMINI_TIMEOUT_SECONDS", "inf"), ("GEMINI_TIMEOUT_SECONDS", "0"),
+            ("GEMINI_TIMEOUT_SECONDS", "-1"), ("GEMINI_TIMEOUT_SECONDS", "private-prompt"),
             ("GEMINI_USER_COOLDOWN_SECONDS", "inf"),
         ]:
             with self.subTest(name=name, value=value), patch.dict(os.environ, {
@@ -232,6 +262,93 @@ class GeminiProviderTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(caught.exception.code, "configuration")
                 self.assertNotIn("private-prompt", str(caught.exception))
                 self.assertNotIn("fake-key", str(caught.exception))
+
+    async def test_success_logs_actual_monotonic_latency_without_response_or_token_metadata(self):
+        payload = {
+            "candidates": [{"content": {"parts": [{"text": "ANSWER_SENTINEL"}]}}],
+            "usageMetadata": {"promptTokenCount": 987654, "sentinel": "TOKEN_SENTINEL"},
+        }
+        client = _Client([_Response(payload)])
+        with self.assertLogs(level="INFO") as logs, patch.object(ai_providers, "monotonic", side_effect=[12.0, 13.125]):
+            answer = await generate_gemini_text(
+                "PROMPT_SENTINEL", system_prompt="SYSTEM_SENTINEL",
+                config=GeminiConfig(api_key="KEY_SENTINEL"), user_id=981234567890,
+                client_factory=lambda **_kwargs: client,
+            )
+        self.assertEqual(answer, "ANSWER_SENTINEL")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual([record.event for record in logs.records], ["gemini_request_start", "gemini_request_end"])
+        self.assertEqual(logs.records[0].elapsed_ms, 0)
+        end = logs.records[-1]
+        self.assertEqual(end.result, "success")
+        self.assertEqual(end.http_status, 200)
+        self.assertEqual(end.elapsed_ms, 1125)
+        self.assertFalse(hasattr(end, "timeout_phase"))
+        for record in logs.records:
+            self.assertEqual(record.model, "gemini-3.5-flash-lite")
+            self.assertIsNone(record.exc_info)
+        for private in ["PROMPT_SENTINEL", "SYSTEM_SENTINEL", "KEY_SENTINEL", "ANSWER_SENTINEL", "TOKEN_SENTINEL", "987654", "981234567890", "https://"]:
+            self.assertNotIn(private, " ".join(logs.output))
+
+    async def test_invalid_configuration_never_logs_configured_values_or_calls_http(self):
+        sentinel = "CONFIG_SECRET_SENTINEL"
+        configs = [
+            GeminiConfig(api_key=sentinel, provider=sentinel),
+            GeminiConfig(api_key=sentinel, text_model=sentinel),
+            GeminiConfig(api_key=sentinel + "\n"),
+            None,
+        ]
+        for config in configs:
+            with self.subTest(config_type=type(config).__name__), patch.dict(os.environ, {
+                "GEMINI_API_KEY": sentinel, "GEMINI_TIMEOUT_SECONDS": sentinel,
+            }, clear=True):
+                client = _Client([])
+                with self.assertLogs(level="INFO") as logs:
+                    with self.assertRaises(GeminiProviderError) as caught:
+                        await generate_gemini_text(
+                            "PROMPT_SENTINEL", config=config, user_id=981234567890,
+                            client_factory=lambda **_kwargs: client,
+                        )
+                self.assertEqual(caught.exception.code, "configuration")
+                self.assertEqual(client.calls, [])
+                self.assertEqual(logs.records[-1].result, "config")
+                for record in logs.records:
+                    self.assertEqual(record.model, "gemini-3.5-flash-lite")
+                    self.assertFalse(hasattr(record, "http_status"))
+                for private in [sentinel, "PROMPT_SENTINEL", "981234567890"]:
+                    self.assertNotIn(private, " ".join(logs.output))
+
+    async def test_configurable_sixty_second_timeout_reserves_once_and_does_not_retry(self):
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "KEY_SENTINEL", "GEMINI_TIMEOUT_SECONDS": "60",
+        }, clear=True):
+            config = GeminiConfig.from_env()
+        config.validate()
+        self.assertEqual(config.timeout_seconds, 60)
+        limiter = AsyncMock()
+        client = _Client([ai_providers.httpx.ReadTimeout("PRIVATE_NETWORK_SENTINEL")])
+        options = []
+
+        def factory(**kwargs):
+            options.append(kwargs)
+            return client
+
+        with self.assertLogs(level="INFO") as logs:
+            with self.assertRaises(GeminiProviderError) as caught:
+                await generate_gemini_text(
+                    "PROMPT_SENTINEL", config=config, limiter=limiter, user_id=42,
+                    client_factory=factory,
+                )
+        self.assertEqual(caught.exception.code, "timeout")
+        limiter.acquire.assert_awaited_once_with(42)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(options[0]["timeout"].connect, 60)
+        self.assertEqual(options[0]["timeout"].read, 60)
+        self.assertEqual(options[0]["timeout"].write, 60)
+        self.assertEqual(options[0]["timeout"].pool, 60)
+        self.assertEqual(logs.records[-1].timeout_phase, "read")
+        for private in ["KEY_SENTINEL", "PROMPT_SENTINEL", "PRIVATE_NETWORK_SENTINEL"]:
+            self.assertNotIn(private, " ".join(logs.output))
 
     async def test_shared_limiter_rejects_before_http_and_does_not_refund_failure(self):
         config = GeminiConfig(api_key="fake-key", requests_per_minute=1, user_cooldown_seconds=0)

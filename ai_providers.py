@@ -12,6 +12,7 @@ import os
 import time
 from collections import deque
 from datetime import datetime, timezone
+from time import monotonic
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping
@@ -204,6 +205,59 @@ def _gemini_text(payload: Mapping[str, Any]) -> str:
     )
 
 
+def _log_gemini_event(
+    event: str,
+    *,
+    elapsed_ms: int = 0,
+    result: str | None = None,
+    http_status: int | None = None,
+    timeout_phase: str | None = None,
+) -> None:
+    """Log only controlled categories and timing, never request/response data.
+
+    Use the fixed intended model even when configuration is invalid: an
+    operator's malformed provider/model setting may itself contain a secret.
+    Fields are available both as key=value text and structured record values.
+    """
+    fields: dict[str, Any] = {
+        "event": event,
+        "model": GEMINI_TEXT_MODEL,
+        "elapsed_ms": elapsed_ms,
+    }
+    if result is not None:
+        fields["result"] = result
+    if http_status is not None:
+        fields["http_status"] = http_status
+    if timeout_phase is not None:
+        fields["timeout_phase"] = timeout_phase
+    logging.info(" ".join(f"{name}={value}" for name, value in fields.items()), extra=fields)
+
+
+def _gemini_log_result(code: str) -> str:
+    """Keep diagnostics within a fixed set of non-sensitive result codes."""
+    if code in {"configuration", "empty_prompt"}:
+        return "config"
+    if code in {"daily_limit", "minute_limit", "user_cooldown", "quota"}:
+        return "quota"
+    if code == "invalid_response":
+        return "empty"
+    if code in {"timeout", "network", "authentication", "model_unavailable", "server", "blocked", "empty"}:
+        return code
+    return "server"
+
+
+def _gemini_timeout_phase(error: httpx.TimeoutException) -> str:
+    for exception_type, phase in (
+        (httpx.ConnectTimeout, "connect"),
+        (httpx.ReadTimeout, "read"),
+        (httpx.WriteTimeout, "write"),
+        (httpx.PoolTimeout, "pool"),
+    ):
+        if isinstance(error, exception_type):
+            return phase
+    return "unspecified"
+
+
 async def generate_gemini_text(
     prompt: str,
     *,
@@ -221,66 +275,87 @@ async def generate_gemini_text(
     sent only in an authentication header, never a query string. Upstream
     response bodies and network exception messages are deliberately discarded.
     """
-    config = config or GeminiConfig.from_env()
-    config.validate()
-    if not prompt.strip():
-        raise GeminiProviderError("empty_prompt", "질문 내용을 입력해 주세요.")
-    if limiter is not None:
-        await limiter.acquire(user_id)
-    request: dict[str, Any] = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "maxOutputTokens": max(1, min(int(max_tokens), 2048)),
-            "temperature": temperature,
-        },
-    }
-    if system_prompt:
-        request["systemInstruction"] = {"parts": [{"text": system_prompt}]}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.text_model}:generateContent"
-    headers = {
-        "x-goog-api-key": config.api_key,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    started_at = monotonic()
+    result = "server"
+    http_status = None
+    timeout_phase = None
+    _log_gemini_event("gemini_request_start")
     try:
-        async with client_factory(timeout=httpx.Timeout(config.timeout_seconds)) as client:
-            response = await client.request(
-                "POST", url, headers=headers, json=request, follow_redirects=False
+        config = config or GeminiConfig.from_env()
+        config.validate()
+        if not prompt.strip():
+            raise GeminiProviderError("empty_prompt", "질문 내용을 입력해 주세요.")
+        if limiter is not None:
+            await limiter.acquire(user_id)
+        request: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": max(1, min(int(max_tokens), 2048)),
+                "temperature": temperature,
+            },
+        }
+        if system_prompt:
+            request["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.text_model}:generateContent"
+        headers = {
+            "x-goog-api-key": config.api_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with client_factory(timeout=httpx.Timeout(config.timeout_seconds)) as client:
+                response = await client.request(
+                    "POST", url, headers=headers, json=request, follow_redirects=False
+                )
+        except httpx.TimeoutException as error:
+            timeout_phase = _gemini_timeout_phase(error)
+            raise GeminiProviderError(
+                "timeout", "Gemini 응답 시간이 초과되었어요. 잠시 후 다시 이용해 주세요."
+            ) from None
+        except httpx.HTTPError:
+            raise GeminiProviderError(
+                "network", "Gemini에 연결하지 못했어요. 잠시 후 다시 이용해 주세요."
+            ) from None
+        status = response.status_code
+        http_status = status
+        if status in {400, 401, 403}:
+            raise GeminiProviderError(
+                "authentication", "Gemini 키 또는 요청 권한 설정을 운영자가 확인해야 합니다."
             )
-    except httpx.TimeoutException:
-        raise GeminiProviderError(
-            "timeout", "Gemini 응답 시간이 초과되었어요. 잠시 후 다시 이용해 주세요."
-        ) from None
-    except httpx.HTTPError:
-        raise GeminiProviderError(
-            "network", "Gemini에 연결하지 못했어요. 잠시 후 다시 이용해 주세요."
-        ) from None
-    status = response.status_code
-    if status in {400, 401, 403}:
-        raise GeminiProviderError(
-            "authentication", "Gemini 키 또는 요청 권한 설정을 운영자가 확인해야 합니다."
+        if status == 404:
+            raise GeminiProviderError(
+                "model_unavailable", "선택한 Gemini 모델을 사용할 수 없어요. 운영자가 모델 접근 권한을 확인해 주세요."
+            )
+        if status == 429:
+            raise GeminiProviderError(
+                "quota", "Gemini 무료 요청 한도에 도달했어요. 잠시 후 또는 다음 날 다시 이용해 주세요."
+            )
+        if status >= 500:
+            raise GeminiProviderError(
+                "server", "Gemini 서비스에 일시적인 문제가 있어요. 잠시 후 다시 이용해 주세요."
+            )
+        if status < 200 or status >= 300:
+            raise GeminiProviderError("http", "Gemini가 질문을 처리하지 못했어요. 잠시 후 다시 이용해 주세요.")
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            raise GeminiProviderError("invalid_response", "Gemini 응답을 읽지 못했어요. 잠시 후 다시 이용해 주세요.") from None
+        if not isinstance(payload, Mapping):
+            raise GeminiProviderError("invalid_response", "Gemini 응답을 읽지 못했어요. 잠시 후 다시 이용해 주세요.")
+        answer = _gemini_text(payload)
+        result = "success"
+        return answer
+    except GeminiProviderError as error:
+        result = _gemini_log_result(error.code)
+        raise
+    finally:
+        _log_gemini_event(
+            "gemini_request_end",
+            elapsed_ms=max(0, round((monotonic() - started_at) * 1000)),
+            result=result,
+            http_status=http_status,
+            timeout_phase=timeout_phase,
         )
-    if status == 404:
-        raise GeminiProviderError(
-            "model_unavailable", "선택한 Gemini 모델을 사용할 수 없어요. 운영자가 모델 접근 권한을 확인해 주세요."
-        )
-    if status == 429:
-        raise GeminiProviderError(
-            "quota", "Gemini 무료 요청 한도에 도달했어요. 잠시 후 또는 다음 날 다시 이용해 주세요."
-        )
-    if status >= 500:
-        raise GeminiProviderError(
-            "server", "Gemini 서비스에 일시적인 문제가 있어요. 잠시 후 다시 이용해 주세요."
-        )
-    if status < 200 or status >= 300:
-        raise GeminiProviderError("http", "Gemini가 질문을 처리하지 못했어요. 잠시 후 다시 이용해 주세요.")
-    try:
-        payload = response.json()
-    except (ValueError, TypeError):
-        raise GeminiProviderError("invalid_response", "Gemini 응답을 읽지 못했어요. 잠시 후 다시 이용해 주세요.") from None
-    if not isinstance(payload, Mapping):
-        raise GeminiProviderError("invalid_response", "Gemini 응답을 읽지 못했어요. 잠시 후 다시 이용해 주세요.")
-    return _gemini_text(payload)
 
 
 @dataclass(frozen=True)

@@ -210,6 +210,21 @@ class PublicQuestionTests(unittest.IsolatedAsyncioTestCase):
                 if "병신" in prompt:
                     ns["_generate_text_response"].assert_not_awaited()
 
+    async def test_slow_and_http_failures_are_deferred_private_and_never_retried(self):
+        for code in ("timeout", "network", "quota", "authentication", "model_unavailable", "server"):
+            with self.subTest(code=code):
+                ns = services()
+                target = interaction()
+                async def fail_after_defer(*_args, **_kwargs):
+                    self.assertTrue(target.response.is_done())
+                    raise ai_providers.GeminiProviderError(code, "안전한 오류 안내")
+                ns["_generate_text_response"] = AsyncMock(side_effect=fail_after_defer)
+                await ns["_question_interaction_service"](target, "private prompt")
+                target.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+                target.channel.send.assert_not_awaited()
+                target.followup.send.assert_awaited_once_with("안전한 오류 안내", ephemeral=True)
+                ns["_generate_text_response"].assert_awaited_once()
+
     async def test_missing_channel_or_send_permission_is_private(self):
         for missing in (True, False):
             ns = services()
