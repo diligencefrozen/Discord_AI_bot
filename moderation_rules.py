@@ -9,7 +9,9 @@ without importing ``main.py``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import re
+import string
 import time
 import unicodedata
 from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
@@ -37,48 +39,193 @@ BAD_ROOTS = frozenset(
 # before the normal message moderation path in ``main.py``.
 AI_PROMPT_COMMANDS = frozenset(("ask", "img"))
 
-# Zero-width formatting characters are removed before matching.  The filler
-# set is intentionally small and a maximum gap is enforced; arbitrary junk
-# between every character caused the old pattern to over-match normal prose.
+# Exact source strings are the policy entries: case variants remain distinct
+# for display/counting even though they share a case-insensitive matcher.
+# This is the only active list; a read-only admin view needs no separate state.
+def active_bad_roots() -> tuple[str, ...]:
+    """Return every distinct original policy entry in stable display order."""
+
+    return tuple(sorted(BAD_ROOTS, key=lambda root: (root.casefold(), root)))
+
+
+# Zero-width formatting characters are removed before matching.  Only ASCII
+# letters/digits, Hangul jamo, whitespace and punctuation may fill a gap.  A
+# complete Korean syllable is never filler, preventing normal prose from
+# joining unrelated words.  Sixteen characters cover common obfuscation while
+# setting an explicit limit on how far a partial root may span.
 ZERO_WIDTH_CHARS = frozenset("\u00ad\u034f\u061c\u180e\u200b\u200c\u200d\u2060\ufeff")
-_GAP_CHARS = r"\s\u2000-\u200a\u2028\u2029.,!?~:;/'\"`_+=|\\-"
-_MAX_GAP = 2
+MAX_FILLER_GAP = 16
+_ASCII_PUNCTUATION = frozenset(string.punctuation)
 
 
 def normalize_text(text: str) -> str:
-    """Normalize Unicode and remove invisible formatting characters."""
+    """Use the same compatibility/canonical normalization for roots and text."""
 
     normalized = unicodedata.normalize("NFKC", str(text))
-    return "".join(ch for ch in normalized if ch not in ZERO_WIDTH_CHARS)
+    visible = "".join(ch for ch in normalized if ch not in ZERO_WIDTH_CHARS)
+    return unicodedata.normalize("NFD", visible)
 
 
-def _pattern_for(root: str) -> re.Pattern[str]:
-    # Permit at most two ordinary separators between root characters.  This
-    # catches common spacing/punctuation obfuscation while bounding false hits.
-    gap = f"[{_GAP_CHARS}]{{0,{_MAX_GAP}}}"
-    return re.compile(gap.join(re.escape(ch) for ch in root), re.IGNORECASE)
+def _matching_atoms(text: str) -> str:
+    # Canonical Hangul syllables form one matching atom.  Without this grouping,
+    # NFD's vowel in an ordinary syllable such as '고' would match the single
+    # configured jamo root 'ㅗ', and syllable parts could become gap filler.
+    return unicodedata.normalize("NFC", normalize_text(text)).casefold()
 
 
-_PATTERNS = tuple((root, _pattern_for(root)) for root in sorted(BAD_ROOTS, key=lambda x: (-len(x), x)))
+def _is_filler(ch: str) -> bool:
+    number = ord(ch)
+    return (
+        "a" <= ch <= "z"
+        or "0" <= ch <= "9"
+        or ch.isspace()
+        or ch in _ASCII_PUNCTUATION
+        or unicodedata.category(ch).startswith("P")
+        or 0x1100 <= number <= 0x11FF
+        or 0x3130 <= number <= 0x318F
+        or 0xA960 <= number <= 0xA97F
+        or 0xD7B0 <= number <= 0xD7FF
+    )
+
+
+@dataclass(frozen=True)
+class _RuleNode:
+    parent: int
+    output: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class _CompiledRules:
+    roots: tuple[str, ...]
+    nodes: tuple[_RuleNode, ...]
+    transitions: Mapping[str, tuple[int, ...]]
+    latin_roots: tuple[tuple[int, str], ...]
+
+
+@lru_cache(maxsize=32)
+def _compile_rules(roots: tuple[str, ...]) -> _CompiledRules:
+    """Build a prefix trie, sharing normalized equivalents internally only."""
+
+    prefixes: dict[str, int] = {}
+    nodes: list[_RuleNode] = []
+    transitions: dict[str, list[int]] = {}
+    original_roots: list[str] = []
+    normalized_roots: set[str] = set()
+    latin_roots: list[tuple[int, str]] = []
+    for root in roots:
+        normalized = _matching_atoms(root)
+        if not normalized or normalized in normalized_roots:
+            continue
+        normalized_roots.add(normalized)
+        output = len(original_roots)
+        original_roots.append(root)
+        if normalized.isascii() and normalized.isalpha():
+            latin_roots.append((output, normalized))
+            continue
+        parent = -1
+        for length in range(1, len(normalized) + 1):
+            prefix = normalized[:length]
+            node_id = prefixes.get(prefix)
+            if node_id is None:
+                node_id = len(nodes)
+                prefixes[prefix] = node_id
+                nodes.append(_RuleNode(parent))
+                transitions.setdefault(prefix[-1], []).append(node_id)
+            if length == len(normalized):
+                nodes[node_id] = _RuleNode(nodes[node_id].parent, output)
+            parent = node_id
+    # Children run first so one character cannot advance several positions of
+    # a repeated-letter root.  Parent nodes are always created before children.
+    return _CompiledRules(
+        tuple(original_roots), tuple(nodes),
+        {ch: tuple(sorted(ids, reverse=True)) for ch, ids in transitions.items()},
+        tuple(latin_roots),
+    )
+
+
+_DEFAULT_RULES = _compile_rules(tuple(sorted(BAD_ROOTS, key=lambda root: (-len(root), root))))
+
+
+def _find_obfuscated_latin(text: str, root: str) -> bool:
+    """Match separated Latin roots without joining ordinary prose or URLs.
+
+    Literal substrings retain the existing policy separately.  Obfuscated
+    English forms need word boundaries and may use explicit filler other than
+    Latin letters.  Otherwise e.g. the 's://ex' in 'https://example.com' would
+    become 'sex', or ordinary English words could form unrelated subsequences.
+    """
+
+    latest = [-1] * len(root)
+    last_non_filler = -1
+    for position, ch in enumerate(text):
+        for offset in range(len(root) - 1, -1, -1):
+            if ch != root[offset]:
+                continue
+            if offset == 0:
+                previous = text[position - 1] if position else ""
+                if previous and (previous.isalnum() or previous == "_"):
+                    continue
+            else:
+                previous_position = latest[offset - 1]
+                if (
+                    previous_position < 0
+                    or previous_position < last_non_filler
+                    or position - previous_position > MAX_FILLER_GAP + 1
+                ):
+                    continue
+            latest[offset] = position
+            if offset == len(root) - 1:
+                following = text[position + 1] if position + 1 < len(text) else ""
+                if not following or not (following.isalnum() or following == "_"):
+                    return True
+        if "a" <= ch <= "z" or not _is_filler(ch):
+            last_non_filler = position
+    return False
 
 
 def find_badroot(text: str, roots: Iterable[str] = BAD_ROOTS) -> Optional[str]:
     """Return the configured root found in *text*, or ``None``.
 
-    Matching runs against NFKC text with zero-width characters removed.  A
-    caller may pass a configured subset (for example, a guild-managed list).
+    A deterministic prefix-state scan permits up to ``MAX_FILLER_GAP`` explicit
+    filler atoms between characters.  It has no regex backtracking: each input
+    character visits only trie transitions for that literal character, with
+    bounded state independent of message length.  Original policy priority is
+    retained (longest root first, then original string), including custom sets.
     """
 
-    normalized = normalize_text(text)
-    patterns = _PATTERNS if roots is BAD_ROOTS else tuple(
-        (root, _pattern_for(root))
-        for root in sorted(set(roots), key=lambda x: (-len(x), x))
-        if root
+    rules = _DEFAULT_RULES if roots is BAD_ROOTS else _compile_rules(
+        tuple(sorted({root for root in roots if root}, key=lambda root: (-len(root), root)))
     )
-    for root, pattern in patterns:
-        if pattern.search(normalized):
-            return root
-    return None
+    latest = [-1] * len(rules.nodes)
+    last_non_filler = -1
+    best: Optional[int] = None
+    normalized = _matching_atoms(text)
+    for output, latin_root in rules.latin_roots:
+        if best is not None and output >= best:
+            continue
+        if latin_root in normalized or _find_obfuscated_latin(normalized, latin_root):
+            best = output
+            if best == 0:
+                return rules.roots[0]
+    for position, ch in enumerate(normalized):
+        for node_id in rules.transitions.get(ch, ()):
+            node = rules.nodes[node_id]
+            if node.parent >= 0:
+                previous = latest[node.parent]
+                if (
+                    previous < 0
+                    or previous < last_non_filler
+                    or position - previous > MAX_FILLER_GAP + 1
+                ):
+                    continue
+            latest[node_id] = position
+            if node.output is not None and (best is None or node.output < best):
+                best = node.output
+                if best == 0:
+                    return rules.roots[0]
+        if not _is_filler(ch):
+            last_non_filler = position
+    return rules.roots[best] if best is not None else None
 
 
 def parse_command(content: str, prefixes: Sequence[str] = ("!", "/")) -> Optional[str]:
@@ -180,6 +327,13 @@ def lookup_exemption(
         if isinstance(entry, Mapping) and _active(entry, now):
             return Exemption("reward", key, "all")
     for key, entry in rewards.items():
+        if (
+            isinstance(entry, Mapping)
+            and _active(entry, now)
+            and entry.get("type") in ("all", "trial")
+        ):
+            return Exemption("reward", str(key), "all")
+    for key, entry in rewards.items():
         if not isinstance(entry, Mapping) or not _active(entry, now):
             continue
         # Achievement counters in the legacy pickle are keyed by name and do
@@ -187,9 +341,8 @@ def lookup_exemption(
         effect_kind = entry.get("type") or (
             kind if str(key) == f"achievement_{kind}" else None
         )
-        if effect_kind == "all" or effect_kind == kind:
-            if effect_kind == "all" or int(entry.get("count", 0)) > 0:
-                return Exemption("reward", str(key), str(effect_kind))
+        if effect_kind == kind and int(entry.get("count", 0)) > 0:
+            return Exemption("reward", str(key), str(effect_kind))
     return None
 
 
@@ -207,7 +360,7 @@ def consume_exemption(
     if found is None:
         return None
     entry = user_state.setdefault("rewards_active", {}).get(found.key)
-    if isinstance(entry, MutableMapping) and "count" in entry:
+    if found.kind != "all" and isinstance(entry, MutableMapping) and "count" in entry:
         entry["count"] = int(entry.get("count", 0)) - 1
         if entry["count"] <= 0:
             user_state["rewards_active"].pop(found.key, None)

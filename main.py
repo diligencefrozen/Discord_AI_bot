@@ -8,7 +8,6 @@ from discord.ext import commands
 from pytz import timezone
 from typing import Optional, List
 from deep_translator import GoogleTranslator
-from huggingface_hub import InferenceClient
 from collections import deque, Counter
 from dotenv import load_dotenv    
 from discord.ui import View, Button 
@@ -28,11 +27,15 @@ from bot_storage import PickleStore
 from bot_metrics import MetricsStore
 from ai_providers import (
     AIProviderError,
+    GeminiConfig,
+    GeminiRateLimiter,
     HordeConfig,
+    generate_gemini_text,
     generate_horde_image,
-    generate_horde_text,
 )
 from moderation_rules import (
+    BAD_ROOTS,
+    active_bad_roots,
     find_badroot as find_badroot_strict,
     lookup_exemption as lookup_rule_exemption,
     parse_command,
@@ -40,10 +43,12 @@ from moderation_rules import (
 from bot_ui import (
     FeatureMenuView,
     IntroView,
+    TypingIntroView,
     is_admin_authorized,
     register_slash_commands,
     SlashCommandRegistrationState,
     typing_intro_payload,
+    send_active_rules_response,
 )
 
 # Load local development settings before resolving state paths. Northflank
@@ -766,7 +771,7 @@ def _consume_legacy_exemption(user_id: int, kind: str) -> bool:
     if found is None:
         return False
     entry = data.setdefault("rewards_active", {}).get(found.key)
-    if isinstance(entry, dict) and "count" in entry:
+    if found.kind != "all" and isinstance(entry, dict) and "count" in entry:
         entry["count"] = int(entry.get("count", 0)) - 1
         if entry["count"] <= 0:
             data["rewards_active"].pop(found.key, None)
@@ -795,7 +800,7 @@ def is_user_exempt_from_profanity(user_id: int) -> bool:
 
 def use_profanity_pass(user_id: int):
     # Explicitly consume a counted pass only after a moderation decision.
-    _consume_legacy_exemption(user_id, "profanity")
+    return _consume_legacy_exemption(user_id, "profanity")
 
 async def safe_delete(message: discord.Message, *, reason: str = "moderation") -> bool:
     """Delete a moderation target and log every failure without message text."""
@@ -814,10 +819,9 @@ async def _moderate_message_content(message: discord.Message) -> bool:
     root = find_badroot(content)
     profanity_violation = root and channel_id not in EXEMPT_PROFANITY_CHANNEL_IDS
     if link_violation or profanity_violation:
-        if is_user_exempt_from_profanity(user_id):
+        if use_profanity_pass(user_id):
             # A single message consumes at most one pass even when it contains
             # both a blocked link and a configured profanity root.
-            use_profanity_pass(user_id)
             if link_violation:
                 try:
                     await message.add_reaction("🔗")
@@ -1447,10 +1451,10 @@ def _wiki_search(query: str, k: int) -> List[str]:
         base_url = "https://ko.wikipedia.org/wiki" if lang == "ko" else "https://en.wikipedia.org/wiki"
         urls = [f"{base_url}/{r['title'].replace(' ', '_')}" for r in results]
         
-        logging.debug(f"Wikipedia 검색 성공: {query} ({lang}) - {len(urls)}개 결과")
+        logging.debug("Wikipedia 검색 성공: language=%s results=%s", lang, len(urls))
         return urls
     except Exception as e:
-        logging.error(f"Wikipedia search error: {e}")
+        logging.warning("Wikipedia search failed")
         return []
 
 def _sync_search(query: str, k: int) -> List[str]:
@@ -1459,7 +1463,7 @@ def _sync_search(query: str, k: int) -> List[str]:
     results = _wiki_search(query, k)
     
     if not results:
-        logging.warning(f"검색 결과 없음: {query}")
+        logging.warning("검색 결과 없음")
     
     return results
 
@@ -1549,8 +1553,13 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
             if msg.author.id == user.id:
                 return
 
-        payload = typing_intro_payload(user)
-        payload["view"] = _intro_view()
+        payload = typing_intro_payload(
+            user,
+            question_service=_question_interaction_service,
+            image_service=_image_interaction_service,
+            growth_service=_growth_interaction_service,
+            menu_service=_menu_interaction_service,
+        )
         async with _typing_notice_send_lock:
             now_ts = time.time()
             last_ts = _last_typing_notice.get(scope_key)
@@ -1569,35 +1578,24 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
         _typing_tasks.pop(key, None)
 
 # ────────── AI / Discord 설정 ──────────
-# AI Horde is the free default.  Hugging Face remains available only when an
-# operator explicitly selects it; there is no paid-provider auto-fallback.
-AI_PROVIDER   = (os.environ.get("AI_PROVIDER") or "aihorde").strip().lower()
-if AI_PROVIDER in {"horde", "ai-horde", "ai_horde"}:
-    AI_PROVIDER = "aihorde"
-elif AI_PROVIDER in {"hf", "huggingface", "novita"}:
-    AI_PROVIDER = "huggingface"
-elif AI_PROVIDER != "aihorde":
-    raise RuntimeError("AI_PROVIDER must be 'aihorde' or 'huggingface'")
-
-HF_TOKEN      = os.environ.get("HF_TOKEN")
-PROVIDER      = os.environ.get("HF_PROVIDER", "novita")
-MODEL         = os.environ.get("HF_MODEL", "openai/gpt-oss-20b")
+# Text questions and image generation have independent, fixed providers.
+# AI_PROVIDER/AI_BACKEND are accepted legacy deployment settings; neither
+# can redirect questions or images to another service.
+AI_PROVIDER = "aihorde"
+TEXT_AI_CONFIG_ERROR = None
+try:
+    GEMINI_CONFIG = GeminiConfig.from_env()
+    GEMINI_CONFIG.validate()
+    GEMINI_LIMITER = GeminiRateLimiter(GEMINI_CONFIG)
+except AIProviderError as exc:
+    GEMINI_CONFIG = None
+    GEMINI_LIMITER = None
+    TEXT_AI_CONFIG_ERROR = str(exc)
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 MAX_TOKENS = 512
-MAX_MSG   = 1900
-FILE_TH   = 6000
-HF_IMG_TOKEN = os.environ.get("HF_IMG_TOKEN")
-IMG_MODEL    = os.environ.get("HF_IMG_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+MAX_MSG = 1900
+FILE_TH = 6000
 HORDE_CONFIG = HordeConfig.from_env()
-# 새로운 Inference Providers API 엔드포인트 사용 (2025년 11월 1일부터 필수)
-ENDPOINT     = f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}"
-HEADERS      = {"Authorization": f"Bearer {HF_IMG_TOKEN}"} if HF_IMG_TOKEN else {}
-# InferenceClient - 새 API 엔드포인트로 모델 URL 직접 지정
-img_client  = (
-    InferenceClient(model=f"https://router.huggingface.co/hf-inference/models/{IMG_MODEL}", token=HF_IMG_TOKEN)
-    if HF_IMG_TOKEN
-    else None
-)
 
 # macOS 일부 환경에서 기본 CA 경로 인식 실패 대응
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
@@ -1605,36 +1603,14 @@ os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
 if not DISCORD_TOKEN:
     raise RuntimeError("환경변수(DISCORD_TOKEN)가 비었습니다. .env 확인")
-if AI_PROVIDER == "huggingface" and not (HF_TOKEN and HF_IMG_TOKEN):
-    raise RuntimeError(
-        "AI_PROVIDER=huggingface 인 경우 HF_TOKEN과 HF_IMG_TOKEN이 필요합니다"
-    )
-
-# 매달 5만 token(=입력+출력)을 넘지 않도록 간단히 차단
-TOKEN_BUDGET = 50_000          # novita 무료 월 한도
-token_used = 0                 # 전역 카운터
-
-def charge(tokens):
-    global token_used
-    token_used += tokens
-    if token_used > TOKEN_BUDGET:
-        raise RuntimeError("Free quota exhausted – further calls blocked!")
-        
 # ────────── 로깅 ──────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s │ %(message)s")
-if not (os.getenv("SPECIAL_ADMIN_USER_ID") or "").strip():
-    logging.warning(
-        "SPECIAL_ADMIN_USER_ID is not configured; administrator access is owner-only"
-    )
-
-# ────────── 토큰 예산 ──────────
-TOKEN_BUDGET = 50_000
-token_used = 0
-def charge(tokens: int):
-    global token_used
-    token_used += tokens
-    if token_used > TOKEN_BUDGET:
-        raise RuntimeError("Free quota exhausted – further calls blocked!")
+if not any((os.getenv(name) or "").strip() for name in ("SPECIAL_ADMIN_USER_ID", "SPECIAL_ADMIN_USER_IDS")):
+    logging.warning("Padak IDs are not configured; administrator access is owner-only")
+if TEXT_AI_CONFIG_ERROR:
+    logging.warning("Gemini questions unavailable: %s", TEXT_AI_CONFIG_ERROR)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ────────── 번역 도우미 ──────────
 def translate_to_korean(text: str) -> str:
@@ -1926,45 +1902,16 @@ def make_enlarge_embed(user: discord.Member, img_url: str) -> discord.Embed:
 # ────────────────────────────────────────────────────────────────────────────
 # 금칙어(욕설,혐오) 패턴 – filler 패턴으로 우회 입력도 탐지
 # ────────────────────────────────────────────────────────────────────────────
-BAD_ROOTS = {
-    "씨발","시발","지랄","존나","섹스","병신","새끼","애미","에미","븅신","보지",
-    "한녀","느금","페미","패미","짱깨","닥쳐","노무","정공","씹놈","씹년","십놈",
-    "십년","계집","장애","시팔","씨팔","ㅈㄴ","ㄷㅊ","ㅈㄹ","미친","미띤","애비",
-    "ㅅㅂ","ㅆㅂ","ㅇㅁ","ㄲㅈ","ㅄ","닥치","씨벌","시벌","븅띤","치매","또라이",
-    "도라이","피싸개","정신병","조선족","쪽발이","쪽빨이","쪽바리","쪽팔이", "노예",
-    "아가리","ㅇㄱㄹ","fuck","좆","설거지","난교","재명","재앙","개놈","개년",
-    "sex", "ㅗ", "아줌마", "노괴", "무현", "엿", "돌아이", "ㄴㄱㅁ", "Fuck", "FUCK",
-    "자지", "씹치", "씹덕", "걸레", "갈보", "창녀", "창남", "꽃뱀",
-    "틀딱", "맘충", "한남", "된장녀", "김치녀", "보슬아치", "급식",
-    "짱개", "왜구", "쪽국", "섬숭이", "쪽숭이", "찌질", "관종", "호구", "흑우", "베충", "일베",
-}
-FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
-BANNED_PATTERNS = [re.compile(FILLER.join(map(re.escape, w)), re.I) for w in BAD_ROOTS]
-
-BANNED_INDEX = []     
+# The moderation engine owns the only policy vocabulary and matcher.
 EXEMPT_PROFANITY_CHANNEL_IDS = set()
 
-def rebuild_bad_index(words: Optional[set] = None) -> None:
-
-    global BANNED_INDEX, BANNED_PATTERNS, BAD_ROOTS
-    if words is None:
-        words = BAD_ROOTS
-    idx = []
-    for w in sorted(set(words)):
-        if not w:
-            continue
-        pat = re.compile(FILLER.join(map(re.escape, w)), re.I)
-        idx.append((w, pat))
-    BANNED_INDEX = idx
-    BANNED_PATTERNS = [p for _, p in idx]  # (기존 for p in BANNED_PATTERNS: 루프 호환용)
 
 def find_badroot(text: str) -> Optional[str]:
-    # Keep the legacy function name while using the bounded, Unicode-aware
-    # matcher. The original index remains available for compatibility with
-    # callers that inspect or rebuild it.
-    return find_badroot_strict(text, BAD_ROOTS)
+    return find_badroot_strict(text)
 
-rebuild_bad_index()
+
+# Kept solely for the existing game-promotion keyword patterns below.
+FILLER = r"[ㄱ-ㅎㅏ-ㅣa-zA-Z0-9\s/@!:;#\-\_=+.,?'\"{}\[\]|`~<>]*"
 
 # “항상 4문장 이하로 요약 답변” 시스템 프롬프트
 SYS_PROMPT = (
@@ -2012,10 +1959,6 @@ SYS_PROMPT = (
     'Now go forth and charm the world! 🚀💖'
 )
 
-# Hugging Face InferenceClient.  It is intentionally optional so an AI Horde
-# deployment does not need to configure or pay for a Hugging Face provider.
-hf = InferenceClient(provider=PROVIDER, api_key=HF_TOKEN) if HF_TOKEN else None
-
 AI_IMAGE_FAILURE_MESSAGE = "무료 이미지 서버가 혼잡해요. 잠시 뒤 다시 시도해 주세요."
 try:
     _image_concurrency_limit = max(1, int(os.getenv("IMAGE_CONCURRENCY_LIMIT", "2")))
@@ -2041,58 +1984,26 @@ async def _reserve_image_request(requester_id: Optional[int]) -> None:
         _last_image_request[requester_id] = now
 
 
-async def _generate_text_response(prompt: str) -> str:
-    """Generate text through the selected provider without implicit fallback."""
-
-    if AI_PROVIDER == "aihorde":
-        return await generate_horde_text(
-            prompt,
-            system_prompt=SYS_PROMPT,
-            max_tokens=MAX_TOKENS,
-            temperature=0.3,
-            config=HORDE_CONFIG,
-        )
-    if hf is None:
-        raise AIProviderError("HF_TOKEN is required when AI_PROVIDER=huggingface")
-    result = await asyncio.to_thread(
-        hf.chat.completions.create,
-        model=MODEL,
-        messages=[{"role": "system", "content": SYS_PROMPT}, {"role": "user", "content": prompt}],
+async def _generate_text_response(prompt: str, *, requester_id: Optional[int] = None) -> str:
+    """Use the same Gemini adapter and shared limiter for every question."""
+    if GEMINI_CONFIG is None:
+        raise AIProviderError(TEXT_AI_CONFIG_ERROR or "Gemini 질문 설정을 확인해 주세요.")
+    return await generate_gemini_text(
+        prompt,
+        system_prompt=SYS_PROMPT,
         max_tokens=MAX_TOKENS,
         temperature=0.3,
+        config=GEMINI_CONFIG,
+        limiter=GEMINI_LIMITER,
+        user_id=requester_id,
     )
-    return result.choices[0].message.content
 
 
 async def _generate_image_bytes(prompt: str, *, requester_id: Optional[int] = None) -> bytes:
-    """Generate image bytes through the selected provider without fallback."""
-
+    """Images always use the existing Horde settings, independently of Gemini."""
     await _reserve_image_request(requester_id)
     async with _image_generation_semaphore:
-        if AI_PROVIDER == "aihorde":
-            return await generate_horde_image(prompt, config=HORDE_CONFIG)
-        if not HF_IMG_TOKEN:
-            raise AIProviderError("HF_IMG_TOKEN is required when AI_PROVIDER=huggingface")
-        async with httpx.AsyncClient(timeout=120) as ac:
-            response = await ac.post(
-                ENDPOINT,
-                headers=HEADERS,
-                json={
-                    "inputs": prompt,
-                    "options": {"wait_for_model": True},
-                    "parameters": {
-                        "negative_prompt": " ",
-                        "num_inference_steps": 40,
-                        "guidance_scale": 7.0,
-                        "width": 512,
-                        "height": 512,
-                    },
-                },
-            )
-        response.raise_for_status()
-        if not response.headers.get("content-type", "").startswith("image"):
-            raise AIProviderError("Hugging Face returned a non-image response")
-        return response.content
+        return await generate_horde_image(prompt, config=HORDE_CONFIG)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2196,17 +2107,16 @@ async def on_message_delete(message: discord.Message):
     if not log_ch:
         return
     ts = datetime.datetime.now(seoul_tz).strftime("%Y-%m-%d %H:%M:%S")
-    content = (message.content or "[첨부 파일 / 스티커 등]")[:1024]
     embed = (
         discord.Embed(
             title="메시지 삭제 기록",
             description=f"**User:** {message.author.mention}\n**Channel:** {message.channel.mention}",
             color=0xFF0000,
         )
-        .add_field(name="Deleted Content", value=content, inline=False)
+        .add_field(name="메시지 ID", value=str(message.id), inline=False)
         .set_footer(text=f"{message.guild.name} | {ts}")
     )
-    await log_ch.send(embed=embed)
+    await log_ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 # ───────────────── Game promo cards ─────────────────
 GAME_CARDS: dict[str, dict] = {
@@ -2603,7 +2513,6 @@ async def on_message(message: discord.Message):
 
     # 1-2 핫 키워드를 위한 설정
     push_recent_message(message.channel.id, message.clean_content)
-    logging.info("[RECENT][ch=%s] %r", message.channel.id, message.clean_content[:80])
 
     # 1-4) 멘션 / 답장 감지 
     if message.mentions or message.reference:
@@ -2970,7 +2879,7 @@ async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
         try:
             img_bytes = await _generate_image_bytes(prompt, requester_id=ctx.author.id)
         except Exception:
-            logging.exception("Image generation failed")
+            logging.warning("Image generation failed")
             await ctx.reply(AI_IMAGE_FAILURE_MESSAGE)
             return
 
@@ -3730,21 +3639,20 @@ async def ask(ctx: commands.Context, *, prompt: Optional[str] = None):
         preface = "💡 예시 질문으로 ‘애플페이가 뭐야?’를 보여 드릴게요!\n다음부터는 `!ask 질문내용` 형식으로 물어보시면 됩니다.\n\n**⚠️ 도리봇은 실수를 할 수 있습니다. 중요한 정보는 재차 확인하세요.**\n\n"
     else:
         preface = ""
-    async with ctx.typing():
-        try:
-            answer = preface + keep_last_paragraph(await _generate_text_response(prompt))
-        except Exception:
-            logging.exception("Prefix question failed")
-            answer = "⚠️ 질문 처리 중 문제가 발생했어요. 잠시 뒤 다시 시도해 주세요."
-    if len(answer) > FILE_TH:
-        await ctx.reply(
-            "📄 답변이 길어 파일로 첨부했어요!",
-            file=discord.File(io.StringIO(answer), "answer.txt"),
-        )
+    try:
+        async with ctx.typing():
+            answer = preface + strip_think(await _generate_text_response(prompt, requester_id=ctx.author.id))
+        await _publish_question_answer(ctx.reply, answer, requester=ctx.author, mention_author=False)
         return
-    for part in fix_code(split_paragraphs(answer)):
-        await ctx.reply(part)
-        await asyncio.sleep(0.1)
+    except AIProviderError as exc:
+        failure = str(exc)
+    except Exception:
+        logging.warning("Prefix question failed")
+        failure = "⚠️ 질문 처리나 답변 게시에 실패했어요. 채널 권한을 확인하고 잠시 뒤 다시 시도해 주세요."
+    try:
+        await ctx.reply(failure, allowed_mentions=discord.AllowedMentions.none(), mention_author=False)
+    except Exception:
+        logging.warning("Prefix question error delivery failed")
 
 # ────────────────────────────────────────────────────────────────────────────
 # 배틀그라운드 모바일 갤러리 크롤링 - 인기글 TOP 10
@@ -4323,6 +4231,33 @@ async def _interaction_defer(interaction, *, ephemeral=True):
         await response.defer(ephemeral=ephemeral, thinking=True)
 
 
+async def _publish_question_answer(sender, answer: str, *, requester=None, **kwargs):
+    """Publish one complete answer, with only the requester's mention enabled.
+
+    Long answers use a UTF-8 attachment rather than cutting text or breaking
+    Markdown/code fences across messages. A single send also avoids partial
+    multi-message answers when channel permissions change mid-publication.
+    """
+    if not answer or not answer.strip():
+        raise AIProviderError("⚠️ AI가 빈 답변을 보냈어요. 잠시 뒤 다시 시도해 주세요.")
+    requester_id = getattr(requester, "id", None)
+    mention = f"<@{requester_id}>" if type(requester_id) is int else "요청자"
+    header = f"💬 {mention}님이 도리봇 AI에게 질문했어요!\n🤖 도리봇의 답변\n\n"
+    allowed_mentions = discord.AllowedMentions(
+        users=[requester] if type(requester_id) is int else [],
+        roles=False, everyone=False, replied_user=False,
+    )
+    content = header + answer
+    if len(content) <= 2000:
+        return await sender(content, allowed_mentions=allowed_mentions, **kwargs)
+    return await sender(
+        header + "📄 긴 답변 전체를 파일로 첨부했어요.",
+        file=discord.File(io.BytesIO(answer.encode("utf-8")), "answer.txt"),
+        allowed_mentions=allowed_mentions,
+        **kwargs,
+    )
+
+
 def _growth_embed(user) -> discord.Embed:
     data = get_user_xp(user.id)
     xp = data.get("xp", 0)
@@ -4354,18 +4289,15 @@ async def _moderate_ai_prompt_interaction(interaction, prompt: str) -> bool:
     user = getattr(interaction, "user", None)
     user_id = getattr(user, "id", 0)
     channel_id = getattr(getattr(interaction, "channel", None), "id", 0)
-    if LINK_REGEX.search(prompt) and channel_id not in ALLOWED_CHANNELS:
-        if not is_user_exempt_from_profanity(user_id):
-            await _interaction_send(interaction, "⚠️ AI 질문/그림 프롬프트에는 링크를 넣을 수 없습니다.")
-            return False
-        use_profanity_pass(user_id)
-
+    link_violation = LINK_REGEX.search(prompt) and channel_id not in ALLOWED_CHANNELS
     root = find_badroot(prompt)
-    if root and channel_id not in EXEMPT_PROFANITY_CHANNEL_IDS:
-        if not is_user_exempt_from_profanity(user_id):
-            await _interaction_send(interaction, "⚠️ AI 프롬프트를 순화해 주세요.")
-            return False
-        use_profanity_pass(user_id)
+    profanity_violation = root and channel_id not in EXEMPT_PROFANITY_CHANNEL_IDS
+    # The synchronous lookup+consume contains no await: concurrent requests
+    # cannot both spend the same last pass on this process's event loop.
+    if (link_violation or profanity_violation) and not use_profanity_pass(user_id):
+        message = "⚠️ AI 질문/그림 프롬프트에는 링크를 넣을 수 없습니다." if link_violation else "⚠️ AI 프롬프트를 순화해 주세요."
+        await _interaction_send(interaction, message)
+        return False
     return True
 
 
@@ -4378,19 +4310,33 @@ async def _start_interaction_service(interaction):
 
 
 async def _question_interaction_service(interaction, prompt: str):
+    await _interaction_defer(interaction)
     if not await _moderate_ai_prompt_interaction(interaction, prompt):
         _metric("feature_failed")
         return
     _metric("modal_submitted")
-    await _interaction_defer(interaction)
     try:
-        answer = keep_last_paragraph(await _generate_text_response(prompt))
-        await interaction.followup.send(answer[:MAX_MSG], ephemeral=True)
+        channel = getattr(interaction, "channel", None)
+        if channel is None or not hasattr(channel, "send"):
+            raise AIProviderError("답변을 보낼 채널을 찾을 수 없어요. 서버 채널에서 다시 시도해 주세요.")
+        requester = getattr(interaction, "user", None)
+        answer = strip_think(await _generate_text_response(prompt, requester_id=getattr(requester, "id", None)))
+        await _publish_question_answer(channel.send, answer, requester=requester)
         _metric("feature_succeeded")
-    except Exception:
-        logging.exception("Interaction question failed")
-        await interaction.followup.send("⚠️ 질문 처리 중 오류가 발생했습니다.", ephemeral=True)
+    except AIProviderError as exc:
+        await _interaction_send(interaction, str(exc))
         _metric("feature_failed")
+        return
+    except Exception:
+        logging.warning("Interaction question failed")
+        await _interaction_send(interaction, "⚠️ 답변을 게시하지 못했어요. 채널 전송 권한을 확인하고 잠시 뒤 다시 시도해 주세요.")
+        _metric("feature_failed")
+        return
+    try:
+        await _interaction_send(interaction, "✅ 답변을 채널에 올렸어요.")
+    except Exception:
+        # The answer is already public. Never generate or publish it again.
+        logging.warning("Question completion acknowledgement failed")
 
 
 async def _image_interaction_service(interaction, prompt: str):
@@ -4421,10 +4367,10 @@ async def _image_interaction_service(interaction, prompt: str):
         except Exception:
             # The public result is already delivered; do not claim generation
             # failed or retry the upload if only the private acknowledgement fails.
-            logging.warning("Image completion acknowledgement failed", exc_info=True)
+            logging.warning("Image completion acknowledgement failed")
         _metric("feature_succeeded")
     except Exception:
-        logging.exception("Interaction image generation failed")
+        logging.warning("Interaction image generation failed")
         await interaction.followup.send(AI_IMAGE_FAILURE_MESSAGE, ephemeral=True)
         _metric("feature_failed")
 
@@ -4451,10 +4397,12 @@ async def _admin_action_service(interaction, action_id):
     if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
         await _interaction_send(interaction, "⛔ 관리 권한이 없습니다.")
         return
+    if action_id == "admin:rules":
+        await send_active_rules_response(interaction, active_bad_roots(), test_service=_admin_test_service)
+        return
     messages = {
-        "admin:rules": f"현재 금칙어 규칙 {len(BAD_ROOTS)}개가 활성화되어 있습니다.",
-        "admin:logs": "관리 로그는 민감한 원문을 저장하지 않는 운영 로그만 사용합니다.",
-        "admin:settings": "운영 설정은 환경변수와 기존 Pickle 파일 정책을 따릅니다.",
+        "admin:logs": "📋 이 패널의 관리 로그 조회는 아직 지원하지 않습니다. 운영 로그와 삭제 기록은 메시지 원문을 보관하지 않습니다.",
+        "admin:settings": "⚙️ 이 패널의 운영 설정 변경은 아직 지원하지 않습니다. 환경변수와 기존 Pickle 파일 정책을 따릅니다.",
     }
     await _interaction_send(interaction, messages.get(action_id, "관리 작업을 선택해 주세요."))
 
@@ -4505,6 +4453,12 @@ async def on_ready():
         # The typing reminder view is persistent and must be registered once
         # after reconnects so buttons on older public messages keep working.
         bot.add_view(_intro_view())
+        bot.add_view(TypingIntroView(
+            question_service=_question_interaction_service,
+            image_service=_image_interaction_service,
+            growth_service=_growth_interaction_service,
+            menu_service=_menu_interaction_service,
+        ))
         _intro_view_registered = True
     # Load persisted state once; reconnects must not overwrite in-memory writes.
     if not _runtime_tasks_started:

@@ -1,38 +1,63 @@
-# v6 Implementation Status
+# 도리봇 구현·검증 상태
 
-Updated: 2026-10-20 (Asia/Seoul)
+갱신: 2026-10-21 (Asia/Seoul). 기존 인수인계 전체와 AI 답변 공개 추가 요구사항을 반영합니다.
 
-The repository now contains the first complete incremental implementation of the v6 direction while preserving the legacy prefix commands and Pickle file names.
+## 원인과 변경 파일
 
-## Implemented
+| 파일 | 원인과 최종 동작 |
+| --- | --- |
+| `moderation_rules.py` | 기존 2자 구분자만 허용하던 탐지를 Unicode 정규화와 최대 16자 명시적 삽입 문자 탐지로 확장. 기존 금칙어 원문을 보존하고 활성 목록을 단일화. 영문은 직접 부분문자열 일치를 유지하며 우회 탐지는 단어 경계를 확인해 정상 URL/문장을 오인하지 않음. |
+| `main.py` | 중복 금칙어 엔진 제거. 일반 메시지/명령 인수를 XP보다 먼저 검열. 프롬프트의 링크+금칙어 면제권 이중 소모 제거, 시간제 면제 보존. 질문은 Gemini, 그림은 Horde로 고정. |
+| `bot_ui.py` | 타이핑 안내를 하나의 Components V2 Container/TextDisplay/ActionRow 2행으로 구성. 구형 `IntroView`와 신규 `TypingIntroView`를 지속 등록하고 기존 custom ID/콜백 유지. |
+| `bot_ui.py`, `main.py` | 파딱 복수 ID·구형 ID 합집합, 엄격한 정수 검사와 fail closed. 활성 목록 전체·개수·안정적 정렬·페이지 이동·권한 재확인·비공개 조회. |
+| `ai_providers.py` | 기존 httpx로 `gemini-3.5-flash-lite` generateContent 1회 호출. 안전한 헤더/예외, 인증·429·서버·시간 초과·차단/빈 응답 구분, 메모리 RPM/RPD/사용자 쿨다운. Horde 이미지 구현과 구형 환경변수 별칭 보존. |
+| `main.py`, `bot_ui.py` | 질문 입력 전 공개 안내. 버튼·전체 메뉴·슬래시 성공 답변을 요청 채널에 공개. 비공개 defer/완료 확인/실패 처리. 긴 답변은 UTF-8 파일로 온전히 전달하고 요청자 외 멘션 억제. 공개 뒤 완료 확인 실패로 재생성/재게시하지 않음. |
+| `main.py` | 메시지 원문을 남기던 RECENT 운영 로그 제거. Discord 삭제 기록은 메시지 ID·메타데이터만 유지. AI 예외는 원문/응답 본문을 로그에 포함하지 않음. |
+| `.env.example`, `README.md`, `docs/NORTHFLANK_OPERATIONS.md` | 확정 Gemini 모델/변수, 파딱 두 계정, 무료 등급 데이터 처리, DB 없는 배포와 스테이징 절차 안내. |
+| `tests/test_main_services.py` 및 기존 UI/검열/제공자 테스트 | 운영 토큰·상태·네트워크 없이 실제 서비스 함수/모의 HTTP/실제 Discord 객체를 검증. |
 
-- `bot_storage.py`: protocol-4 Pickle persistence, same-directory temporary files, fsync, atomic replacement, rotating `.bak.N` generations, corruption quarantine, backup recovery, schema validation, and a process-wide writer lock.
-- `moderation_rules.py`: NFKC and zero-width normalization, bounded separator matching, preserved `BAD_ROOTS`, known-command gating, and separate exemption lookup/consumption decisions.
-- `bot_ui.py`: four-button public intro view, question/image/moderation-test modals, ephemeral administrator panel, repeated authorization checks, and slash-command registration adapters.
-- `main.py`: storage integration, strict moderation matcher, explicit moderation for `!ask`/`!img` prompt arguments, explicit exemption consumption, persisted typing-reminder cooldowns, four-button typing reminder, asynchronous AI interaction work, slash command sync, and idempotent reconnect tasks.
-- `ai_providers.py`: AI Horde text/image submit-and-poll adapters are the default free provider. Hugging Face remains available only with explicit `AI_PROVIDER=huggingface`; provider failures never trigger a paid fallback.
-- v8 emergency hardening: image results from buttons and `/그림` are posted publicly only after generation succeeds, while failures remain private; image bytes are size/format checked and URL hosts are explicit; image requests have a concurrency limit and per-user cooldown.
-- v8 UI: typing reminders use short Korean content with a user-only mention, neutral persistent buttons, and a private select menu for feature navigation.
-- XP awards now avoid counting filtered link/profanity messages and achievement bonus XP no longer consumes the normal message cooldown or creates a second message event.
-- `.env.example`: Discord, AI Horde, optional Hugging Face, and v6 administrator configuration.
-- `bot_metrics.py`: privacy-minimized aggregate UX counters stored in a JSON file, with no prompts, message content, or user IDs.
-- `.python-version` and dependency pins target Python 3.13 and discord.py 2.7.1. The original requests/urllib3, PyNaCl, and Pillow pins were replaced after a fresh-environment import failure or Python 3.13 support review.
+관리 로그 조회·운영 설정 변경 버튼은 미지원 상태를 정직하게 안내합니다.
+금칙어 추가/삭제·새로운 DB·Pickle 구조 변경·유료 fallback·실제 계정 설정 변경은 추가하지 않았습니다.
 
-## Verification
+## 보존한 기능과 정책
 
-- The prior v6 verification used a fresh Python 3.12.14 environment: requirements installation, `pip check`, dependency imports, token-free Bot construction, and slash registration all passed. The current workstation no longer has that environment; the v7 provider transition adds no package requirement, but a fresh dependency-backed import remains a staging check.
-- Slash command registration previously passed for 시작, 질문, 그림, 내정보, and 관리.
-- Discord UI smoke checks passed: exactly four intro buttons in a 2×2 layout and four administrator buttons.
-- Offline regression suite contains 28 tests covering Pickle recovery/concurrency, moderation normalization and AI prompt command checks, administrator authorization, privacy-safe metrics, slash-sync retry behavior, AI Horde submit/poll behavior, image validation, and the v8 UI contract. The bundled minimal runtime passed 23 tests and skipped five provider tests because `httpx` is not installed; the full 28 passed with a deterministic HTTP test double.
-- State files keep their historical names and Pickle structures. Set `DATA_DIR` to the mounted Northflank volume path (or `STATE_DIR` as an alias) to persist XP, achievements, typing cooldowns, and aggregate metrics; when unset, the historical current-working-directory behavior is retained.
-- CPython 3.13 manylinux dependency resolution passed for all 47 artifacts after pinning Pillow 12.2.0; a clean Python 3.12 environment also passed `pip check`, main import, Bot construction, and slash registration.
-- A temporary-volume smoke test verified that a legacy CWD Pickle is copied into `DATA_DIR` without changing its bytes.
+- 기존 XP/레벨/업적 보상, `daily_xp_data.pkl`, `achievements_data.pkl`, 원자적 저장·백업 복구.
+- 금칙어/링크 예외 채널과 면제권 공동 효력. 위반 메시지/프롬프트당 최대 1회 소모, 정상 허용 시 소모 없음, 시간제 `all`·`trial` 횟수 유지.
+- `!ask`·`!img` 및 나머지 접두사 명령, 기존 슬래시 명령과 `ui:*`/`admin:*` 버튼 식별자.
+- 타이핑 감지 지연 5초·전송 조건·12시간 사용자 범위 쿨다운·채널 쿨다운, 기존/신규 공지의 지속 콜백 등록.
+- 이미지 크기·검증·Horde 설정·동시 생성 제한·사용자 쿨다운·성공 결과 공개와 비공개 완료 확인.
+- 내 성장·전체 메뉴·파딱 패널·활성 목록·탐지 테스트·인터랙션 오류는 비공개.
 
-## Still requiring an external environment
+`!ask`의 오류는 Discord 접두사 명령이 ephemeral을 지원하지 않아 기존처럼 채널에 안전한 문구로 표시합니다.
+AI 질문의 성공 결과는 모든 경로에서 공개이며 질문 원문은 봇이 별도 재게시하지 않습니다.
 
-- Python 3.13 itself is not installed on the current workstation, so the 3.13 interpreter run is not claimed as complete.
-- Discord gateway login, command sync against a real guild, interaction callbacks, AI Horde/Hugging Face API calls, crawler behavior, persistent hosting volume, and 24-hour reconnect behavior require staging credentials and a staging server.
-- The v8 public-image interaction, persistent-view reattachment after restart, and special-admin environment configuration still require a real staging guild test.
-- Existing user Pickle files were not present in the workspace; production backup/restore must be exercised against a copy before rollout.
+## 파딱과 실제 활성 목록
 
-No database or Pickle-to-JSON migration was added. Existing `!` commands remain registered for backward compatibility.
+기본 정책의 원문 99개를 그대로 유지합니다. 정확히 같은 문자열만 중복 제거하고
+`fuck`, `Fuck`, `FUCK`는 표시/개수에서 각각 보존합니다. 매칭은 정규화 동등성을 공유합니다.
+관리 화면은 실제 `moderation_rules.BAD_ROOTS`에서 계산하므로 페이지 전체 항목 수와 `N`이 일치합니다.
+
+배포 변수에는 기존 `855749166764654653`와 신규 `491239880005910538`를 모두 넣어야 합니다.
+단일/복수 ID 합집합·중복 제거·잘못된 값 전체 거부·미설정 소유자 전용·DM 거부·역할 비인가·서버 범위를 검사합니다.
+소유자의 기존 접근은 유지합니다. 모든 관리 진입/클릭/모달/페이지 이동에 서버 측 검사가 있습니다.
+
+## 로컬 검증
+
+- 번들 Python 3.12.14에 전체 requirements를 작업용 `.venv-deps`로 설치했습니다. discord.py 2.7.1/httpx/Pillow 실제 의존성을 사용합니다.
+- 가짜 Discord 토큰, dotenv 비활성화, 임시 데이터 디렉터리로 `main.py` import 및 Bot 생성 성공. 외부 로그인/네트워크 호출은 하지 않았습니다.
+- 실제 라이브러리로 구형/Components V2 View의 persistent 등록과 5개 슬래시 명령(시작/질문/그림/내정보/관리) 등록 성공.
+- 최종 `python -m unittest discover -s tests -v`: **94개 통과, 실패 0, 건너뜀 0** (1.986초). 번들 Python에 `PYTHONPATH=.venv-deps`를 적용해 실행했습니다.
+- 제공자 22개, UI 25개, 검열 규칙 17개, 메인 서비스 17개와 기존 저장/삭제/지표/슬래시 회귀 테스트를 포함합니다. 모의 HTTP 결과는 실제 Gemini/Horde 생성 품질 검증으로 간주하지 않습니다.
+- `py_compile` 및 `git diff --check` 통과. Git의 CRLF 변환 안내는 공백 오류가 아닙니다.
+
+## 실제 환경에서 남은 확인
+
+- Python 3.13 인터프리터 실행 및 Northflank 빌드/런타임/영속 볼륨 검증.
+- Discord gateway 로그인·실제 명령 sync·스케치와 컨테이너 시각 비교·재시작 후 기존/신규 버튼 클릭.
+- 별도 일반 계정의 공개 답변/그림 열람과 실채널 쓰기 권한 거부·임의 멘션 억제.
+- 실제 무료 `tbBot` 프로젝트의 키·모델 접근·한국어/영어 품질·현재 RPM/TPM/RPD, Gemini/Horde 생성 성공.
+- 운영 Pickle 복사본의 백업/복구와 XP·업적·면제권 검증. 저장소에는 실제 사용자 Pickle이 없습니다.
+- Northflank의 신규 파딱 복수 ID 및 Gemini secret 반영, 노출된 Discord/Hugging Face 토큰 폐기·재발급.
+
+[배포 절차와 실제 환경변수](NORTHFLANK_OPERATIONS.md)를 따라 검증 결과를 운영자가 기록해야 합니다.
+코드만 변경하여 실배포 또는 실서버 시각 검증까지 끝났다고 보고하지 않습니다.
