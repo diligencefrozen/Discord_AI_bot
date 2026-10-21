@@ -36,6 +36,7 @@ SERVICE_NAMES = {
     "_interaction_send", "_interaction_defer", "_question_interaction_service",
     "_publish_question_answer", "_generate_text_response", "_generate_image_bytes",
     "_reserve_image_request", "ask", "strip_think", "_send_typing_reminder",
+    "_deliver_typing_reminder", "_typing_scope_key",
     "_image_interaction_service", "on_message_delete",
 }
 
@@ -60,10 +61,9 @@ def services():
         "_last_image_request": {}, "IMAGE_REQUEST_COOLDOWN": 20,
         "THINK_RE": re.compile(r"<think>.*?</think>", re.S),
         "bot": SimpleNamespace(user=None, all_commands={"ask": object(), "img": object(), "xp": object()}, process_commands=AsyncMock()),
-        "TYPE_REMINDER_COOLDOWN": 43200, "TYPE_REMINDER_CHANNEL_COOLDOWN": 60,
+        "TYPE_REMINDER_COOLDOWN": 86400, "TYPE_REMINDER_CHANNEL_COOLDOWN": 60,
         "_last_typing_notice": {}, "_last_typing_channel_notice": {},
         "_typing_notice_send_lock": asyncio.Lock(), "_typing_tasks": {},
-        "_typing_scope_key": lambda channel, user: f"1:{channel.id}:{user.id}",
         "_save_typing_cooldowns": Mock(),
         "AI_IMAGE_FAILURE_MESSAGE": "무료 이미지 서버가 혼잡해요.",
     }

@@ -17,6 +17,7 @@ from itertools import cycle
 from typing import Optional, List, Union, Dict
 from concurrent.futures import ThreadPoolExecutor
 import urllib.parse, textwrap
+import math
 from bs4 import BeautifulSoup  
 from collections import defaultdict, deque, Counter
 from pathlib import Path
@@ -1502,26 +1503,58 @@ ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
-# 12시간 쿨다운과 마지막 안내 시각(UTC timestamp) 저장용
-TYPE_REMINDER_COOLDOWN = 60 * 60 * 12
+# A user sees at most one typing notice in a rolling 24 hours, across channels.
+TYPE_REMINDER_COOLDOWN = 60 * 60 * 24
 TYPE_REMINDER_CHANNEL_COOLDOWN = 60
 TYPE_REMINDER_COOLDOWN_FILE = _state_path("typing_cooldowns.json")
 
 def _load_typing_cooldowns() -> Dict[str, float]:
     try:
         raw = json.loads(TYPE_REMINDER_COOLDOWN_FILE.read_text(encoding="utf-8"))
-        return {str(key): float(value) for key, value in raw.items()}
+        if not isinstance(raw, dict):
+            raise ValueError("invalid cooldown state")
+        notices = {}
+        for key, value in raw.items():
+            parts = str(key).split(":")
+            # Current user:<id>, previous guild:channel:user, and legacy user ID.
+            if len(parts) == 2 and parts[0] == "user":
+                user_id = parts[1]
+            elif len(parts) in (1, 3) and all(part.isascii() and part.isdecimal() for part in parts):
+                user_id = parts[-1]
+            else:
+                continue
+            if (
+                len(user_id) > 20 or not user_id.isascii() or not user_id.isdecimal()
+                or not 0 < int(user_id) < 2**64
+            ):
+                continue
+            try:
+                timestamp = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if isinstance(value, bool) or not math.isfinite(timestamp) or timestamp <= 0:
+                continue
+            canonical = f"user:{int(user_id)}"
+            notices[canonical] = max(notices.get(canonical, 0), timestamp)
+        return notices
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError, TypeError):
+        logging.warning("event=typing_cooldowns_load_failed")
         return {}
 
 
 def _save_typing_cooldowns() -> None:
     temp = TYPE_REMINDER_COOLDOWN_FILE.with_suffix(".tmp")
     try:
-        temp.write_text(json.dumps(_last_typing_notice), encoding="utf-8")
+        TYPE_REMINDER_COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(_last_typing_notice, handle, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temp, TYPE_REMINDER_COOLDOWN_FILE)
-    except OSError:
-        logging.exception("Could not persist typing reminder cooldowns")
+    except (OSError, ValueError, TypeError):
+        logging.warning("event=typing_cooldowns_save_failed")
         try:
             temp.unlink(missing_ok=True)
         except OSError:
@@ -1533,9 +1566,27 @@ _last_typing_channel_notice: Dict[int, float] = {}
 _typing_notice_send_lock = asyncio.Lock()
 
 def _typing_scope_key(channel: ChannelT, user: UserT) -> str:
-    guild = getattr(channel, "guild", None)
-    guild_id = getattr(guild, "id", 0)
-    return f"{guild_id}:{channel.id}:{user.id}"
+    return f"user:{user.id}"
+
+
+async def _deliver_typing_reminder(channel: ChannelT, user: UserT, payload):
+    # This worker owns the lock and survives cancellation of the typing timer.
+    # Keep the final check, send, and cooldown write under the same lock.
+    scope_key = _typing_scope_key(channel, user)
+    async with _typing_notice_send_lock:
+        now_ts = time.time()
+        last_ts = _last_typing_notice.get(scope_key)
+        if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
+            return
+        channel_last_ts = _last_typing_channel_notice.get(channel.id)
+        if channel_last_ts is not None and (now_ts - channel_last_ts) < TYPE_REMINDER_CHANNEL_COOLDOWN:
+            return
+        await channel.send(**payload)
+        sent_at = time.time()
+        _last_typing_notice[scope_key] = sent_at
+        _last_typing_channel_notice[channel.id] = sent_at
+        _save_typing_cooldowns()
+        _metric("intro_viewed")
 
 
 async def _send_typing_reminder(channel: ChannelT, user: UserT,
@@ -1560,22 +1611,22 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
             growth_service=_growth_interaction_service,
             menu_service=_menu_interaction_service,
         )
-        async with _typing_notice_send_lock:
-            now_ts = time.time()
-            last_ts = _last_typing_notice.get(scope_key)
-            if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
-                return
-            channel_last_ts = _last_typing_channel_notice.get(channel.id)
-            if channel_last_ts is not None and (now_ts - channel_last_ts) < TYPE_REMINDER_CHANNEL_COOLDOWN:
-                return
-            await channel.send(**payload)
-
-            _metric("intro_viewed")
-            _last_typing_notice[scope_key] = now_ts
-            _last_typing_channel_notice[channel.id] = now_ts
-            _save_typing_cooldowns()
+        delivery = asyncio.create_task(_deliver_typing_reminder(channel, user, payload))
+        try:
+            await asyncio.shield(delivery)
+        except asyncio.CancelledError:
+            # A new typing event may replace the timer while Discord accepts
+            # the message. Finish recording that delivery before propagating.
+            try:
+                await delivery
+            except Exception:
+                logging.warning("event=typing_notice_failed")
+            raise
+    except Exception:
+        logging.warning("event=typing_notice_failed")
     finally:
-        _typing_tasks.pop(key, None)
+        if _typing_tasks.get(key) is asyncio.current_task():
+            _typing_tasks.pop(key, None)
 
 # ────────── AI / Discord 설정 ──────────
 # Text questions and image generation have independent, fixed providers.
