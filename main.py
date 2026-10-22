@@ -2265,7 +2265,12 @@ LOG_ROUTES = {
 }
 
 CHANNEL_TO_LOG = {src: dst for dst, srcs in LOG_ROUTES.items() for src in srcs}
-DELETION_AUDIT = DeletionAuditService(CHANNEL_TO_LOG, bot.get_channel, guild_resolver=bot.get_guild)
+DELETION_AUDIT = DeletionAuditService(
+    CHANNEL_TO_LOG,
+    bot.get_channel,
+    guild_resolver=bot.get_guild,
+    channel_fetcher=bot.fetch_channel
+)
 ADMIN_SERVICE.delete_service = DELETION_AUDIT.delete
 
 # ────────────────────────────────────────────────────────────────────────────
