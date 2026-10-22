@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import bot_ui
+from slash_visibility import SlashVisibilityAudit, slash_sync_mode
 
 try:
     import discord
@@ -33,6 +34,8 @@ def lifecycle():
         "admin_configuration_diagnostics": bot_ui.admin_configuration_diagnostics,
         "SLASH_COMMAND_NAMES": frozenset(("시작", "질문", "그림", "내정보", "관리")),
         "_slash_registration_state": bot_ui.SlashCommandRegistrationState(),
+        "_slash_visibility_audit": SlashVisibilityAudit(), "slash_sync_mode": slash_sync_mode,
+        "EDIT_MODERATION": SimpleNamespace(start=Mock(), close=AsyncMock()),
         "_intro_view_registered": False, "_runtime_tasks_started": True,
         "_intro_view": lambda: bot_ui.IntroView(), "TypingIntroView": bot_ui.TypingIntroView,
         "load_xp_data": Mock(), "load_achievements_data": Mock(),
@@ -57,16 +60,16 @@ class BotLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bot.tree.get_commands()), 5)
         self.assertTrue(bot.tree.get_command("관리").guild_only)
 
-    async def test_unset_sync_flag_defaults_to_no_remote_write(self):
+    async def test_unset_sync_flag_defaults_to_auto_repair(self):
         ns = lifecycle()
         try:
             with patch.dict(os.environ):
                 os.environ.pop("SLASH_SYNC_ON_STARTUP", None)
-                self.assertFalse(ns["_slash_sync_requested"]())
+                self.assertEqual(ns["_slash_sync_requested"](), "auto")
                 await ns["bot"].setup_hook()
             self.assert_five_commands(ns["bot"])
-            ns["bot"].tree.sync.assert_not_awaited()
-            ns["bot"].tree.fetch_commands.assert_not_awaited()
+            ns["bot"].tree.sync.assert_awaited_once()
+            ns["bot"].tree.fetch_commands.assert_awaited_once()
         finally:
             await ns["bot"].close()
 

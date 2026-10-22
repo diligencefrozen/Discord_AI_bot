@@ -1,5 +1,6 @@
 """Exercise real main adapters without a token, gateway or production state."""
 import ast
+import datetime
 import logging
 import os
 from pathlib import Path
@@ -17,15 +18,22 @@ def adapters():
     names = {"_admin_action_service", "_admin_test_service", "_plain_admin_message_hint"}
     nodes = [node for node in source.body if isinstance(node, ast.AsyncFunctionDef) and node.name in names]
     namespace = {
-        "discord": discord, "logging": logging, "os": os, "time": time,
+        "discord": discord, "datetime": datetime, "logging": logging, "os": os, "time": time,
         "log_admin_access": bot_ui.log_admin_access,
         "_interaction_send": AsyncMock(), "send_active_rules_response": AsyncMock(),
+        "_interaction_defer": AsyncMock(),
         "active_bad_roots": lambda: ("rule",), "find_badroot": lambda value: None,
         "handle_admin_action": AsyncMock(return_value=True),
         "XP_DATA_FILE": Path(__file__),
         "bot": SimpleNamespace(tree=SimpleNamespace(get_commands=lambda: [1] * 5)),
         "_slash_registration_state": SimpleNamespace(synced=False),
-        "DELETION_AUDIT": SimpleNamespace(include_content=True),
+        "DELETION_AUDIT": SimpleNamespace(include_content=True, diagnostics=lambda _guild: {
+            "reason": "ready", "eligible_source_count": 3, "excluded_source_count": 2,
+            "sent": 8, "failures": 1, "bot_view_channel": True,
+            "last_success": datetime.datetime(2026, 10, 22, tzinfo=datetime.timezone.utc)},
+            send_test=AsyncMock(return_value={"result": "ready", "reason": "sent"})),
+        "EDIT_MODERATION": SimpleNamespace(status_text=lambda _guild: "검열 상태: 72시간 / 96시간"),
+        "_slash_visibility_audit": SimpleNamespace(status_text=lambda: "전역 게시 진단"),
         "_admin_text_hint_cooldowns": {},
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), namespace)
@@ -66,6 +74,9 @@ class AdminAdapterTests(unittest.IsolatedAsyncioTestCase):
             text = ns["handle_admin_action"].call_args.kwargs["status_text"]
             self.assertIn("원격 게시 성공: 미확인", text)
             self.assertIn("재시작 시 초기화", text)
+            self.assertIn("기록 가능/제외 채널: 3/2", text)
+            self.assertIn("전송 성공/실패: 8/1", text)
+            self.assertIn("2026-10-22T00:00:00+00:00", text)
 
     async def test_rules_and_test_routes_remain_available(self):
         ns = adapters()
@@ -74,6 +85,21 @@ class AdminAdapterTests(unittest.IsolatedAsyncioTestCase):
         ns["handle_admin_action"].assert_not_awaited()
         await ns["_admin_test_service"](target(), "hello")
         self.assertIn("탐지되지", ns["_interaction_send"].call_args.args[1])
+
+    async def test_edit_status_and_one_synthetic_log_test_use_authenticated_adapters(self):
+        ns = adapters()
+        await ns["_admin_action_service"](target(), "admin:edit-status")
+        self.assertIn("72시간 / 96시간", ns["_interaction_send"].call_args.args[1])
+        ns["DELETION_AUDIT"].send_test.assert_not_awaited()
+        await ns["_admin_action_service"](target(), "admin:deletion-test")
+        ns["_interaction_defer"].assert_awaited_once()
+        ns["DELETION_AUDIT"].send_test.assert_awaited_once()
+        ns["handle_admin_action"].assert_not_awaited()
+        for action in ("admin:edit-status", "admin:deletion-test"):
+            denied = adapters()
+            await denied["_admin_action_service"](target(12), action)
+            denied["DELETION_AUDIT"].send_test.assert_not_awaited()
+            denied["_interaction_defer"].assert_not_awaited()
 
 
 class PlainAdminHintTests(unittest.IsolatedAsyncioTestCase):

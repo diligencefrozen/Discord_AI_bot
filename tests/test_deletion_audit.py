@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from itertools import combinations
+import random
 from time import perf_counter
 from types import SimpleNamespace
 import unittest
@@ -10,7 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 
-from deletion_audit import DeletionAuditService, build_deletion_embed, private_destination_reason, _text
+from deletion_audit import DeletionAuditService, build_deletion_embed, private_destination_reason, public_destination_reason, _text
 from moderation_audit import capture_message_snapshot
 
 
@@ -21,12 +23,16 @@ def permissions(**values):
 
 
 def private_channel():
-    everyone = SimpleNamespace(id=1, permissions=permissions(), tags=None)
-    operator = SimpleNamespace(id=2, permissions=permissions(manage_messages=True), tags=None)
+    everyone = Mock(spec=discord.Role)
+    everyone.id, everyone.permissions, everyone.tags = 1, permissions(view_channel=True), None
+    operator = Mock(spec=discord.Role)
+    operator.id, operator.permissions, operator.tags = 2, permissions(manage_messages=True), None
     bot = SimpleNamespace(id=99)
     guild = SimpleNamespace(id=1, name="test guild", owner_id=10, default_role=everyone, roles=[everyone, operator], me=bot)
     channel = Mock(spec=discord.TextChannel)
-    channel.id, channel.guild, channel.overwrites = 20, guild, {}
+    channel.id, channel.guild = 20, guild
+    channel.overwrites = {everyone: discord.PermissionOverwrite(view_channel=False),
+                          operator: discord.PermissionOverwrite(view_channel=True)}
     channel.send = AsyncMock()
 
     def channel_permissions(target):
@@ -37,6 +43,11 @@ def private_channel():
         return permissions(view_channel=True)
 
     channel.permissions_for.side_effect = channel_permissions
+    source = Mock(spec=discord.TextChannel)
+    source.id, source.name, source.guild, source.overwrites = 11, "public-source", guild, {}
+    source.permissions_for.return_value = permissions(view_channel=True, send_messages=True, embed_links=True)
+    channel.source = source
+    guild.text_channels = [source, channel]
     return channel
 
 
@@ -58,6 +69,55 @@ def raw(message_id=100, **kwargs):
 def field(embed, name):
     name = {"탐지 사유": "탐지 정보"}.get(name, name)
     return next(item.value for item in embed.fields if name in item.name)
+
+
+def reader_pair():
+    """Independent small Discord permission model, including member overrides."""
+    everyone = Mock(spec=discord.Role)
+    everyone.id, everyone.permissions = 1, permissions(view_channel=True)
+    bot = Mock(spec=discord.Member)
+    bot.id, bot.roles = 99, [everyone]
+    members = {}
+    guild = SimpleNamespace(id=1, default_role=everyone, roles=[everyone], me=bot, get_member=members.get)
+    channels = []
+    for channel_id in (11, 20):
+        channel = Mock(spec=discord.TextChannel)
+        channel.id, channel.name, channel.guild, channel.overwrites = channel_id, f"channel-{channel_id}", guild, {}
+        channel.send = AsyncMock()
+
+        def channel_permissions(target, channel=channel):
+            if target is bot:
+                return permissions(view_channel=True, send_messages=True, embed_links=True)
+            member_roles = getattr(target, "roles", None) if isinstance(target, discord.Member) else [everyone, target]
+            member_roles = member_roles or [everyone]
+            if any(role.permissions.administrator for role in member_roles):
+                return permissions(view_channel=True, administrator=True)
+            view = any(role.permissions.view_channel for role in member_roles)
+            overwrite = channel.overwrites.get(everyone)
+            if overwrite is not None and overwrite.view_channel is not None:
+                view = overwrite.view_channel
+            role_values = [channel.overwrites[role].view_channel for role in member_roles
+                           if role is not everyone and role in channel.overwrites]
+            if False in role_values:
+                view = False
+            if True in role_values:
+                view = True
+            overwrite = channel.overwrites.get(target) if isinstance(target, discord.Member) else None
+            if overwrite is not None and overwrite.view_channel is not None:
+                view = overwrite.view_channel
+            return permissions(view_channel=view)
+
+        channel.permissions_for.side_effect = channel_permissions
+        channels.append(channel)
+    guild.text_channels = channels
+    return channels[0], channels[1], members
+
+
+def reader_role(source, role_id, *, view=False, administrator=False):
+    role = Mock(spec=discord.Role)
+    role.id, role.permissions = role_id, permissions(view_channel=view, administrator=administrator)
+    source.guild.roles.append(role)
+    return role
 
 
 class EmbedTests(unittest.TestCase):
@@ -213,10 +273,309 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(private_destination_reason(channel, 1), "destination_unknown_overwrite")
 
 
+class PublicReaderScopeTests(unittest.TestCase):
+    def test_containment_matches_exhaustive_role_combinations(self):
+        rng = random.Random(27)
+        for case in range(24):
+            source, destination, _ = reader_pair()
+            everyone = source.guild.default_role
+            everyone.permissions.view_channel = rng.choice((False, True))
+            roles = [reader_role(source, index, view=rng.choice((False, True)),
+                                 administrator=rng.choice((False, False, False, True))) for index in range(3, 8)]
+            for channel in (source, destination):
+                for role in (everyone, *roles):
+                    value = rng.choice((None, False, True))
+                    if value is not None:
+                        channel.overwrites[role] = discord.PermissionOverwrite(view_channel=value)
+            counterexample = False
+            for count in range(len(roles) + 1):
+                for assigned in combinations(roles, count):
+                    member = Mock(spec=discord.Member)
+                    member.id, member.roles = 40, [everyone, *assigned]
+                    if destination.permissions_for(member).view_channel and not source.permissions_for(member).view_channel:
+                        counterexample = True
+            with self.subTest(case=case):
+                self.assertEqual(public_destination_reason(source, destination, 1) is None, not counterexample)
+
+    def test_public_source_to_single_public_log_is_allowed(self):
+        source, destination, _ = reader_pair()
+        self.assertIsNone(public_destination_reason(source, destination, 1))
+
+    def test_private_source_never_leaks_even_metadata_to_public_log(self):
+        source, destination, _ = reader_pair()
+        source.overwrites[source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        self.assertEqual(public_destination_reason(source, destination, 1), "source_reader_scope_exceeded")
+
+    def test_shared_member_role_with_everyone_denied_at_both_ends_is_allowed(self):
+        source, destination, _ = reader_pair()
+        member_role = reader_role(source, 3)
+        for channel in (source, destination):
+            channel.overwrites[source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+            channel.overwrites[member_role] = discord.PermissionOverwrite(view_channel=True)
+        self.assertIsNone(public_destination_reason(source, destination, 1))
+
+    def test_role_combinations_can_leak_despite_safe_individual_roles(self):
+        source, destination, _ = reader_pair()
+        denied_role = reader_role(source, 3)
+        destination_allow = reader_role(source, 4)
+        source.overwrites[denied_role] = discord.PermissionOverwrite(view_channel=False)
+        destination.overwrites[denied_role] = discord.PermissionOverwrite(view_channel=False)
+        destination.overwrites[destination_allow] = discord.PermissionOverwrite(view_channel=True)
+        self.assertEqual(public_destination_reason(source, destination, 1), "source_reader_scope_exceeded")
+
+    def test_member_denial_in_source_cannot_be_bypassed_by_destination_role(self):
+        source, destination, members = reader_pair()
+        member = Mock(spec=discord.Member)
+        member.id, member.roles = 44, [source.guild.default_role]
+        members[44] = member
+        source.overwrites[member] = discord.PermissionOverwrite(view_channel=False)
+        self.assertEqual(public_destination_reason(source, destination, 1), "source_member_scope_exceeded")
+
+    def test_known_member_role_is_used_for_individual_allow(self):
+        source, destination, members = reader_pair()
+        member_role = reader_role(source, 3)
+        member = Mock(spec=discord.Member)
+        member.id, member.roles = 44, [source.guild.default_role, member_role]
+        members[44] = member
+        for channel in (source, destination):
+            channel.overwrites[source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        source.overwrites[member_role] = discord.PermissionOverwrite(view_channel=True)
+        destination.overwrites[member] = discord.PermissionOverwrite(view_channel=True)
+        self.assertIsNone(public_destination_reason(source, destination, 1))
+
+    def test_unknown_member_allow_is_fail_closed_unless_source_also_allows(self):
+        source, destination, _ = reader_pair()
+        member = discord.Object(id=44, type=discord.User)
+        for channel in (source, destination):
+            channel.overwrites[source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        destination.overwrites[member] = discord.PermissionOverwrite(view_channel=True)
+        self.assertEqual(public_destination_reason(source, destination, 1), "source_member_scope_exceeded")
+        source.overwrites[member] = discord.PermissionOverwrite(view_channel=True)
+        self.assertIsNone(public_destination_reason(source, destination, 1))
+
+    def test_unknown_permission_overwrites_and_foreign_guild_fail_closed(self):
+        source, destination, _ = reader_pair()
+        source.overwrites[object()] = discord.PermissionOverwrite(view_channel=True)
+        self.assertEqual(public_destination_reason(source, destination, 1), "source_permissions_unavailable")
+        source.overwrites = {}
+        destination.guild = SimpleNamespace(id=2)
+        self.assertEqual(public_destination_reason(source, destination, 1), "destination_guild_mismatch")
+
+    def test_bot_permission_failures_have_specific_codes(self):
+        for name in ("view_channel", "send_messages", "embed_links"):
+            with self.subTest(name=name):
+                source, destination, _ = reader_pair()
+                values = dict(view_channel=True, send_messages=True, embed_links=True)
+                values[name] = False
+                destination.permissions_for.side_effect = None
+                destination.permissions_for.return_value = permissions(**values)
+                self.assertEqual(public_destination_reason(source, destination, 1), "destination_bot_" + name)
+
+
+class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.source, self.destination, self.members = reader_pair()
+        self.channels = {11: self.source, 20: self.destination}
+        self.service = DeletionAuditService({11: 20}, self.channels.get)
+
+    async def test_all_sources_reuses_existing_destination_and_excludes_unknown_and_foreign(self):
+        source = Mock(spec=discord.TextChannel)
+        source.id, source.name, source.guild, source.overwrites = 12, "new-public", self.source.guild, {}
+        source.permissions_for.side_effect = self.source.permissions_for.side_effect
+        self.channels[12] = source
+        self.assertEqual(self.service.destination_for(1, 12), 20)
+        self.assertTrue(self.service.can_track_source(source))
+        target = message()
+        target.channel = source
+        await self.service.on_message_delete(target)
+        self.destination.send.assert_awaited_once()
+        self.assertIsNone(self.service.destination_for(2, 12))
+        self.assertIsNone(self.service.destination_for(1, 123))
+        self.assertIsNone(self.service.destination_for(1, 20))
+
+    async def test_unknown_raw_source_has_no_content_or_channel_metadata_publication(self):
+        self.channels.pop(11)
+        await self.service.on_raw_message_delete(raw())
+        self.destination.send.assert_not_awaited()
+        self.assertEqual(self.service.diagnostics(1)["last_reason"], "source_not_text_channel")
+
+    async def test_resolver_id_mismatch_cannot_send_to_another_same_guild_channel(self):
+        self.destination.id = 999
+        self.assertEqual((await self.service.send_test(1))["reason"], "destination_id_mismatch")
+        self.assertFalse(self.service.can_track_source(self.source))
+        await self.service.on_message_delete(message())
+        self.destination.send.assert_not_awaited()
+        self.assertEqual(self.service.diagnostics(1)["last_reason"], "destination_id_mismatch")
+        self.destination.id = 20
+        self.source.id = 999
+        await self.service.on_message_delete(message(message_id=101))
+        self.destination.send.assert_not_awaited()
+        self.assertEqual(self.service.diagnostics(1)["last_reason"], "source_id_mismatch")
+
+    async def test_private_cached_and_raw_deletions_publish_nothing(self):
+        self.source.overwrites[self.source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        await self.service.on_message_delete(message("private-sensitive-content"))
+        await self.service.on_raw_message_delete(raw(101))
+        self.destination.send.assert_not_awaited()
+        status = self.service.diagnostics(1)
+        self.assertEqual(status["last_reason"], "source_reader_scope_exceeded")
+        self.assertNotIn("private-sensitive-content", str(status))
+        self.assertNotIn("channel-11", str(status))
+
+    async def test_test_card_sends_once_to_existing_destination_without_original(self):
+        result = await self.service.send_test(self.source.guild)
+        self.assertEqual((result["result"], result["reason"]), ("ready", "test_sent"))
+        self.destination.send.assert_awaited_once()
+        embed = self.destination.send.call_args.kwargs["embed"]
+        self.assertIn("테스트", embed.title)
+        self.assertEqual(self.destination.send.call_args.kwargs["allowed_mentions"].to_dict()["parse"], [])
+        self.assertIsNotNone(self.service.diagnostics(1)["last_success"])
+
+    async def test_test_card_missing_permissions_fails_without_send(self):
+        self.destination.permissions_for.side_effect = None
+        self.destination.permissions_for.return_value = permissions(view_channel=True, send_messages=True)
+        result = await self.service.send_test(1)
+        self.assertEqual(result["reason"], "destination_bot_embed_links")
+        self.destination.send.assert_not_awaited()
+
+    async def test_actual_delivery_failures_remain_classified_and_content_free(self):
+        class HttpFailure(Exception):
+            status = 429
+        self.destination.send.side_effect = HttpFailure("do-not-log-user-body-or-url")
+        with self.assertLogs("deletion_audit", level="WARNING") as captured:
+            await self.service.on_message_delete(message("do-not-log-user-body-or-url"))
+        self.assertNotIn("do-not-log-user-body-or-url", "\n".join(captured.output))
+        status = self.service.diagnostics(1)
+        self.assertEqual(status["failures"], 1)
+        self.assertEqual(status["last_reason"], "delivery_rate_limited")
+
+    async def test_explicit_extra_source_and_ambiguous_destination_do_not_create_routes(self):
+        source = Mock(spec=discord.TextChannel)
+        source.id, source.name, source.guild, source.overwrites = 12, "extra-public", self.source.guild, {}
+        source.permissions_for.side_effect = self.source.permissions_for.side_effect
+        self.channels[12] = source
+        with patch.dict("os.environ", {"DELETION_LOG_ALL_GUILD_CHANNELS": "0", "DELETION_LOG_EXTRA_SOURCE_CHANNEL_IDS": "12,20"}):
+            service = DeletionAuditService({11: 20}, self.channels.get)
+        self.assertEqual(service.destination_for(1, 12), 20)
+        self.assertIsNone(service.destination_for(1, 20))
+        self.assertIsNone(service.destination_for(1, 13))
+        other = Mock(spec=discord.TextChannel)
+        other.id, other.guild = 21, self.source.guild
+        self.channels[21] = other
+        service.routes[13] = 21
+        self.assertIsNone(service.destination_for(1, 12))
+        self.assertEqual((await service.send_test(1))["reason"], "destination_ambiguous")
+        self.destination.send.assert_not_awaited()
+
+    async def test_disabled_public_log_preserves_delete_enforcement(self):
+        with patch.dict("os.environ", {"DELETION_PUBLIC_LOG_ENABLED": "0"}):
+            service = DeletionAuditService({11: 20}, self.channels.get)
+        target = message()
+        self.assertTrue(await service.delete(target, reason="profanity"))
+        target.delete.assert_awaited_once()
+        self.destination.send.assert_not_awaited()
+        self.assertEqual((await service.send_test(1))["reason"], "disabled")
+
+    async def test_edit_and_history_metadata_are_separate_from_exact_body_and_reason(self):
+        for index, trigger in enumerate(("message_edit", "history_scan"), 100):
+            target = message("시321133발", message_id=index)
+            edited_at = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+            self.assertTrue(await self.service.delete(target, reason="link+profanity", matched_rule="시발",
+                                                     trigger=trigger, edited_at=edited_at))
+            embed = self.destination.send.call_args.kwargs["embed"]
+            self.assertEqual(field(embed, "원문"), "시321133발")
+            self.assertIn("링크 및 금칙어", embed.description)
+            self.assertIn("수정 후 검열" if trigger == "message_edit" else "정기 재점검", embed.description)
+            self.assertIn("2026-10-22 21:00:00 KST", embed.description)
+            self.assertIn("시발", field(embed, "탐지 정보"))
+
+    async def test_http_success_does_not_repeat_delete_after_completed_event(self):
+        target = message()
+        self.assertTrue(await self.service.delete(target, reason="profanity"))
+        self.assertFalse(await self.service.delete(target, reason="profanity", trigger="message_edit"))
+        target.delete.assert_awaited_once()
+        self.destination.send.assert_awaited_once()
+
+    async def test_duplicate_verified_raw_edit_does_not_erase_pending_current_original(self):
+        target = message("시발")
+        target.edited_at = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+
+        async def delete():
+            self.service.on_raw_message_edit(raw(data={"content": "시발", "edited_timestamp": target.edited_at.isoformat()}))
+            await self.service.on_raw_message_delete(raw())
+
+        target.delete.side_effect = delete
+        self.assertTrue(await self.service.delete(target, reason="profanity", trigger="message_edit", matched_rule="시발"))
+        self.assertEqual(field(self.destination.send.call_args.kwargs["embed"], "원문"), "시발")
+        target.delete.assert_awaited_once()
+        self.destination.send.assert_awaited_once()
+
+    async def test_stale_cached_and_raw_edits_cannot_replace_pending_newer_original(self):
+        target = message("시발")
+        target.edited_at = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+        stale = message("old clean content")
+        stale.edited_at = datetime(2026, 10, 22, 11, 0, tzinfo=timezone.utc)
+
+        async def delete():
+            self.service.remember(stale)
+            self.service.on_raw_message_edit(raw(data={"content": stale.content, "edited_timestamp": stale.edited_at.isoformat()}))
+            await self.service.on_raw_message_delete(raw())
+
+        target.delete.side_effect = delete
+        self.assertTrue(await self.service.delete(target, reason="profanity", trigger="message_edit", matched_rule="시발"))
+        embed = self.destination.send.call_args.kwargs["embed"]
+        self.assertEqual(field(embed, "원문"), "시발")
+        self.assertIn("2026-10-22 21:00:00 KST", embed.description)
+        self.assertNotIn(stale.content, str(embed.to_dict()))
+        target.delete.assert_awaited_once()
+        self.destination.send.assert_awaited_once()
+
+    async def test_raw_newer_timestamp_tombstone_prevents_stale_body_restoration(self):
+        old = message("old clean content")
+        old.edited_at = datetime(2026, 10, 22, 11, 0, tzinfo=timezone.utc)
+        current = message("시発 current version")
+        current.edited_at = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+        self.service.remember(old)
+        self.service.on_raw_message_edit(raw(data={"content": current.content, "edited_timestamp": current.edited_at.isoformat()}))
+        unknown = self.service.remember(old)
+        self.assertFalse(unknown.content_available)
+        self.assertEqual(unknown.edited_at, current.edited_at)
+        self.assertNotEqual(unknown.content, old.content)
+        restored = self.service.remember(current)
+        self.assertTrue(restored.content_available)
+        self.assertEqual(restored.content, current.content)
+        await self.service.on_raw_message_delete(raw())
+        self.assertEqual(field(self.destination.send.call_args.kwargs["embed"], "원문"), current.content)
+
+    async def test_unknown_timestamp_cannot_replace_confirmed_newer_snapshot(self):
+        current = message("current original")
+        current.edited_at = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
+        self.service.remember(current)
+        self.assertEqual(self.service.remember(message("ambiguous unknown version")).content, current.content)
+        self.service.on_raw_message_edit(raw(data={"content": "unknown new version"}))
+        await self.service.on_raw_message_delete(raw())
+        self.assertIn("원문 확인 불가", field(self.destination.send.call_args.kwargs["embed"], "원문"))
+
+    def test_strict_extra_source_settings_and_deprecated_variables(self):
+        for raw_value in ("12,", '"12"', "12,no", "0", str(2 ** 64), "１２", "9" * 6000):
+            with self.subTest(raw_value=raw_value), patch.dict("os.environ", {
+                    "DELETION_LOG_EXTRA_SOURCE_CHANNEL_IDS": raw_value, "DELETION_LOG_ALL_GUILD_CHANNELS": "0"}):
+                service = DeletionAuditService({11: 20}, self.channels.get)
+                self.assertFalse(service.extra_sources_valid)
+                self.assertEqual(service.extra_sources, frozenset())
+        with patch.dict("os.environ", {"DELETION_PRIVATE_AUDIT_ROUTES": "invalid", "DELETION_LOG_INCLUDE_CONTENT": "0",
+                                       "DELETION_LOG_TRUSTED_ROLE_IDS": "invalid", "DELETION_LOG_EXTRA_SOURCE_CHANNEL_IDS": "12, 13"}, clear=True):
+            service = DeletionAuditService({11: 20}, self.channels.get)
+            self.assertTrue(service.enabled)
+            self.assertTrue(service.include_content)
+            self.assertEqual(service.extra_sources, frozenset((12, 13)))
+
+
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.channel = private_channel()
-        self.service = DeletionAuditService({11: 20, 20: 20}, lambda _id: self.channel, configured_admin_ids=set())
+        self.resolve = lambda channel_id: self.channel if channel_id == 20 else self.channel.source if channel_id == 11 else None
+        self.service = DeletionAuditService({11: 20, 20: 20}, self.resolve, configured_admin_ids=set())
 
     async def test_direct_delete_snapshots_before_http_and_deduplicates_gateway_race(self):
         target = message()
@@ -327,11 +686,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.on_raw_message_delete(raw())
         self.assertEqual(self.channel.send.await_count, 2)
 
-    async def test_public_destination_never_receives_content_and_enforcement_continues(self):
+    async def test_public_destination_receives_public_source_content(self):
         self.channel.permissions_for.side_effect = None
-        self.channel.permissions_for.return_value = permissions(view_channel=True)
+        self.channel.permissions_for.return_value = permissions(view_channel=True, send_messages=True, embed_links=True)
+        self.channel.overwrites = {}
         self.assertTrue(await self.service.delete(message(), reason="profanity"))
-        self.channel.send.assert_not_awaited()
+        self.channel.send.assert_awaited_once()
+        self.assertEqual(field(self.channel.send.call_args.kwargs["embed"], "원문"), "시321133발")
 
     async def test_bulk_cached_raw_and_single_events_are_deduplicated(self):
         first, second = message(message_id=100), message("second", message_id=101)
@@ -363,7 +724,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             active -= 1
 
         self.channel.send.side_effect = send
-        self.service = DeletionAuditService({11: 20}, lambda _id: self.channel, concurrency=2, configured_admin_ids=set())
+        self.service = DeletionAuditService({11: 20}, self.resolve, concurrency=2, configured_admin_ids=set())
         await asyncio.gather(*(self.service.on_message_delete(message(message_id=index)) for index in range(1, 9)))
         self.assertEqual(self.channel.send.await_count, 8)
         self.assertEqual(peak, 2)
@@ -371,7 +732,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delivery_dedupe_ttl_and_lru_are_bounded(self):
         clock = [0]
-        self.service = DeletionAuditService({11: 20}, lambda _id: self.channel, clock=lambda: clock[0], delivery_limit=2,
+        self.service = DeletionAuditService({11: 20}, self.resolve, clock=lambda: clock[0], delivery_limit=2,
                                             delivery_ttl=10, configured_admin_ids=set())
         for index in range(1, 5):
             await self.service.on_message_delete(message(message_id=index))
@@ -390,7 +751,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pending_attempt_capacity_never_prevents_actual_deletion(self):
         entered, release = asyncio.Event(), asyncio.Event()
-        self.service = DeletionAuditService({11: 20}, lambda _id: self.channel, pending_limit=1, configured_admin_ids=set())
+        self.service = DeletionAuditService({11: 20}, self.resolve, pending_limit=1, configured_admin_ids=set())
         first, second = message(), message(message_id=101)
 
         async def delayed_delete():
@@ -462,7 +823,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_event_observation_time_is_retained_while_delivery_waits_for_capacity(self):
         current = [datetime(2026, 10, 22, 10, 0, 0, tzinfo=timezone.utc)]
-        self.service = DeletionAuditService({11: 20}, lambda _id: self.channel, concurrency=1,
+        self.service = DeletionAuditService({11: 20}, self.resolve, concurrency=1,
                                             configured_admin_ids=set(), wall_clock=lambda: current[0])
         await self.service._semaphore.acquire()
         pending = asyncio.create_task(self.service.on_message_delete(message()))
@@ -479,7 +840,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_http_confirmation_time_is_retained_while_delivery_is_queued(self):
         current = [datetime(2026, 10, 22, 10, 1, 0, tzinfo=timezone.utc)]
-        self.service = DeletionAuditService({11: 20}, lambda _id: self.channel, concurrency=1,
+        self.service = DeletionAuditService({11: 20}, self.resolve, concurrency=1,
                                             configured_admin_ids=set(), wall_clock=lambda: current[0])
         await self.service._semaphore.acquire()
         pending = asyncio.create_task(self.service.delete(message(), reason="profanity"))
@@ -496,7 +857,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         class Forbidden(Exception):
             status = 403
         current = [datetime(2026, 10, 22, 10, 0, 0, tzinfo=timezone.utc)]
-        self.service = DeletionAuditService({11: 20}, lambda _id: self.channel, configured_admin_ids=set(),
+        self.service = DeletionAuditService({11: 20}, self.resolve, configured_admin_ids=set(),
                                             wall_clock=lambda: current[0])
         target = message()
 
@@ -517,10 +878,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         for raw_value, expected in ((None, True), ("1", True), ("0", False), ("yes", False), ("", False)):
             with self.subTest(raw_value=raw_value), patch.dict("os.environ", {}, clear=True):
                 if raw_value is not None:
-                    with patch.dict("os.environ", {"DELETION_LOG_INCLUDE_CONTENT": raw_value}):
-                        service = DeletionAuditService({11: 20}, lambda _id: self.channel)
+                    with patch.dict("os.environ", {"DELETION_PUBLIC_LOG_INCLUDE_CONTENT": raw_value}):
+                        service = DeletionAuditService({11: 20}, self.resolve)
                 else:
-                    service = DeletionAuditService({11: 20}, lambda _id: self.channel)
+                    service = DeletionAuditService({11: 20}, self.resolve)
                 self.assertEqual(service.include_content, expected)
 
 

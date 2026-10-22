@@ -18,7 +18,7 @@ SECOND = 855749166764654653
 
 def permissions(**changes):
     values = {name: True for name in ("moderate_members", "manage_nicknames", "ban_members", "kick_members",
-                                      "manage_messages", "manage_channels", "manage_threads", "view_channel", "read_message_history")}
+                                      "manage_messages", "manage_channels", "manage_threads", "manage_roles", "view_channel", "read_message_history")}
     values["administrator"] = False
     values.update(changes)
     return SimpleNamespace(**values)
@@ -36,6 +36,7 @@ def context(actor_id=10):
                                                     member(99, 100), member(20, 10), member(30, 80))
     members = {item.id: item for item in (owner, special, second, bot, target, outsider)}
     guild.me = bot
+    guild.default_role = SimpleNamespace(id=guild.id)
     guild.get_member = lambda member_id: members.get(member_id)
 
     async def fetch(member_id):
@@ -48,6 +49,9 @@ def context(actor_id=10):
     channel.id, channel.guild = 200, guild
     channel.permissions_for = lambda item: item.guild_permissions
     channel.edit, channel.purge = AsyncMock(), AsyncMock(return_value=[])
+    channel.slowmode_delay = 0
+    channel.overwrites_for.return_value = discord.PermissionOverwrite(send_messages=True, view_channel=True, add_reactions=False)
+    channel.set_permissions = AsyncMock()
     interaction = SimpleNamespace(user=members[actor_id], guild=guild, channel=channel, data={},
                                   response=SimpleNamespace(is_done=lambda: False, send_message=AsyncMock(),
                                                            edit_message=AsyncMock(), send_modal=AsyncMock()),
@@ -135,17 +139,74 @@ class AdminServiceTests(unittest.IsolatedAsyncioTestCase):
         self.target.timeout.assert_not_awaited()
         self.assertEqual(self.service.audit[-1]["result"], "bot_permission_missing")
 
-    async def test_actor_requires_native_permission_and_higher_role(self):
+    async def test_cleanup_keeps_actor_native_permission_and_higher_role_gate(self):
         self.interaction.user = self.members[SPECIAL]
-        self.members[SPECIAL].guild_permissions.moderate_members = False
+        self.members[SPECIAL].guild_permissions.manage_messages = False
         with self.assertRaises(admin.AdminActionError) as caught:
-            await self.request()
+            await self.request("cleanup", value=1)
         self.assertEqual(caught.exception.code, "actor_permission_missing")
-        self.members[SPECIAL].guild_permissions.moderate_members = True
+        self.members[SPECIAL].guild_permissions.manage_messages = True
         self.members[SPECIAL].top_role = self.target.top_role
         with self.assertRaises(admin.AdminActionError) as caught:
-            await self.request()
+            await self.request("cleanup", value=1)
         self.assertEqual(caught.exception.code, "role_hierarchy")
+
+    async def test_hidden_cleanup_actor_capability_rechecked_at_commit_without_weakening_service(self):
+        self.interaction.user = self.members[SPECIAL]
+        request = await self.request("cleanup", value=1)
+        self.members[SPECIAL].guild_permissions.manage_messages = False
+        with self.assertRaises(admin.AdminActionError) as caught:
+            await self.service.execute(self.interaction, request)
+        self.assertEqual(caught.exception.code, "actor_permission_missing")
+        self.interaction.channel.purge.assert_not_awaited()
+
+    async def test_delegated_execution_rechecks_bot_hierarchy_and_target_administrator_status(self):
+        self.interaction.user = self.members[SPECIAL]
+        self.members[SPECIAL].top_role = 1
+        request = await self.request()
+        self.target.top_role = self.members[99].top_role
+        with self.assertRaises(admin.AdminActionError) as caught:
+            await self.service.execute(self.interaction, request)
+        self.assertEqual(caught.exception.code, "role_hierarchy")
+        self.target.top_role = 10
+        request = await self.request()
+        self.target.guild_permissions.administrator = True
+        with self.assertRaises(admin.AdminActionError) as caught:
+            await self.service.execute(self.interaction, request)
+        self.assertEqual(caught.exception.code, "protected_administrator")
+        self.target.timeout.assert_not_awaited()
+
+    async def test_both_id_only_admins_delegate_exposed_actions_without_native_permissions_or_role_priority(self):
+        for actor_id in (SPECIAL, SECOND):
+            self.interaction.user = self.members[actor_id]
+            self.members[actor_id].guild_permissions = permissions(**{name: False for name in admin.PERMISSIONS.values() if name})
+            self.members[actor_id].top_role = 1
+            for action, value in (("timeout", 5), ("untimeout", None), ("nickname", "서버 별명"),
+                                  ("reset_nickname", None), ("ban", None), ("unban", None), ("kick", None), ("warn", None)):
+                with self.subTest(actor=actor_id, action=action):
+                    request = await self.request(action, value=value)
+                    await self.service.execute(self.interaction, request)
+        self.assertEqual(self.target.timeout.await_count, 4)
+        self.assertEqual(self.target.edit.await_count, 4)
+        self.assertEqual(self.interaction.guild.ban.await_count, 2)
+        self.assertTrue(all(call.kwargs["delete_message_seconds"] == 0 for call in self.interaction.guild.ban.call_args_list))
+
+    async def test_bot_native_permission_and_protected_target_checks_cover_each_exposed_action(self):
+        for action, permission in admin.PERMISSIONS.items():
+            if action in ("cleanup", "slowmode", "lock", "unlock", "warn"):
+                continue
+            value = 5 if action == "timeout" else "별명" if action == "nickname" else None
+            setattr(self.members[99].guild_permissions, permission, False)
+            with self.subTest(action=action), self.assertRaises(admin.AdminActionError) as caught:
+                await self.request(action, value=value)
+            self.assertEqual(caught.exception.code, "bot_permission_missing")
+            setattr(self.members[99].guild_permissions, permission, True)
+            with self.assertRaises(admin.AdminActionError) as caught:
+                await self.request(action, value=value, target_id=SECOND)
+            self.assertEqual(caught.exception.code, "protected_target")
+        self.target.timeout.assert_not_awaited()
+        self.target.edit.assert_not_awaited()
+        self.interaction.guild.ban.assert_not_awaited()
 
     async def test_self_bot_owner_other_special_and_discord_admin_are_protected(self):
         for member_id in (10, 99, SPECIAL, SECOND):
@@ -250,7 +311,7 @@ class AdminServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.execute(self.interaction, request)
         self.assertEqual(caught.exception.code, "channel_mismatch")
 
-    async def test_thread_slowmode_requires_manage_threads_for_actor_and_bot(self):
+    async def test_thread_slowmode_uses_only_bot_manage_threads_and_actor_visibility(self):
         channel = MagicMock(spec=discord.Thread)
         channel.id, channel.guild = 201, self.interaction.guild
         channel.permissions_for = lambda item: item.guild_permissions
@@ -263,30 +324,27 @@ class AdminServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code, "bot_permission_missing")
         self.members[99].guild_permissions.manage_threads = True
         self.members[SPECIAL].guild_permissions.manage_threads = False
-        with self.assertRaises(admin.AdminActionError) as caught:
-            await self.request("slowmode", target_id=None, value=30)
-        self.assertEqual(caught.exception.code, "actor_permission_missing")
-        self.members[SPECIAL].guild_permissions.manage_threads = True
         self.members[99].guild_permissions.manage_channels = False
         self.members[SPECIAL].guild_permissions.manage_channels = False
         request = await self.request("slowmode", target_id=None, value=30)
         await self.service.execute(self.interaction, request)
         channel.edit.assert_awaited_once_with(slowmode_delay=30, reason=f"Doribot slowmode; actor={SPECIAL}")
 
-    async def test_thread_manage_threads_is_rechecked_on_execution_for_actor_and_bot(self):
+    async def test_thread_manage_threads_and_actor_visibility_rechecked_on_execution(self):
         channel = MagicMock(spec=discord.Thread)
         channel.id, channel.guild = 201, self.interaction.guild
         channel.permissions_for = lambda item: item.guild_permissions
         channel.edit = AsyncMock()
         self.interaction.channel = channel
         self.interaction.user = self.members[SPECIAL]
-        for member_id, expected in ((99, "bot_permission_missing"), (SPECIAL, "actor_permission_missing")):
+        for member_id, permission, expected in ((99, "manage_threads", "bot_permission_missing"),
+                                                 (SPECIAL, "view_channel", "actor_channel_hidden")):
             request = await self.request("slowmode", target_id=None, value=30)
-            self.members[member_id].guild_permissions.manage_threads = False
+            setattr(self.members[member_id].guild_permissions, permission, False)
             with self.assertRaises(admin.AdminActionError) as caught:
                 await self.service.execute(self.interaction, request)
             self.assertEqual(caught.exception.code, expected)
-            self.members[member_id].guild_permissions.manage_threads = True
+            setattr(self.members[member_id].guild_permissions, permission, True)
         channel.edit.assert_not_awaited()
 
     async def test_duplicate_and_concurrent_confirmation_execute_once(self):
@@ -389,6 +447,162 @@ class AdminServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await admin.handle_admin_action(self.interaction, action, status_text="상태"))
             self.assertTrue(self.interaction.response.send_message.call_args.kwargs["ephemeral"])
         self.assertFalse(await admin.handle_admin_action(self.interaction, "admin:rules"))
+
+    async def test_cleanup_only_hidden_at_select_boundary_and_preserved_modal_and_service_still_run(self):
+        view = admin.AdminMemberActionsView(self.interaction, self.service, 20)
+        self.assertEqual([option.value for option in view.children[0].options],
+                         ["timeout", "untimeout", "nickname", "reset_nickname", "ban", "kick", "warn"])
+        self.assertIn("cleanup", admin.ACTION_LABELS)
+        self.assertEqual(admin.PERMISSIONS["cleanup"], "manage_messages")
+        self.interaction.data = {"values": ["cleanup"]}
+        await view.select_action(self.interaction)
+        self.interaction.response.send_modal.assert_not_awaited()
+        self.assertTrue(self.interaction.response.send_message.call_args.kwargs["ephemeral"])
+        self.assertIn("제공하지 않습니다", self.interaction.response.send_message.call_args.args[0])
+        # An internal, explicitly constructed cleanup modal and service remain
+        # usable. This is deliberately NOT a new UI entry point.
+        modal = admin.AdminActionModal(self.interaction, self.service, "cleanup", target_id=20)
+        modal.value_input = SimpleNamespace(value="1")
+        modal.reason_input = SimpleNamespace(value="보존 기능 회귀 검증")
+        await modal.on_submit(self.interaction)
+        confirm = self.interaction.response.send_message.call_args.kwargs["view"]
+        self.assertIn("최근 메시지 정리", confirm.request.preview)
+        await confirm.confirm(self.interaction)
+        self.interaction.channel.purge.assert_awaited_once()
+
+    async def test_low_role_special_admin_entire_member_modal_confirmation_flow(self):
+        self.interaction.user = self.members[SPECIAL]
+        self.members[SPECIAL].guild_permissions = permissions(moderate_members=False, manage_nicknames=False)
+        self.members[SPECIAL].top_role = 1
+        select = admin.AdminMemberSelectView(self.interaction, self.service)
+        self.interaction.data = {"values": ["20"]}
+        await select.select_member(self.interaction)
+        actions = self.interaction.response.send_message.call_args.kwargs["view"]
+        self.interaction.data = {"values": ["timeout"]}
+        await actions.select_action(self.interaction)
+        durations = self.interaction.response.send_message.call_args.kwargs["view"]
+        self.interaction.data = {"values": ["5"]}
+        await durations.select_duration(self.interaction)
+        modal = self.interaction.response.send_modal.call_args.args[0]
+        modal.reason_input = SimpleNamespace(value="ID 위임 조치")
+        await modal.on_submit(self.interaction)
+        confirm = self.interaction.response.send_message.call_args.kwargs["view"]
+        await confirm.confirm(self.interaction)
+        self.target.timeout.assert_awaited_once_with(timedelta(minutes=5), reason=f"Doribot timeout; actor={SPECIAL}")
+
+    async def test_warning_counts_are_guild_scoped_bounded_metadata_and_reset_on_restart(self):
+        self.service = admin.AdminService(warning_limit=2)
+        for _ in range(2):
+            request = await self.request("warn", reason="SECRET free form reason")
+            self.assertIn("자동 제재 없음", request.preview)
+            await self.service.execute(self.interaction, request)
+        text = await self.service.warning_text(self.interaction, 20)
+        self.assertIn("경고 2회", text)
+        self.assertIn("조치자 ID `10`", text)
+        self.assertIn("최근 시각", text)
+        self.assertIn("재시작 시 초기화", text)
+        self.assertNotIn("SECRET", repr(self.service._warnings))
+        self.assertNotIn("SECRET", repr(self.service.audit))
+        other, _, _ = context(SPECIAL)
+        other.guild.id = 101
+        self.assertIn("경고 0회", await self.service.warning_text(other, 20))
+        await self.service.execute(other, await self.service.prepare(other, "warn", target_id=20))
+        self.assertIn("경고 1회", await self.service.warning_text(other, 20))
+        self.assertIn("경고 2회", await self.service.warning_text(self.interaction, 20))
+        await self.service.execute(self.interaction, await self.request("warn", target_id=30))
+        self.assertEqual(len(self.service._warnings), 2)
+        self.assertIn("경고 0회", await admin.AdminService().warning_text(self.interaction, 20))
+        self.target.timeout.assert_not_awaited()
+        self.target.kick.assert_not_awaited()
+
+    async def test_warning_query_and_mutation_reject_unauthorized_and_protected_targets(self):
+        self.interaction.user = self.members[30]
+        with self.assertRaises(admin.AdminActionError):
+            await self.service.warning_text(self.interaction, 20)
+        view = admin.AdminMemberActionsView(self.interaction, self.service, 20)
+        await view.warnings(self.interaction)
+        self.assertNotIn("임시 경고", self.interaction.response.send_message.call_args.args[0])
+        self.interaction.user = self.members[10]
+        for target_id in (10, SPECIAL, SECOND, 99):
+            with self.assertRaises(admin.AdminActionError):
+                await self.request("warn", target_id=target_id)
+        self.assertEqual(len(self.service._warnings), 0)
+
+    async def test_warning_ui_is_connected_to_reason_confirmation_and_private_query(self):
+        view = admin.AdminMemberActionsView(self.interaction, self.service, 20)
+        self.interaction.data = {"values": ["warn"]}
+        await view.select_action(self.interaction)
+        modal = self.interaction.response.send_modal.call_args.args[0]
+        self.assertEqual(modal.action, "warn")
+        modal.reason_input = SimpleNamespace(value="운영 경고")
+        await modal.on_submit(self.interaction)
+        confirm = self.interaction.response.send_message.call_args.kwargs["view"]
+        await confirm.confirm(self.interaction)
+        await view.warnings(self.interaction)
+        self.assertIn("경고 1회", self.interaction.response.send_message.call_args.args[0])
+        self.assertTrue(self.interaction.response.send_message.call_args.kwargs["ephemeral"])
+
+    async def test_channel_lock_unlock_preserve_unrelated_permissions_and_explicit_inherit_semantics(self):
+        channel = self.interaction.channel
+        original = channel.overwrites_for.return_value
+        self.interaction.user = self.members[SPECIAL]
+        self.members[SPECIAL].guild_permissions.manage_roles = False
+        for action, after in (("lock", False), ("unlock", None)):
+            with self.subTest(action=action):
+                request = await self.request(action, target_id=None)
+                self.assertIn("허용(True)", request.preview)
+                self.assertIn("역할의 명시적 쓰기 허용", request.preview)
+                self.assertIn("상속", request.preview)
+                await self.service.execute(self.interaction, request)
+                call = channel.set_permissions.call_args
+                self.assertIs(call.args[0], self.interaction.guild.default_role)
+                overwrite = call.kwargs["overwrite"]
+                self.assertIs(overwrite.send_messages, after)
+                self.assertIs(overwrite.view_channel, True)
+                self.assertIs(overwrite.add_reactions, False)
+                self.assertIs(original.send_messages, True)
+                self.assertIn(f"Doribot {action}", call.kwargs["reason"])
+
+    async def test_channel_lock_refetches_overwrite_but_requires_bot_permission_and_actor_visibility(self):
+        request = await self.request("lock", target_id=None)
+        self.interaction.channel.overwrites_for.return_value.attach_files = False
+        await self.service.execute(self.interaction, request)
+        self.assertIs(self.interaction.channel.set_permissions.call_args.kwargs["overwrite"].attach_files, False)
+        request = await self.request("unlock", target_id=None)
+        self.members[99].guild_permissions.manage_roles = False
+        with self.assertRaises(admin.AdminActionError) as caught:
+            await self.service.execute(self.interaction, request)
+        self.assertEqual(caught.exception.code, "bot_permission_missing")
+        self.assertEqual(self.interaction.channel.set_permissions.await_count, 1)
+        self.members[99].guild_permissions.manage_roles = True
+        self.members[10].guild_permissions.view_channel = False
+        with self.assertRaises(admin.AdminActionError) as caught:
+            await self.request("lock", target_id=None)
+        self.assertEqual(caught.exception.code, "actor_channel_hidden")
+
+    async def test_current_channel_view_modal_and_execute_cannot_be_moved_to_another_channel(self):
+        view = admin.AdminChannelView(self.interaction, self.service)
+        self.assertEqual([item.custom_id for item in view.children], ["admin:slowmode", "admin:lock", "admin:unlock"])
+        await view.lock(self.interaction)
+        modal = self.interaction.response.send_modal.call_args.args[0]
+        self.assertEqual(modal.action, "lock")
+        modal.reason_input = SimpleNamespace(value="운영 잠금")
+        self.interaction.channel.id = 999
+        await modal.on_submit(self.interaction)
+        self.assertFalse(self.service._pending)
+        self.interaction.response.send_modal.reset_mock()
+        await view.unlock(self.interaction)
+        self.interaction.response.send_modal.assert_not_awaited()
+        self.interaction.channel.set_permissions.assert_not_awaited()
+
+    async def test_channel_route_denies_hidden_channels_without_showing_channel_controls(self):
+        self.interaction.user = self.members[SPECIAL]
+        self.members[SPECIAL].guild_permissions.view_channel = False
+        self.assertTrue(await admin.handle_admin_action(self.interaction, "admin:channel"))
+        call = self.interaction.response.send_message.call_args
+        self.assertNotIn("view", call.kwargs)
+        self.assertTrue(call.kwargs["ephemeral"])
+        self.assertIn("직접 볼 수 있는", call.args[0])
 
 
 if __name__ == "__main__":

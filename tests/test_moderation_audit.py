@@ -39,6 +39,22 @@ def attachment(**overrides):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_edit_trigger_is_bounded_metadata_separate_from_original_and_rule(self):
+        edited = datetime(2026, 10, 22, 21, 0, tzinfo=timezone(timedelta(hours=9)))
+        source = message(content="시321133발", edited_at=edited)
+        snapshot = capture_message_snapshot(source, reason_code="profanity", detected_root="시발",
+                                            trigger="message_edit")
+        self.assertEqual(snapshot.content, "시321133발")
+        self.assertEqual(snapshot.reason_code, "profanity")
+        self.assertEqual(snapshot.trigger, "message_edit")
+        self.assertEqual(snapshot.edited_at, datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc))
+        self.assertNotIn("시321133발", repr(snapshot))
+        self.assertEqual(capture_message_snapshot(source, trigger="unsafe-free-form-content").trigger, "message_new")
+        cache = MessageAuditCache()
+        cache.remember(snapshot)
+        annotated = cache.annotate(456, 123, trigger="history_scan")
+        self.assertEqual((annotated.trigger, annotated.edited_at, annotated.content), ("history_scan", snapshot.edited_at, snapshot.content))
+
     def test_content_is_exact_original_and_separate_from_matched_rule(self):
         source = message()
         snapshot = capture_message_snapshot(source, reason_code="profanity", detected_root="시발",

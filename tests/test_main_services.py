@@ -19,6 +19,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import moderation_rules
+from edit_moderation import evaluate_policy
 
 try:
     import discord
@@ -32,7 +33,7 @@ SOURCE = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(e
 SERVICE_NAMES = {
     "get_user_xp", "claim_reward", "_legacy_exemption_state", "_lookup_legacy_exemption",
     "_consume_legacy_exemption", "is_user_exempt_from_profanity", "use_profanity_pass",
-    "_moderate_message_content", "_moderate_ai_prompt_interaction", "on_message",
+    "_evaluate_message_policy", "_moderate_message_content", "_moderate_ai_prompt_interaction", "on_message",
     "_interaction_send", "_interaction_defer", "_question_interaction_service",
     "_publish_question_answer", "_generate_text_response", "_generate_image_bytes",
     "_reserve_image_request", "ask", "strip_think", "_send_typing_reminder",
@@ -47,6 +48,9 @@ def services():
         "asyncio": asyncio, "discord": discord, "datetime": datetime,
         "logging": logging, "time": time, "re": re, "io": io,
         "find_badroot": moderation_rules.find_badroot,
+        "evaluate_policy": evaluate_policy,
+        "EDIT_MODERATION": SimpleNamespace(known_outcome=Mock(return_value=None), record_new_outcome=Mock(),
+            on_cached_edit=AsyncMock(), on_raw_edit=AsyncMock()),
         "lookup_rule_exemption": moderation_rules.lookup_exemption,
         "parse_command": moderation_rules.parse_command,
         "ALLOWED_CHANNELS": {99}, "EXEMPT_PROFANITY_CHANNEL_IDS": {98},
@@ -385,6 +389,8 @@ class PublicQuestionTests(unittest.IsolatedAsyncioTestCase):
         audit.on_raw_bulk_message_delete.assert_awaited_once_with(target)
         audit.remember.assert_called_once_with(target)
         audit.on_raw_message_edit.assert_called_once_with(target)
+        ns["EDIT_MODERATION"].on_cached_edit.assert_awaited_once_with(None, target)
+        ns["EDIT_MODERATION"].on_raw_edit.assert_awaited_once_with(target)
 
     async def test_moderation_keeps_original_separate_from_measured_rule(self):
         ns = services()
@@ -399,30 +405,41 @@ class PublicQuestionTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipIf(discord is None, "requires actual discord.py")
 class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_real_moderation_to_private_card_preserves_original_and_deduplicates_events(self):
+    def audit_context(self, content="시321133발"):
         from deletion_audit import DeletionAuditService
 
         ns = services()
-        target = message("시321133발")
+        target = message(content)
         target.delete = AsyncMock()
         target.attachments, target.stickers, target.embeds = [], [], []
         target.author.display_name = "테스트 사용자"
-        target.channel.name, target.guild.name = "general", "테스트 서버"
-        everyone = SimpleNamespace(id=1)
+        target.guild.name = "테스트 서버"
+        everyone = SimpleNamespace(id=1, permissions=discord.Permissions(view_channel=True))
         target.guild.default_role, target.guild.me = everyone, SimpleNamespace(id=99)
         target.guild.owner_id, target.guild.roles = 77, [everyone]
+        source_channel = MagicMock(spec=discord.TextChannel)
+        source_channel.id, source_channel.guild, source_channel.overwrites = 1, target.guild, {}
+        source_channel.name, source_channel.send = "general", AsyncMock()
+        source_channel.type = discord.ChannelType.text
+        source_channel.permissions_for = lambda _actor: SimpleNamespace(
+            view_channel=True, send_messages=True, embed_links=True,
+            read_message_history=True, manage_messages=True)
+        target.channel = source_channel
         log_channel = MagicMock(spec=discord.TextChannel)
         log_channel.id, log_channel.guild, log_channel.overwrites = 10, target.guild, {}
         log_channel.send = AsyncMock()
-        log_channel.permissions_for = lambda actor: SimpleNamespace(
-            view_channel=actor.id != everyone.id, send_messages=True, embed_links=True)
-        audit = DeletionAuditService({1: 10}, lambda _channel_id: log_channel,
+        log_channel.permissions_for = source_channel.permissions_for
+        audit = DeletionAuditService({1: 10}, {1: source_channel, 10: log_channel}.get,
                                      include_content=True, configured_admin_ids=())
         ns["DELETION_AUDIT"] = audit
         safe_delete_node = next(node for node in SOURCE.body
                                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "safe_delete")
         module = ast.Module(body=[safe_delete_node], type_ignores=[])
         exec(compile(ast.fix_missing_locations(module), "main.py", "exec"), ns)
+        return ns, target, log_channel, audit
+
+    async def test_real_moderation_to_public_card_preserves_original_and_deduplicates_events(self):
+        ns, target, log_channel, _audit = self.audit_context()
         with self.assertLogs("deletion_audit", level="INFO") as captured:
             self.assertFalse(await ns["_moderate_message_content"](target))
             await ns["on_message_delete"](target)
@@ -437,6 +454,41 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("123", rendered)
         self.assertNotIn("시321133발", "\n".join(captured.output))
         self.assertEqual(payload["allowed_mentions"].to_dict()["parse"], [])
+
+    async def test_real_raw_and_cached_edit_to_public_card_never_replays_xp_ai_or_typing(self):
+        from edit_moderation import EditModerationService
+
+        ns, target, log_channel, audit = self.audit_context("1")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        target.created_at, target.edited_at = now, None
+        worker = EditModerationService(
+            SimpleNamespace(get_channel=lambda _id: target.channel, user=SimpleNamespace(id=99)),
+            evaluate=ns["_evaluate_message_policy"], delete=ns["safe_delete"],
+            consume_pass=ns["use_profanity_pass"], has_pass=ns["is_user_exempt_from_profanity"],
+            remember=audit.remember)
+        ns["EDIT_MODERATION"] = worker
+        self.assertTrue(await ns["_moderate_message_content"](target))
+        before = SimpleNamespace(**vars(target))
+        target.content, target.edited_at = "시321133발", now + datetime.timedelta(seconds=1)
+        raw = SimpleNamespace(guild_id=1, channel_id=1, message_id=123,
+                              cached_message=before, message=target,
+                              data={"content": target.content, "edited_timestamp": target.edited_at.isoformat()})
+        ns["add_xp"] = Mock(side_effect=AssertionError("edit replayed XP"))
+        ns["_generate_text_response"] = AsyncMock(side_effect=AssertionError("edit replayed AI"))
+        with self.assertLogs("deletion_audit", level="INFO") as captured:
+            await asyncio.gather(ns["on_raw_message_edit"](raw), ns["on_message_edit"](before, target))
+            await ns["on_message_delete"](target)
+        target.delete.assert_awaited_once()
+        log_channel.send.assert_awaited_once()
+        rendered = str(log_channel.send.call_args.kwargs["embed"].to_dict())
+        self.assertIn("시321133발", rendered)
+        self.assertIn("수정", rendered)
+        self.assertIn("123", rendered)
+        self.assertNotIn("시321133발", "\n".join(captured.output))
+        ns["add_xp"].assert_not_called()
+        ns["_generate_text_response"].assert_not_awaited()
+        ns["_observe_typing_message"].assert_not_called()
+        ns["_typing_message_fallback"].assert_not_called()
 
 
 if __name__ == "__main__":

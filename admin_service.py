@@ -28,12 +28,14 @@ ACTION_LABELS = {
     "timeout": "채팅금지", "untimeout": "타임아웃 해제", "nickname": "서버 별명 변경",
     "reset_nickname": "서버 별명 초기화", "ban": "영구 밴", "unban": "밴 해제",
     "kick": "추방", "cleanup": "최근 메시지 정리", "slowmode": "채널 슬로우모드",
+    "lock": "현재 채널 쓰기 잠금", "unlock": "현재 채널 쓰기 상속", "warn": "임시 경고",
 }
 PERMISSIONS = {
     "timeout": "moderate_members", "untimeout": "moderate_members",
     "nickname": "manage_nicknames", "reset_nickname": "manage_nicknames",
     "ban": "ban_members", "unban": "ban_members", "kick": "kick_members",
     "cleanup": "manage_messages", "slowmode": "manage_channels",
+    "lock": "manage_roles", "unlock": "manage_roles", "warn": None,
 }
 
 
@@ -63,10 +65,12 @@ async def _defer(interaction: Any) -> None:
         await response.defer(ephemeral=True, thinking=True)
 
 
-async def _guard(interaction: Any, actor_id: int | None = None, guild_id: int | None = None) -> bool:
+async def _guard(interaction: Any, actor_id: int | None = None, guild_id: int | None = None,
+                 channel_id: int | None = None) -> bool:
     denied = log_admin_access(interaction, source="component", event="admin_action") is not None
     denied = denied or (actor_id is not None and getattr(interaction.user, "id", None) != actor_id)
     denied = denied or (guild_id is not None and getattr(getattr(interaction, "guild", None), "id", None) != guild_id)
+    denied = denied or (channel_id is not None and getattr(getattr(interaction, "channel", None), "id", None) != channel_id)
     if denied:
         await _ephemeral(interaction, UNAUTHORIZED_ADMIN_MESSAGE, allowed_mentions=_no_mentions())
     return not denied
@@ -97,7 +101,14 @@ class AdminRequest:
         elif self.action == "cleanup":
             value = f"\n범위: 이 채널 최근 100개 중 대상의 메시지 최대 {self.value}개"
         elif self.action == "slowmode":
-            value = f"\n간격: {self.value}초 (0초는 해제)"
+            value = f"\n변경 전: {self.before_value}초\n변경 후: {self.value}초 (0초는 해제)"
+        elif self.action in ("lock", "unlock"):
+            after = "거부(False)" if self.action == "lock" else "상속(None)"
+            value = (f"\n@everyone 메시지 쓰기: {self.before_value} → {after}"
+                     "\n다른 권한 덮어쓰기는 보존합니다. 별도 역할의 명시적 쓰기 허용은 계속 적용될 수 있습니다."
+                     "\n해제는 상속으로 변경하며 잠금 이전 상태 복원을 보장하지 않습니다.")
+        elif self.action == "warn":
+            value = "\n범위: 이 서버의 임시 경고 횟수만 증가 · 자동 제재 없음 · 봇 재시작 시 초기화"
         elif self.action == "ban":
             value = "\n기한: 영구 · 자동 해제 없음 · 기존 메시지는 보존"
         return (f"**{ACTION_LABELS[self.action]} 확인**\n대상: {target}{value}\n"
@@ -107,10 +118,12 @@ class AdminRequest:
 class AdminService:
     """Resolve current guild state and revalidate at prepare AND commit."""
 
-    def __init__(self, *, audit_limit: int = 200, delete_service: Any = None):
+    def __init__(self, *, audit_limit: int = 200, delete_service: Any = None, warning_limit: int = 1000):
         self.audit: deque[dict[str, Any]] = deque(maxlen=audit_limit)
         self._pending: OrderedDict[str, AdminRequest] = OrderedDict()
         self._claim_lock = asyncio.Lock()
+        self._warnings: OrderedDict[tuple[int, int], dict[str, Any]] = OrderedDict()
+        self._warning_limit = max(1, warning_limit)
         # Production injects the shared deletion audit coordinator. Lightweight
         # standalone adapters may continue using Discord's individual purge.
         self.delete_service = delete_service
@@ -126,6 +139,28 @@ class AdminService:
         reason = admin_authorization_reason(getattr(interaction, "user", None), getattr(interaction, "guild", None))
         if reason is not None:
             raise AdminActionError(reason, UNAUTHORIZED_ADMIN_MESSAGE)
+
+    async def visible_current_channel(self, interaction: Any) -> Any:
+        """Do not reveal or manage a channel the delegated actor cannot read."""
+        self._authorized(interaction)
+        guild, channel = interaction.guild, getattr(interaction, "channel", None)
+        if (channel is None or getattr(getattr(channel, "guild", None), "id", None) != guild.id
+                or not isinstance(channel, (discord.TextChannel, discord.Thread))):
+            raise AdminActionError("unsupported_channel", "현재 서버의 텍스트 채널에서 실행해 주세요.")
+        actor = await self._member(guild, interaction.user.id)
+        if not self._has_permission(channel.permissions_for(actor), "view_channel"):
+            raise AdminActionError("actor_channel_hidden", "직접 볼 수 있는 현재 채널에서만 실행할 수 있습니다.")
+        return channel
+
+    async def warning_text(self, interaction: Any, target_id: int) -> str:
+        await self.member(interaction, target_id)
+        entry = self._warnings.get((interaction.guild.id, target_id))
+        lines = ["**⚠️ 이 서버 임시 경고**", f"대상 ID `{target_id}` · 경고 {entry['count'] if entry else 0}회",
+                 "인메모리 기록 · 봇 재시작 시 초기화 · 자동 제재 없음",
+                 f"전체 서버 합계 최근 {self._warning_limit}명 보관 · 초과 시 오래된 대상 기록 삭제"]
+        if entry:
+            lines.append(f"최근 시각: {entry['at']} · 조치자 ID `{entry['actor_id']}`")
+        return "\n".join(lines)
 
     async def member(self, interaction: Any, target_id: int) -> Any:
         self._authorized(interaction)
@@ -165,26 +200,34 @@ class AdminService:
             raise AdminActionError("bot_member_missing", "봇의 서버 멤버 정보를 확인할 수 없습니다.")
         bot_member = await self._member(guild, bot_id)
         channel = getattr(interaction, "channel", None)
-        if action in ("cleanup", "slowmode"):
+        if action in ("cleanup", "slowmode", "lock", "unlock"):
             if (channel is None or getattr(channel, "id", None) != request.channel_id
                     or getattr(getattr(channel, "guild", None), "id", None) != guild.id):
                 raise AdminActionError("channel_mismatch", "원래 서버 채널에서 다시 실행해 주세요.")
             if action == "slowmode" and not isinstance(channel, (discord.TextChannel, discord.Thread)):
                 raise AdminActionError("unsupported_channel", "텍스트 채널 또는 스레드에서 실행해 주세요.")
+            if action in ("lock", "unlock") and not isinstance(channel, discord.TextChannel):
+                raise AdminActionError("unsupported_channel", "쓰기 잠금은 현재 텍스트 채널에서만 지원합니다.")
             bot_permissions = channel.permissions_for(bot_member)
             actor_permissions = channel.permissions_for(actor)
+            if not self._has_permission(actor_permissions, "view_channel"):
+                raise AdminActionError("actor_channel_hidden", "직접 볼 수 있는 현재 채널에서만 실행할 수 있습니다.")
+            if not self._has_permission(bot_permissions, "view_channel"):
+                raise AdminActionError("bot_channel_hidden", "봇이 현재 채널을 볼 수 없습니다.")
         else:
             bot_permissions, actor_permissions = bot_member.guild_permissions, actor.guild_permissions
         permission = PERMISSIONS[action]
         if action == "slowmode" and isinstance(channel, discord.Thread):
             permission = "manage_threads"
-        if not self._has_permission(bot_permissions, permission):
+        if permission is not None and not self._has_permission(bot_permissions, permission):
             raise AdminActionError("bot_permission_missing", "봇에 이 작업의 Discord 권한이 없습니다.")
-        if request.actor_id != guild.owner_id and not self._has_permission(actor_permissions, permission):
+        # Delegated ID administrators use the BOT's native capabilities. Keep
+        # the hidden cleanup service's existing actor gate intact for reuse.
+        if action == "cleanup" and request.actor_id != guild.owner_id and not self._has_permission(actor_permissions, permission):
             raise AdminActionError("actor_permission_missing", "도리봇 관리 인증 외에 이 작업의 Discord 권한도 필요합니다.")
         if action == "cleanup" and not all(self._has_permission(bot_permissions, name) for name in ("view_channel", "read_message_history")):
             raise AdminActionError("bot_history_permission_missing", "봇에 채널 보기와 메시지 기록 보기 권한이 필요합니다.")
-        if action == "slowmode":
+        if action in ("slowmode", "lock", "unlock"):
             return None, channel
         protected = {request.actor_id, bot_id, guild.owner_id, *configured_special_admin_ids()}
         if request.target_id is None or request.target_id in protected:
@@ -197,11 +240,14 @@ class AdminService:
             raise AdminActionError("protected_administrator", "Discord 관리자 권한을 가진 멤버는 보호 대상입니다.")
         try:
             bot_above = bot_member.top_role > target.top_role
+        except (AttributeError, TypeError):
+            bot_above = False
+        try:
             actor_above = request.actor_id == guild.owner_id or actor.top_role > target.top_role
         except (AttributeError, TypeError):
-            bot_above = actor_above = False
-        if not bot_above or not actor_above:
-            raise AdminActionError("role_hierarchy", "대상의 최상위 역할보다 봇과 실행자의 역할이 높아야 합니다.")
+            actor_above = False
+        if not bot_above or (action == "cleanup" and not actor_above):
+            raise AdminActionError("role_hierarchy", "봇의 역할 우위가 필요합니다. 메시지 정리는 실행자의 역할 우위도 필요합니다.")
         return target, channel
 
     async def prepare(self, interaction: Any, action: str, *, target_id: int | None = None,
@@ -211,9 +257,14 @@ class AdminService:
                                getattr(getattr(interaction, "channel", None), "id", None),
                                target_id, value, reason.strip(), secrets.token_hex(16), monotonic())
         try:
-            target, _ = await self._validate(interaction, request)
+            target, channel = await self._validate(interaction, request)
             if action in ("nickname", "reset_nickname"):
                 request = replace(request, before_value=getattr(target, "nick", None))
+            elif action == "slowmode":
+                request = replace(request, before_value=str(channel.slowmode_delay))
+            elif action in ("lock", "unlock"):
+                previous = channel.overwrites_for(interaction.guild.default_role).send_messages
+                request = replace(request, before_value={None: "상속(None)", True: "허용(True)", False: "거부(False)"}[previous])
         except AdminActionError:
             raise
         except Exception as error:
@@ -302,6 +353,25 @@ class AdminService:
                 return f"최근 메시지 {len(deleted)}개를 삭제했습니다."
             elif action == "slowmode":
                 await channel.edit(slowmode_delay=request.value, reason=audit_reason)
+            elif action in ("lock", "unlock"):
+                # Read again at execution so unrelated concurrent overwrite
+                # changes are preserved. Unlock explicitly means inheritance.
+                current = channel.overwrites_for(interaction.guild.default_role)
+                overwrite = discord.PermissionOverwrite.from_pair(*current.pair())
+                overwrite.send_messages = False if action == "lock" else None
+                await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite, reason=audit_reason)
+            elif action == "warn":
+                key = (request.guild_id, request.target_id)
+                old = self._warnings.get(key)
+                self._warnings[key] = {"count": (old["count"] if old else 0) + 1,
+                                       "actor_id": request.actor_id,
+                                       "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                self._warnings.move_to_end(key)
+                while len(self._warnings) > self._warning_limit:
+                    self._warnings.popitem(last=False)
+                count = self._warnings[key]['count']
+                await self._record(interaction, request, "success")
+                return f"임시 경고 {count}회 · 자동 제재 없음 · 봇 재시작 시 초기화"
             await self._record(interaction, request, "success")
             return f"{ACTION_LABELS[action]} 작업을 완료했습니다."
         except Exception as error:
@@ -323,13 +393,14 @@ ADMIN_SERVICE = AdminService()
 
 
 class _BoundView(discord.ui.View):
-    def __init__(self, interaction: Any, service: AdminService):
+    def __init__(self, interaction: Any, service: AdminService, *, bind_channel: bool = False):
         super().__init__(timeout=120)
         self.actor_id, self.guild_id = interaction.user.id, interaction.guild.id
+        self.channel_id = getattr(getattr(interaction, "channel", None), "id", None) if bind_channel else None
         self.service = service
 
     async def interaction_check(self, interaction: Any) -> bool:
-        return await _guard(interaction, self.actor_id, self.guild_id)
+        return await _guard(interaction, self.actor_id, self.guild_id, self.channel_id)
 
     async def on_error(self, interaction: Any, error: Exception, item: Any) -> None:
         safe = _api_error(error)
@@ -380,6 +451,8 @@ class AdminActionModal(discord.ui.Modal):
                  *, target_id: int | None = None, value: int | None = None):
         super().__init__(title=ACTION_LABELS.get(action, "사용자 선택"), timeout=120)
         self.actor_id, self.guild_id = interaction.user.id, interaction.guild.id
+        self.channel_id = (getattr(getattr(interaction, "channel", None), "id", None)
+                           if action in ("cleanup", "slowmode", "lock", "unlock") else None)
         self.service, self.action, self.target_id, self.action_value = service, action, target_id, value
         self.value_input = None
         if action in ("select", "unban", "nickname", "cleanup", "slowmode"):
@@ -394,7 +467,7 @@ class AdminActionModal(discord.ui.Modal):
             self.add_item(self.reason_input)
 
     async def on_submit(self, interaction: Any) -> None:
-        if not await _guard(interaction, self.actor_id, self.guild_id):
+        if not await _guard(interaction, self.actor_id, self.guild_id, self.channel_id):
             return
         await _defer(interaction)
         try:
@@ -461,22 +534,38 @@ class AdminMemberActionsView(_BoundView):
         self.target_id = target_id
         select = discord.ui.Select(custom_id="admin:member-action", placeholder="이 멤버에게 실행할 작업",
                                    options=[discord.SelectOption(label=ACTION_LABELS[action], value=action)
-                                            for action in ("timeout", "untimeout", "nickname", "reset_nickname", "ban", "kick", "cleanup")])
+                                            for action in ("timeout", "untimeout", "nickname", "reset_nickname", "ban", "kick", "warn")])
         select.callback = self.select_action
         self.add_item(select)
+        self.button("임시 경고 조회", "admin:member-warnings", self.warnings)
 
     async def select_action(self, interaction: Any) -> None:
         if not await self.interaction_check(interaction):
             return
         values = (getattr(interaction, "data", {}) or {}).get("values", [])
         action = values[0] if values else ""
+        if action == "cleanup":
+            # UI-only policy. Keep the service, validation, modal and legacy
+            # branch below intact for an explicitly approved future UI patch.
+            await _ephemeral(interaction, "메시지 정리는 현재 관리자 선택 메뉴에서 제공하지 않습니다.", allowed_mentions=_no_mentions())
+            return
         if action == "timeout":
             await _ephemeral(interaction, "**⏳ 채팅금지 기간**\n사유 입력과 최종 확인 후 적용됩니다.",
                              view=AdminTimeoutView(interaction, self.service, self.target_id))
-        elif action in ("untimeout", "nickname", "reset_nickname", "ban", "kick", "cleanup"):
+        elif action in ("untimeout", "nickname", "reset_nickname", "ban", "kick", "cleanup", "warn"):
             await interaction.response.send_modal(AdminActionModal(interaction, self.service, action, target_id=self.target_id))
         else:
             await _ephemeral(interaction, "작업을 다시 선택해 주세요.")
+
+    async def warnings(self, interaction: Any) -> None:
+        if not await self.interaction_check(interaction):
+            return
+        await _defer(interaction)
+        try:
+            text = await self.service.warning_text(interaction, self.target_id)
+            await _ephemeral(interaction, text, allowed_mentions=_no_mentions())
+        except AdminActionError as error:
+            await _ephemeral(interaction, error.message, allowed_mentions=_no_mentions())
 
 
 class AdminTimeoutView(_BoundView):
@@ -505,12 +594,32 @@ class AdminTimeoutView(_BoundView):
 
 class AdminChannelView(_BoundView):
     def __init__(self, interaction: Any, service: AdminService):
-        super().__init__(interaction, service)
+        super().__init__(interaction, service, bind_channel=True)
         self.button("슬로우모드 설정 / 해제", "admin:slowmode", self.slowmode)
+        self.button("현재 채널 쓰기 잠금", "admin:lock", self.lock)
+        self.button("현재 채널 쓰기 상속", "admin:unlock", self.unlock)
+
+    async def interaction_check(self, interaction: Any) -> bool:
+        if not await super().interaction_check(interaction):
+            return False
+        try:
+            await self.service.visible_current_channel(interaction)
+            return True
+        except AdminActionError as error:
+            await _ephemeral(interaction, error.message, allowed_mentions=_no_mentions())
+            return False
 
     async def slowmode(self, interaction: Any) -> None:
         if await self.interaction_check(interaction):
             await interaction.response.send_modal(AdminActionModal(interaction, self.service, "slowmode"))
+
+    async def lock(self, interaction: Any) -> None:
+        if await self.interaction_check(interaction):
+            await interaction.response.send_modal(AdminActionModal(interaction, self.service, "lock"))
+
+    async def unlock(self, interaction: Any) -> None:
+        if await self.interaction_check(interaction):
+            await interaction.response.send_modal(AdminActionModal(interaction, self.service, "unlock"))
 
 
 async def send_member_actions(interaction: Any, target_id: int, service: AdminService = ADMIN_SERVICE) -> None:
@@ -539,7 +648,12 @@ async def handle_admin_action(interaction: Any, action_id: str, *, status_text: 
         await _ephemeral(interaction, "**👤 사용자 관리**\n이 서버 멤버를 선택하거나 사용자 ID를 입력하세요.",
                          view=AdminMemberSelectView(interaction, ADMIN_SERVICE), allowed_mentions=_no_mentions())
     elif action_id == "admin:channel":
-        await _ephemeral(interaction, "**🛡️ 이 채널 관리**\n슬로우모드는 Discord에 저장됩니다. 0초로 해제할 수 있어요.",
+        try:
+            await ADMIN_SERVICE.visible_current_channel(interaction)
+        except AdminActionError as error:
+            await _ephemeral(interaction, error.message, allowed_mentions=_no_mentions())
+            return True
+        await _ephemeral(interaction, "**🔒 이 채널 관리**\nDiscord에 저장됩니다. 쓰기 잠금은 @everyone만 변경하며 역할별 허용은 유지될 수 있어요.\n쓰기 해제는 상속(None)으로 변경하며 잠금 이전 상태 복원이 아닙니다.",
                          view=AdminChannelView(interaction, ADMIN_SERVICE), allowed_mentions=_no_mentions())
     elif action_id == "admin:logs":
         await _ephemeral(interaction, ADMIN_SERVICE.recent_log_text(interaction.guild.id), allowed_mentions=_no_mentions())

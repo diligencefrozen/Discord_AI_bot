@@ -1,9 +1,9 @@
-"""Bounded, memory-only copies of messages for private moderation audit delivery.
+"""Bounded, memory-only copies for the configured deletion record channel.
 
 Capture a message before deleting or editing it.  This module never downloads,
 logs, serializes, or sends message content.  Its frozen records deliberately
 contain no references to Discord objects; a sender must suppress mentions and
-restrict its destination to the configured private operator channel.
+verify that destination readers can also read the source channel.
 """
 
 from __future__ import annotations
@@ -128,6 +128,8 @@ class MessageAuditSnapshot:
     truncated_fields: tuple[str, ...] = ()
     # Retain the capture limits for bounded immutable reason updates.
     _limits: SnapshotLimits = field(default_factory=SnapshotLimits, compare=False)
+    trigger: str = "message_new"
+    edited_at: datetime | None = None
 
     @property
     def reason_code(self) -> str:
@@ -310,7 +312,7 @@ def _reason(code: Any, root: Any, detail: Any, limits: SnapshotLimits) -> tuple[
     return result, budget.truncated
 
 
-def capture_message_snapshot(message: Any, *, reason_code: str = "", detected_root: str = "", reason_detail: str = "", delete_origin: str = "unknown", captured_at: datetime | None = None, limits: SnapshotLimits | None = None) -> MessageAuditSnapshot:
+def capture_message_snapshot(message: Any, *, reason_code: str = "", detected_root: str = "", reason_detail: str = "", delete_origin: str = "unknown", captured_at: datetime | None = None, limits: SnapshotLimits | None = None, trigger: str = "message_new", edited_at: datetime | None = None) -> MessageAuditSnapshot:
     """Detach bounded original content and metadata from a Discord-like message."""
     if delete_origin not in DELETE_ORIGINS:
         raise ValueError("delete_origin must be bot, external, or unknown")
@@ -411,6 +413,8 @@ def capture_message_snapshot(message: Any, *, reason_code: str = "", detected_ro
         attachment_count, sticker_count, embed_count,
         raw_attachments is not None, raw_stickers is not None, raw_embeds is not None,
         tuple(sorted(truncated)), limits,
+        trigger if trigger in {"message_new", "message_edit", "history_scan"} else "message_new",
+        _timestamp(edited_at) or _timestamp(_get(message, "edited_at")),
     )
 
 
@@ -467,7 +471,7 @@ class MessageAuditCache:
         entry = self._entries.pop((guild_id, message_id), None)
         return entry[1] if entry is not None else None
 
-    def annotate(self, guild_id: int, message_id: int, *, reason_code: str | None = None, detected_root: str | None = None, reason_detail: str | None = None, delete_origin: str | None = None) -> MessageAuditSnapshot | None:
+    def annotate(self, guild_id: int, message_id: int, *, reason_code: str | None = None, detected_root: str | None = None, reason_detail: str | None = None, delete_origin: str | None = None, trigger: str | None = None, edited_at: datetime | None = None) -> MessageAuditSnapshot | None:
         if delete_origin is not None and delete_origin not in DELETE_ORIGINS:
             raise ValueError("delete_origin must be bot, external, or unknown")
         snapshot = self.get(guild_id, message_id)
@@ -481,6 +485,8 @@ class MessageAuditCache:
         )
         updated = replace(snapshot, reason=reason,
                           delete_origin=snapshot.delete_origin if delete_origin is None else delete_origin,
+                          trigger=trigger if trigger in {"message_new", "message_edit", "history_scan"} else snapshot.trigger,
+                          edited_at=_timestamp(edited_at) or snapshot.edited_at,
                           truncated_fields=tuple(sorted(set(snapshot.truncated_fields) | truncated)))
         key = (guild_id, message_id)
         expires, _ = self._entries[key]

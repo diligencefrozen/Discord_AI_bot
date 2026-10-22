@@ -537,9 +537,10 @@ class AdminPanelView(_ViewBase):
         self.action_service = action_service
         self.test_service = test_service
         self.actor_id, self.guild_id = actor_id, guild_id
-        actions = (("👤 사용자 관리", "admin:members"), ("🛡️ 채널 관리", "admin:channel"),
+        actions = (("👤 사용자 관리", "admin:members"), ("🔒 채널 관리", "admin:channel"),
                    ("⚙️ 금칙어", "admin:rules"), ("🧪 탐지 테스트", "admin:test"),
-                   ("📋 관리 기록", "admin:logs"), ("⚙️ 운영 상태", "admin:settings"))
+                   ("📋 관리 기록", "admin:logs"), ("⚙️ 운영 상태", "admin:settings"),
+                   ("🛡️ 수정 메시지 검열", "admin:edit-status"), ("🧪 삭제 로그 전송 테스트", "admin:deletion-test"))
         if DISCORD_AVAILABLE:
             for index, (label, custom_id) in enumerate(actions):
                 button = discord.ui.Button(label=label, custom_id=custom_id, style=discord.ButtonStyle.secondary, row=index // 2)
@@ -681,7 +682,7 @@ async def admin_panel_response(interaction: Any, *, action_service: Callable[...
     if log_admin_access(interaction, source="slash") is not None:
         await _ephemeral(interaction, UNAUTHORIZED_ADMIN_MESSAGE)
         return
-    await _ephemeral(interaction, "**🛡️ 도리봇 파딱 패널**\n사용자·채널 관리 또는 금칙어·관리 기록을 선택하세요.\n관리 작업은 확인 후 실행됩니다.",
+    await _ephemeral(interaction, "**🛡️ 도리봇 · 관리자 센터**\n지정된 파딱과 서버 소유자 전용 · 봇 대리 관리\n사용자·채널 관리, 검열 조회와 운영 진단을 선택하세요. 변경은 최종 확인 후 실행됩니다.",
                      view=AdminPanelView(action_service=action_service, test_service=test_service,
                                          actor_id=interaction.user.id, guild_id=interaction.guild.id),
                      allowed_mentions=_no_mentions())

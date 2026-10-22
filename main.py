@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Dict, Set, Tuple
 from dataclasses import dataclass
 from deletion_audit import DeletionAuditService
+from edit_moderation import EditModerationService, evaluate_policy
+from slash_visibility import SlashVisibilityAudit, slash_sync_mode
 from bot_storage import PickleStore
 from bot_metrics import MetricsStore
 from ai_providers import (
@@ -870,9 +872,22 @@ def use_profanity_pass(user_id: int):
     return _consume_legacy_exemption(user_id, "profanity")
 
 async def safe_delete(message: discord.Message, *, reason: str = "moderation",
-                      matched_rule: str = None, detail: str = None) -> bool:
+                      matched_rule: str = None, detail: str = None,
+                      trigger: str = "message_new", edited_at=None) -> bool:
     """Keep the operator audit separate from content-free console telemetry."""
-    return await DELETION_AUDIT.delete(message, reason=reason, matched_rule=matched_rule, detail=detail)
+    return await DELETION_AUDIT.delete(message, reason=reason, matched_rule=matched_rule,
+                                       detail=detail, trigger=trigger, edited_at=edited_at)
+
+
+def _evaluate_message_policy(message):
+    channel = message.channel
+    parent_id = getattr(getattr(channel, "parent", None), "id", None)
+    return evaluate_policy(
+        message.content, channel.id, link_regex=LINK_REGEX, find_badroot=find_badroot,
+        allowed_link_channel_ids=ALLOWED_CHANNELS,
+        exempt_profanity_channel_ids=EXEMPT_PROFANITY_CHANNEL_IDS,
+        parent_channel_id=parent_id,
+    )
 
 
 async def _moderate_message_content(message: discord.Message) -> bool:
@@ -882,11 +897,18 @@ async def _moderate_message_content(message: discord.Message) -> bool:
     user_id = getattr(getattr(message, "author", None), "id", 0)
     content = getattr(message, "content", "")
 
-    link_violation = LINK_REGEX.search(content) and channel_id not in ALLOWED_CHANNELS
-    root = find_badroot(content)
-    profanity_violation = root and channel_id not in EXEMPT_PROFANITY_CHANNEL_IDS
+    violation = _evaluate_message_policy(message)
+    link_violation = violation.link if violation else False
+    root = violation.matched_rule if violation else None
+    profanity_violation = violation.profanity if violation else False
     if link_violation or profanity_violation:
+        previous = EDIT_MODERATION.known_outcome(message)
+        if previous == "exempt":
+            return True
+        if previous == "deleted":
+            return False
         if use_profanity_pass(user_id):
+            EDIT_MODERATION.record_new_outcome(message, "exempt")
             # A single message consumes at most one pass even when it contains
             # both a blocked link and a configured profanity root.
             if link_violation:
@@ -919,7 +941,8 @@ async def _moderate_message_content(message: discord.Message) -> bool:
             reason = "link+profanity" if link_violation and profanity_violation else (
                 "profanity" if profanity_violation else "link"
             )
-            await safe_delete(message, reason=reason, matched_rule=root if profanity_violation else None)
+            deleted = await safe_delete(message, reason=reason, matched_rule=root if profanity_violation else None)
+            EDIT_MODERATION.record_new_outcome(message, "deleted" if deleted else "delete_failed")
             if link_violation:
                 await message.channel.send(
                     embed=discord.Embed(
@@ -939,6 +962,8 @@ async def _moderate_message_content(message: discord.Message) -> bool:
                     )
                 )
             return False
+    if not violation:
+        EDIT_MODERATION.record_new_outcome(message, "clean")
     return True
 
 # 공통 예외 로깅 도우미
@@ -2205,9 +2230,14 @@ intents.typing = True
 class Doribot(commands.Bot):
     async def setup_hook(self):
         # setup_hook runs after login, before the gateway and on_ready events.
-        # Register local handlers every process, publish only on explicit opt-in.
+        # V6 audits visibility each process; auto repairs only after safety checks.
         await _register_slash_commands_once(sync=_slash_sync_requested())
         _register_intro_views_once()
+        EDIT_MODERATION.start()
+
+    async def close(self):
+        await EDIT_MODERATION.close()
+        await super().close()
 
 
 bot = Doribot(command_prefix="!", intents=intents)
@@ -2235,7 +2265,7 @@ LOG_ROUTES = {
 }
 
 CHANNEL_TO_LOG = {src: dst for dst, srcs in LOG_ROUTES.items() for src in srcs}
-DELETION_AUDIT = DeletionAuditService(CHANNEL_TO_LOG, bot.get_channel)
+DELETION_AUDIT = DeletionAuditService(CHANNEL_TO_LOG, bot.get_channel, guild_resolver=bot.get_guild)
 ADMIN_SERVICE.delete_service = DELETION_AUDIT.delete
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -2287,6 +2317,11 @@ LINK_REGEX = re.compile(
     r'https?://\S+|youtu\.be|youtube\.com|gall\.dcinside\.com|m\.dcinside\.com|news\.(naver|v\.daum)\.com',
     re.I,
 )
+EDIT_MODERATION = EditModerationService(
+    bot, evaluate=_evaluate_message_policy, delete=safe_delete,
+    consume_pass=use_profanity_pass, has_pass=is_user_exempt_from_profanity,
+    remember=DELETION_AUDIT.remember, log_channel_ids=lambda: set(CHANNEL_TO_LOG.values()),
+)
 
 # ────────────────────────────────────────────────────────────────────────────
 # 게임 경고 관련 필터.
@@ -2316,11 +2351,13 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
     DELETION_AUDIT.remember(after)
+    await EDIT_MODERATION.on_cached_edit(before, after)
 
 
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     DELETION_AUDIT.on_raw_message_edit(payload)
+    await EDIT_MODERATION.on_raw_edit(payload)
 
 # ───────────────── Game promo cards ─────────────────
 GAME_CARDS: dict[str, dict] = {
@@ -4347,6 +4384,7 @@ async def pubg_mobile_gallery(ctx):
 
 # ────────── 버튼/슬래시 서비스 어댑터 ──────────
 _slash_registration_state = SlashCommandRegistrationState()
+_slash_visibility_audit = SlashVisibilityAudit()
 _runtime_tasks_started = False
 _intro_view_registered = False
 _admin_text_hint_cooldowns = {}
@@ -4571,7 +4609,19 @@ async def _admin_action_service(interaction, action_id):
     if action_id == "admin:rules":
         await send_active_rules_response(interaction, active_bad_roots(), test_service=_admin_test_service)
         return
+    if action_id == "admin:edit-status":
+        await _interaction_send(interaction, EDIT_MODERATION.status_text(interaction.guild.id))
+        return
+    if action_id == "admin:deletion-test":
+        await _interaction_defer(interaction)
+        result = await DELETION_AUDIT.send_test(interaction)
+        await _interaction_send(interaction, f"공용 삭제 로그 전송 테스트: {result.get('result', 'failed')} · {result.get('reason', 'unknown')}")
+        return
     state_root = XP_DATA_FILE.parent
+    deletion_status = DELETION_AUDIT.diagnostics(interaction.guild)
+    last_log_success = deletion_status.get("last_success")
+    last_log_success_text = (last_log_success.isoformat(timespec="seconds")
+                             if isinstance(last_log_success, datetime.datetime) else "없음")
     status_text = (
         f"⚙️ 운영 상태\n활성 금칙어: {len(active_bad_roots())}개\n"
         f"저장 경로 설정: {'DATA_DIR/STATE_DIR' if os.getenv('DATA_DIR') or os.getenv('STATE_DIR') else '작업 디렉터리'}\n"
@@ -4580,8 +4630,15 @@ async def _admin_action_service(interaction, action_id):
         f"슬래시 로컬 등록: {len(bot.tree.get_commands())}개\n"
         f"이번 프로세스 원격 게시 성공: {'예' if _slash_registration_state.synced else '미확인'}\n"
         "로컬 등록은 Discord 명령 선택기 표시를 보장하지 않습니다.\n"
-        f"삭제 감사 원문: {'켜짐 · 검증된 비공개 채널만' if DELETION_AUDIT.include_content else '꺼짐'}\n"
+        f"공용 삭제 로그 원문: {'켜짐 · 원본 열람 범위 검사' if DELETION_AUDIT.include_content else '꺼짐'}\n"
+        f"공용 로그 진단: {deletion_status.get('reason', 'unknown')}\n"
+        f"봇 로그 권한: 보기 {deletion_status.get('bot_view_channel', False)} · 보내기 {deletion_status.get('bot_send_messages', False)} · 임베드 {deletion_status.get('bot_embed_links', False)}\n"
+        f"기록 가능/제외 채널: {deletion_status.get('eligible_source_count', 0)}/{deletion_status.get('excluded_source_count', 0)} · 수신지 {deletion_status.get('destination_count', 0)}개\n"
+        f"전송 성공/실패: {deletion_status.get('sent', 0)}/{deletion_status.get('failures', 0)} · 최근 사유 {deletion_status.get('last_reason') or '없음'}\n"
+        f"최근 전송 확인(UTC): {last_log_success_text}\n"
         "삭제 스냅샷은 메모리에만 잠시 보관하며 파일은 다운로드하지 않습니다.\n"
+        f"{_slash_visibility_audit.status_text()}\n"
+        f"{EDIT_MODERATION.status_text(interaction.guild.id)}\n"
         "관리 기록과 중복 실행 방지는 메모리이며 재시작 시 초기화됩니다."
     )
     if await handle_admin_action(interaction, action_id, status_text=status_text):
@@ -4599,14 +4656,11 @@ async def _admin_test_service(interaction, content: str):
 
 
 SLASH_COMMAND_NAMES = frozenset(("시작", "질문", "그림", "내정보", "관리"))
+SLASH_OBSOLETE_NAMES = frozenset(("ai질문",))
 
 
-def _slash_sync_requested() -> bool:
-    value = os.getenv("SLASH_SYNC_ON_STARTUP", "0").strip()
-    if value not in {"0", "1"}:
-        logging.warning("event=slash_sync_skipped scope=global reason=invalid_configuration")
-        return False
-    return value == "1"
+def _slash_sync_requested() -> str:
+    return slash_sync_mode()
 
 
 async def _register_slash_commands_once(*, sync=False):
@@ -4617,59 +4671,25 @@ async def _register_slash_commands_once(*, sync=False):
         diagnostics["special_ids_reason"], diagnostics["guild_scope_configured"],
         diagnostics["guild_scope_valid"], diagnostics["guild_scope_count"],
     )
-    def _register() -> None:
+    def _register():
         register_slash_commands(
-            bot,
-            start_service=_start_interaction_service,
+            bot, start_service=_start_interaction_service,
             question_service=_question_interaction_service,
             image_service=_image_interaction_service,
             growth_service=_growth_interaction_service,
             admin_service=_admin_action_service,
             admin_test_service=_admin_test_service,
         )
-        registered = bot.tree.get_commands()
-        logging.info(
-            "event=slash_registered scope=global count=%d names=%s",
-            len(registered), ",".join(sorted(command.name for command in registered)),
-        )
-
-    async def _sync() -> list[object]:
-        # Global sync replaces a scope's complete remote command set. Never
-        # publish an incomplete tree or silently replace foreign commands.
-        names = frozenset(command.name for command in bot.tree.get_commands())
-        if names != SLASH_COMMAND_NAMES:
-            logging.error("event=slash_sync_rejected scope=global reason=unexpected_local_commands count=%d", len(names))
-            raise RuntimeError("unexpected_slash_command_set")
-        app_id, bot_id = bot.application_id, getattr(bot.user, "id", None)
-        if app_id is not None and bot_id is not None and app_id != bot_id:
-            logging.error("event=slash_sync_rejected scope=global reason=application_bot_mismatch")
-            raise RuntimeError("application_bot_mismatch")
-        # Bulk sync replaces all remote commands for this application. Inspect
-        # first so commands owned by another extension are never deleted.
-        remote = await bot.tree.fetch_commands()
-        foreign_count = sum(command.name not in SLASH_COMMAND_NAMES for command in remote)
-        if foreign_count:
-            logging.error("event=slash_sync_rejected scope=global reason=unexpected_remote_commands count=%d", foreign_count)
-            raise RuntimeError("unexpected_remote_commands")
-        synced = await bot.tree.sync()
-        logging.info(
-            "event=slash_sync_success scope=global count=%d names=%s application_id=%s bot_id=%s",
-            len(synced), ",".join(sorted(command.name for command in synced)),
-            bot.application_id, getattr(bot.user, "id", None),
-        )
-        return synced
-
-    await _slash_registration_state.ensure(_register, _sync if sync else None)
-    error = _slash_registration_state.last_error
-    if sync and error is not None:
-        status = getattr(error, "status", None)
-        logging.error(
-            "event=slash_sync_failed scope=global error_type=%s status=%s application_id=%s bot_id=%s",
-            type(error).__name__, status if type(status) is int else None,
-            bot.application_id, getattr(bot.user, "id", None),
-        )
-    elif not sync:
-        logging.info("event=slash_sync_skipped scope=global reason=not_requested")
+        logging.info("event=slash_registered scope=global count=%d names=%s",
+                     len(bot.tree.get_commands()), ",".join(sorted(command.name for command in bot.tree.get_commands())))
+    await _slash_registration_state.ensure(_register)
+    mode = "1" if sync is True else "0" if sync is False else sync
+    if mode not in {"0", "1", "auto"}:
+        mode = "0"
+    await _slash_visibility_audit.run(bot, mode)
+    _slash_registration_state.synced = _slash_visibility_audit.published
+    _slash_registration_state.last_error = _slash_visibility_audit.last_error
+    _slash_registration_state.sync_attempts = _slash_visibility_audit.sync_attempts
 
 
 def _register_intro_views_once():
@@ -4699,6 +4719,7 @@ async def on_ready():
     if not _runtime_tasks_started:
         load_xp_data()
         load_achievements_data()
+        await _slash_visibility_audit.audit_guild_aliases(bot, _slash_sync_requested())
     else:
         logging.info("Reconnected without reloading in-memory state")
 

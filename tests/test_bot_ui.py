@@ -218,7 +218,22 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(args.kwargs["ephemeral"])
         self.assertIn("파딱", args.args[0])
         self.assertEqual([button.custom_id for button in args.kwargs["view"].children],
-                         ["admin:members", "admin:channel", "admin:rules", "admin:test", "admin:logs", "admin:settings"])
+                         ["admin:members", "admin:channel", "admin:rules", "admin:test", "admin:logs", "admin:settings",
+                          "admin:edit-status", "admin:deletion-test"])
+
+    async def test_new_admin_diagnostics_are_bound_private_callbacks(self):
+        os.environ["SPECIAL_ADMIN_USER_IDS"] = str(NEW_ADMIN)
+        service = AsyncMock()
+        view = bot_ui.AdminPanelView(action_service=service, actor_id=NEW_ADMIN, guild_id=1)
+        for action_id in ("admin:edit-status", "admin:deletion-test"):
+            target = interaction(NEW_ADMIN, action=action_id)
+            await view._button_callback(target)
+            service.assert_awaited_with(target, action_id)
+        for actor in (10, 20):
+            target = interaction(actor, action="admin:deletion-test")
+            await view._button_callback(target)
+            self.assertTrue(target.response.send_message.call_args.kwargs["ephemeral"])
+        self.assertEqual(service.await_count, 2)
 
     async def test_typing_greeting_uses_safe_display_names_without_mentions(self):
         names = ("Apple Watch", "늘어버린 도리", "😡🐻👩\u200d💻", "name" * 100,
