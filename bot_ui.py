@@ -83,6 +83,8 @@ def admin_authorization_reason(actor: Any, guild: Any) -> str | None:
         return "special_id_mismatch"
 
     allowed_guilds = _configured_guild_ids()
+    if allowed_guilds == set():
+        return "guild_scope_invalid"
     if allowed_guilds is not None and getattr(guild, "id", None) not in allowed_guilds:
         return "guild_scope_denied"
     return None
@@ -104,6 +106,31 @@ def _configured_guild_ids() -> set[int] | None:
     except ValueError:
         return set()
     return ids
+
+
+def admin_configuration_diagnostics() -> dict[str, Any]:
+    """Safe configuration metadata; never return raw environment values."""
+    ids, reason = _special_admin_configuration()
+    raw_scope = os.getenv(SPECIAL_ADMIN_GUILD_IDS_ENV)
+    configured = bool(raw_scope and raw_scope.strip())
+    scope = _configured_guild_ids()
+    return {
+        "special_ids_valid": reason is None,
+        "special_id_count": len(ids),
+        "special_ids_reason": reason or "valid",
+        "guild_scope_configured": configured,
+        "guild_scope_valid": not configured or bool(scope),
+        "guild_scope_count": len(scope or ()),
+    }
+
+
+def log_admin_access(interaction: Any, *, source: str, event: str = "admin_open") -> str | None:
+    """Record a decision without actor IDs, environment values or exception text."""
+    reason = admin_authorization_reason(getattr(interaction, "user", None), getattr(interaction, "guild", None))
+    logging.info("event=%s result=%s reason=%s guild_id=%s source=%s", event,
+                 "denied" if reason else "allowed", reason or "authorized",
+                 getattr(getattr(interaction, "guild", None), "id", None), source)
+    return reason
 
 
 def is_admin_authorized(actor: Any, guild: Any) -> bool:
@@ -141,6 +168,11 @@ async def _ephemeral(interaction: Any, content: str, **kwargs: Any) -> Any:
     if sender is not None:
         return await sender(content, ephemeral=True, **kwargs)
     return None
+
+
+async def _admin_ui_error(interaction: Any, error: Exception) -> None:
+    logging.warning("event=admin_component result=failed reason=callback_error exception_type=%s", type(error).__name__)
+    await _ephemeral(interaction, "관리 화면을 처리하지 못했습니다. /관리에서 다시 시작해 주세요.")
 
 
 try:  # discord.py is optional for static analysis and unit tests.
@@ -299,16 +331,20 @@ class ModerationTestModal(_ModalBase):
             required=True,
         )
 
-    def __init__(self, test_service: Callable[..., Awaitable[Any]] | None = None):
+    def __init__(self, test_service: Callable[..., Awaitable[Any]] | None = None,
+                 *, actor_id: int | None = None, guild_id: int | None = None):
         if DISCORD_AVAILABLE:
             super().__init__(title="금칙어 탐지 테스트")
         else:
             super().__init__()
             self.content = discord.TextInput()
         self.test_service = test_service
+        self.actor_id, self.guild_id = actor_id, guild_id
 
     async def on_submit(self, interaction: Any) -> None:
-        if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
+        if (not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None))
+                or (self.actor_id is not None and self.actor_id != getattr(interaction.user, "id", None))
+                or (self.guild_id is not None and self.guild_id != getattr(getattr(interaction, "guild", None), "id", None))):
             await _ephemeral(interaction, UNAUTHORIZED_ADMIN_MESSAGE)
             return
         content = str(getattr(self.content, "value", "")).strip()
@@ -318,7 +354,14 @@ class ModerationTestModal(_ModalBase):
         if self.test_service is None:
             await _ephemeral(interaction, "탐지 테스트 기능이 준비되지 않았습니다.")
             return
-        await self.test_service(interaction, content)
+        try:
+            await self.test_service(interaction, content)
+        except Exception as error:
+            logging.warning("event=admin_action result=failed reason=service_error exception_type=%s", type(error).__name__)
+            await _ephemeral(interaction, "탐지 테스트를 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+
+    async def on_error(self, interaction: Any, error: Exception) -> None:
+        await _admin_ui_error(interaction, error)
 
 
 class _IntroActions:
@@ -396,8 +439,9 @@ class TypingIntroView(_IntroActions, _LayoutViewBase):
                  growth_service=None, menu_service=None):
         super().__init__(timeout=None)
         self._configure_services(question_service, image_service, growth_service, menu_service)
-        mention = getattr(user, "mention", "사용자")
-        self.text = f"{mention}님, 채팅을 작성 중이셨군요! ⌨️\n도리봇으로 무엇을 해볼까요?"
+        user_id = getattr(user, "id", None)
+        mention = f"<@{user_id}>" if _is_integer_id(user_id) else "사용자"
+        self.text = f"**🐻 도리봇 · 빠른 실행**\n{mention}님, 무엇을 도와드릴까요?\n아래에서 원하는 기능을 선택해 주세요."
         buttons = self._intro_buttons()
         self.add_item(_Container(_TextDisplay(self.text), _ActionRow(*buttons[:2]), _ActionRow(*buttons[2:])))
 
@@ -453,23 +497,33 @@ class AdminPanelView(_ViewBase):
     """Ephemeral administrator panel with a repeated authorization boundary."""
 
     def __init__(self, *, action_service: Callable[..., Awaitable[Any]] | None = None,
-                 test_service: Callable[..., Awaitable[Any]] | None = None):
+                 test_service: Callable[..., Awaitable[Any]] | None = None,
+                 actor_id: int | None = None, guild_id: int | None = None):
         super().__init__(timeout=300)
         self.action_service = action_service
         self.test_service = test_service
+        self.actor_id, self.guild_id = actor_id, guild_id
+        actions = (("👤 사용자 관리", "admin:members"), ("🛡️ 채널 관리", "admin:channel"),
+                   ("⚙️ 금칙어", "admin:rules"), ("🧪 탐지 테스트", "admin:test"),
+                   ("📋 관리 기록", "admin:logs"), ("⚙️ 운영 상태", "admin:settings"))
         if DISCORD_AVAILABLE:
-            for label, custom_id in (("⚙️ 금칙어", "admin:rules"), ("🧪 탐지 테스트", "admin:test"), ("📋 관리 로그", "admin:logs"), ("⚙️ 운영 설정", "admin:settings")):
-                button = discord.ui.Button(label=label, custom_id=custom_id, style=discord.ButtonStyle.secondary)
+            for index, (label, custom_id) in enumerate(actions):
+                button = discord.ui.Button(label=label, custom_id=custom_id, style=discord.ButtonStyle.secondary, row=index // 2)
                 button.callback = self._button_callback
                 self.add_item(button)
         else:
-            self.children = [type("ButtonStub", (), {"label": label, "custom_id": custom_id})() for label, custom_id in (("⚙️ 금칙어", "admin:rules"), ("🧪 탐지 테스트", "admin:test"), ("📋 관리 로그", "admin:logs"), ("⚙️ 운영 설정", "admin:settings"))]
+            self.children = [type("ButtonStub", (), {"label": label, "custom_id": custom_id})() for label, custom_id in actions]
 
     async def interaction_check(self, interaction: Any) -> bool:
-        allowed = is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None))
+        allowed = log_admin_access(interaction, source="button", event="admin_action") is None
+        allowed = allowed and (self.actor_id is None or self.actor_id == getattr(interaction.user, "id", None))
+        allowed = allowed and (self.guild_id is None or self.guild_id == getattr(getattr(interaction, "guild", None), "id", None))
         if not allowed:
             await _ephemeral(interaction, UNAUTHORIZED_ADMIN_MESSAGE)
         return allowed
+
+    async def on_error(self, interaction: Any, error: Exception, item: Any) -> None:
+        await _admin_ui_error(interaction, error)
 
     async def _button_callback(self, interaction: Any) -> None:
         if not await self.interaction_check(interaction):
@@ -478,9 +532,14 @@ class AdminPanelView(_ViewBase):
             data = getattr(interaction, "data", {}) or {}
             action_id = getattr(interaction, "custom_id", None) or data.get("custom_id")
             if action_id == "admin:test" and self.test_service is not None:
-                await interaction.response.send_modal(ModerationTestModal(self.test_service))
+                await interaction.response.send_modal(ModerationTestModal(self.test_service, actor_id=self.actor_id or interaction.user.id,
+                                                                          guild_id=self.guild_id or interaction.guild.id))
                 return
-            await self.action_service(interaction, action_id)
+            try:
+                await self.action_service(interaction, action_id)
+            except Exception as error:
+                logging.warning("event=admin_action result=failed reason=service_error exception_type=%s", type(error).__name__)
+                await _ephemeral(interaction, "관리 기능을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.")
         else:
             await _ephemeral(interaction, "관리 기능이 준비되지 않았습니다.")
 
@@ -494,10 +553,12 @@ def _rule_display_text(root: str) -> str:
 class ActiveRulesView(_ViewBase):
     """Read-only, private snapshot of the authoritative active policy list."""
 
-    def __init__(self, roots: Iterable[str], *, test_service=None, page_size: int = 20):
+    def __init__(self, roots: Iterable[str], *, test_service=None, page_size: int = 20,
+                 actor_id: int | None = None, guild_id: int | None = None):
         super().__init__(timeout=300)
         self.roots = tuple(sorted(set(roots), key=lambda root: (unicodedata.normalize("NFKC", root).casefold(), root)))
         self.test_service = test_service
+        self.actor_id, self.guild_id = actor_id, guild_id
         self.page_index = 0
         self._page_lock = asyncio.Lock()
         # Reserve room for the heading and page indicator under Discord's 2000
@@ -535,10 +596,15 @@ class ActiveRulesView(_ViewBase):
         self.next_button.disabled = self.page_index == len(self.pages) - 1
 
     async def interaction_check(self, interaction: Any) -> bool:
-        if is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
+        if (is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None))
+                and (self.actor_id is None or self.actor_id == getattr(interaction.user, "id", None))
+                and (self.guild_id is None or self.guild_id == getattr(getattr(interaction, "guild", None), "id", None))):
             return True
         await _ephemeral(interaction, UNAUTHORIZED_ADMIN_MESSAGE)
         return False
+
+    async def on_error(self, interaction: Any, error: Exception, item: Any) -> None:
+        await _admin_ui_error(interaction, error)
 
     async def _button_callback(self, interaction: Any) -> None:
         if not await self.interaction_check(interaction):
@@ -549,7 +615,8 @@ class ActiveRulesView(_ViewBase):
             if self.test_service is None:
                 await _ephemeral(interaction, "탐지 테스트 기능이 준비되지 않았습니다.")
             else:
-                await interaction.response.send_modal(ModerationTestModal(self.test_service))
+                await interaction.response.send_modal(ModerationTestModal(self.test_service, actor_id=self.actor_id or interaction.user.id,
+                                                                          guild_id=self.guild_id or interaction.guild.id))
             return
         if action_id not in ("admin:rules:previous", "admin:rules:next"):
             await _ephemeral(interaction, "관리 작업을 선택해 주세요.")
@@ -570,17 +637,20 @@ async def send_active_rules_response(interaction: Any, roots: Iterable[str], *, 
     if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
         await _ephemeral(interaction, UNAUTHORIZED_ADMIN_MESSAGE)
         return
-    view = ActiveRulesView(roots, test_service=test_service)
+    view = ActiveRulesView(roots, test_service=test_service, actor_id=interaction.user.id, guild_id=interaction.guild.id)
     await _ephemeral(interaction, view.content, view=view, allowed_mentions=_no_mentions())
 
 
 async def admin_panel_response(interaction: Any, *, action_service: Callable[..., Awaitable[Any]] | None = None,
                                test_service: Callable[..., Awaitable[Any]] | None = None) -> None:
     """Handle ``/관리`` and never expose panel content to unauthorized users."""
-    if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
+    if log_admin_access(interaction, source="slash") is not None:
         await _ephemeral(interaction, UNAUTHORIZED_ADMIN_MESSAGE)
         return
-    await _ephemeral(interaction, "도리봇 파딱 패널입니다.", view=AdminPanelView(action_service=action_service, test_service=test_service))
+    await _ephemeral(interaction, "**🛡️ 도리봇 파딱 패널**\n사용자·채널 관리 또는 금칙어·관리 기록을 선택하세요.\n관리 작업은 확인 후 실행됩니다.",
+                     view=AdminPanelView(action_service=action_service, test_service=test_service,
+                                         actor_id=interaction.user.id, guild_id=interaction.guild.id),
+                     allowed_mentions=_no_mentions())
 
 
 def register_slash_commands(
@@ -712,6 +782,6 @@ def typing_intro_payload(user: Any, **services: Any) -> dict[str, Any]:
 
 __all__ = [
     "SPECIAL_ADMIN_USER_ID", "IntroView", "TypingIntroView", "FeatureMenuView", "QuestionModal", "ImageModal", "ModerationTestModal", "AdminPanelView", "ActiveRulesView",
-    "admin_panel_response", "send_active_rules_response", "admin_authorization_reason", "configured_special_admin_ids", "is_admin_authorized", "is_authorized_admin", "is_admin_user",
+    "admin_panel_response", "send_active_rules_response", "admin_authorization_reason", "admin_configuration_diagnostics", "log_admin_access", "configured_special_admin_ids", "is_admin_authorized", "is_authorized_admin", "is_admin_user",
     "register_slash_commands", "SlashCommandRegistrationState", "typing_intro_payload",
 ]

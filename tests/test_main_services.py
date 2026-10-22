@@ -36,7 +36,7 @@ SERVICE_NAMES = {
     "_interaction_send", "_interaction_defer", "_question_interaction_service",
     "_publish_question_answer", "_generate_text_response", "_generate_image_bytes",
     "_reserve_image_request", "ask", "strip_think", "_send_typing_reminder",
-    "_deliver_typing_reminder", "_typing_scope_key",
+    "_deliver_typing_reminder", "_typing_scope_key", "_typing_notice_on_cooldown",
     "_image_interaction_service", "on_message_delete",
 }
 
@@ -51,7 +51,7 @@ def services():
         "ALLOWED_CHANNELS": {99}, "EXEMPT_PROFANITY_CHANNEL_IDS": {98},
         "LINK_REGEX": re.compile(r"https?://\S+", re.I),
         "user_xp_data": {}, "get_today_date": lambda: "2026-10-21",
-        "save_xp_data": Mock(), "check_achievements": Mock(return_value=[]),
+        "save_xp_data": Mock(), "save_achievements_data": Mock(), "check_achievements": Mock(return_value=[]),
         "safe_delete": AsyncMock(return_value=True), "_metric": Mock(),
         "AIProviderError": ai_providers.AIProviderError if ai_providers else RuntimeError,
         "GEMINI_CONFIG": object(), "GEMINI_LIMITER": object(), "HORDE_CONFIG": object(),
@@ -61,10 +61,11 @@ def services():
         "_last_image_request": {}, "IMAGE_REQUEST_COOLDOWN": 20,
         "THINK_RE": re.compile(r"<think>.*?</think>", re.S),
         "bot": SimpleNamespace(user=None, all_commands={"ask": object(), "img": object(), "xp": object()}, process_commands=AsyncMock()),
-        "TYPE_REMINDER_COOLDOWN": 86400, "TYPE_REMINDER_CHANNEL_COOLDOWN": 60,
-        "_last_typing_notice": {}, "_last_typing_channel_notice": {},
-        "_typing_notice_send_lock": asyncio.Lock(), "_typing_tasks": {},
-        "_save_typing_cooldowns": Mock(),
+        "TYPE_REMINDER_COOLDOWN": 86400, "TYPING_INTRO_DELAY_SECONDS": 1.3,
+        "_last_typing_notice": {}, "_typing_notice_inflight": set(), "_typing_tasks": {},
+        "_persist_typing_cooldowns": AsyncMock(),
+        "_observe_typing_message": Mock(), "_typing_message_fallback": Mock(),
+        "_plain_admin_message_hint": AsyncMock(return_value=False),
         "AI_IMAGE_FAILURE_MESSAGE": "무료 이미지 서버가 혼잡해요.",
     }
     bodies = []
@@ -160,9 +161,47 @@ class MainModerationTests(unittest.IsolatedAsyncioTestCase):
             ns["safe_delete"].assert_awaited_once()
             ns["bot"].process_commands.assert_not_awaited()
             ns["add_xp"].assert_not_called()
+            ns["_observe_typing_message"].assert_called_once()
+            ns["_typing_message_fallback"].assert_not_called()
         ns = services()
         await ns["on_message"](message("!ask hello"))
         ns["bot"].process_commands.assert_awaited_once()
+        ns["_typing_message_fallback"].assert_not_called()
+
+    async def test_message_fallback_runs_only_after_media_and_spam_acceptance(self):
+        class ReachedFallback(Exception):
+            pass
+
+        for gate in ("blocked_media", "spam", "accepted"):
+            with self.subTest(gate=gate):
+                ns = services()
+                target = message("hello")
+                target.attachments = []
+                target.clean_content = target.content
+                target.mentions = []
+                target.reference = None
+                ns.update({
+                    "BLOCK_MEDIA_USER_IDS": {42} if gate == "blocked_media" else set(),
+                    "EXEMPT_MEDIA_CHANNEL_IDS": set(), "PRIMARY_EXEMPT_MEDIA_CH_ID": 99,
+                    "_dbg": Mock(), "_message_has_blocked_media_or_emoji": Mock(return_value=True),
+                    "make_surveillance_embed": Mock(return_value=(object(), object())),
+                    "push_recent_message": Mock(), "SPAM_ENABLED": gate == "spam",
+                    "_is_exempt": Mock(return_value=False), "is_user_exempt_from_spam": Mock(return_value=False),
+                    "check_spam_and_reason": Mock(return_value="frequency"),
+                    "_user_deletion_rate": {}, "_user_violations": {42: 1},
+                    "SPAM_CFG": {"auto_timeout_threshold": 5},
+                    "random": SimpleNamespace(random=lambda: 1.0),
+                    "_typing_message_fallback": Mock(side_effect=ReachedFallback),
+                    "add_xp": Mock(side_effect=AssertionError("test stops before XP")),
+                })
+                if gate == "accepted":
+                    with self.assertRaises(ReachedFallback):
+                        await ns["on_message"](target)
+                    ns["_typing_message_fallback"].assert_called_once_with(target)
+                else:
+                    await ns["on_message"](target)
+                    ns["_typing_message_fallback"].assert_not_called()
+                ns["add_xp"].assert_not_called()
 
 
 @unittest.skipIf(discord is None or ai_providers is None, "requires project dependencies")
@@ -302,14 +341,11 @@ class PublicQuestionTests(unittest.IsolatedAsyncioTestCase):
         ns["typing_intro_payload"] = bot_ui.typing_intro_payload
         for name in ("_question_interaction_service", "_image_interaction_service", "_growth_interaction_service", "_menu_interaction_service"):
             ns[name] = AsyncMock()
-        async def history(**_kwargs):
-            if False:
-                yield None
-        channel = SimpleNamespace(id=1, guild=SimpleNamespace(id=1), send=AsyncMock(), history=history)
+        channel = SimpleNamespace(id=1, guild=SimpleNamespace(id=1), send=AsyncMock())
         user = SimpleNamespace(id=42, mention="<@42>")
         with patch.object(asyncio, "sleep", new_callable=AsyncMock) as sleep:
             await ns["_send_typing_reminder"](channel, user, (1, 42), time.time())
-            sleep.assert_awaited_once_with(5)
+            sleep.assert_awaited_once_with(1.3)
             channel.send.assert_awaited_once()
             payload = channel.send.call_args.kwargs
             self.assertNotIn("content", payload)

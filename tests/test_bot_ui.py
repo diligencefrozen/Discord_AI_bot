@@ -56,8 +56,9 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         container = view.children[0]
         self.assertEqual(len(container.children), 3)
         text, first, second = container.children
-        self.assertIn("<@42>님, 채팅을 작성 중이셨군요!", text.content)
-        self.assertIn("도리봇으로 무엇을 해볼까요?", text.content)
+        self.assertIn("**🐻 도리봇 · 빠른 실행**", text.content)
+        self.assertIn("<@42>님, 무엇을 도와드릴까요?", text.content)
+        self.assertIn("아래에서 원하는 기능을 선택해 주세요.", text.content)
         self.assertEqual([len(first.children), len(second.children)], [2, 2])
         buttons = [*first.children, *second.children]
         self.assertEqual([button.custom_id for button in buttons], list(view.BUTTON_IDS))
@@ -195,7 +196,64 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         args = target.response.send_message.call_args
         self.assertTrue(args.kwargs["ephemeral"])
         self.assertIn("파딱", args.args[0])
-        self.assertEqual([button.custom_id for button in args.kwargs["view"].children], ["admin:rules", "admin:test", "admin:logs", "admin:settings"])
+        self.assertEqual([button.custom_id for button in args.kwargs["view"].children],
+                         ["admin:members", "admin:channel", "admin:rules", "admin:test", "admin:logs", "admin:settings"])
+
+    async def test_notice_builds_target_mention_from_validated_id(self):
+        user = SimpleNamespace(id=42, mention="@everyone <@123>")
+        view = bot_ui.TypingIntroView(user)
+        self.assertNotIn("@everyone", view.text)
+        self.assertNotIn("<@123>", view.text)
+        self.assertEqual(view.text.count("<@42>"), 1)
+        self.assertEqual(len(view.text.splitlines()), 3)
+
+    async def test_configuration_diagnostics_never_contain_raw_values(self):
+        os.environ["SPECIAL_ADMIN_USER_IDS"] = f"{OLD_ADMIN},{NEW_ADMIN}"
+        os.environ["SPECIAL_ADMIN_GUILD_IDS"] = "1,2"
+        details = bot_ui.admin_configuration_diagnostics()
+        self.assertEqual(details["special_id_count"], 2)
+        self.assertEqual(details["guild_scope_count"], 2)
+        self.assertTrue(details["special_ids_valid"])
+        self.assertNotIn(str(NEW_ADMIN), repr(details))
+        for invalid in ('"1,2"', "1;2", "1,,2", "1，2", "1,"):
+            os.environ["SPECIAL_ADMIN_GUILD_IDS"] = invalid
+            self.assertEqual(bot_ui.admin_authorization_reason(SimpleNamespace(id=NEW_ADMIN), SimpleNamespace(id=1, owner_id=10)), "guild_scope_invalid")
+            self.assertFalse(bot_ui.admin_configuration_diagnostics()["guild_scope_valid"])
+
+    async def test_admin_open_logs_safe_source_reason_and_guild(self):
+        with self.assertLogs(level="INFO") as logs:
+            await bot_ui.admin_panel_response(interaction())
+        output = " ".join(logs.output)
+        self.assertIn("event=admin_open result=allowed reason=authorized guild_id=1 source=slash", output)
+        self.assertNotIn(str(NEW_ADMIN), output)
+
+    async def test_panel_is_bound_to_original_actor_and_server_even_for_other_admin(self):
+        os.environ["SPECIAL_ADMIN_USER_IDS"] = str(NEW_ADMIN)
+        service = AsyncMock()
+        view = bot_ui.AdminPanelView(action_service=service, actor_id=10, guild_id=1)
+        for target in (interaction(NEW_ADMIN, action="admin:rules"), interaction(10, 2, action="admin:rules")):
+            await view._button_callback(target)
+        service.assert_not_awaited()
+
+    async def test_bound_moderation_modal_rejects_other_admin_and_other_guild(self):
+        os.environ["SPECIAL_ADMIN_USER_IDS"] = str(NEW_ADMIN)
+        service = AsyncMock()
+        modal = bot_ui.ModerationTestModal(service, actor_id=10, guild_id=1)
+        modal.content = SimpleNamespace(value="test")
+        await modal.on_submit(interaction(NEW_ADMIN))
+        await modal.on_submit(interaction(10, 2))
+        service.assert_not_awaited()
+
+    async def test_admin_service_error_is_private_and_does_not_expose_exception(self):
+        service = AsyncMock(side_effect=RuntimeError("SECRET_API_KEY"))
+        view = bot_ui.AdminPanelView(action_service=service)
+        target = interaction(action="admin:rules")
+        with self.assertLogs(level="WARNING") as logs:
+            await view._button_callback(target)
+        self.assertNotIn("SECRET_API_KEY", " ".join(logs.output))
+        args = target.response.send_message.call_args
+        self.assertTrue(args.kwargs["ephemeral"])
+        self.assertNotIn("SECRET_API_KEY", args.args[0])
 
     async def test_admin_panel_rechecks_permission_on_every_button(self):
         service = AsyncMock()

@@ -50,7 +50,10 @@ from bot_ui import (
     SlashCommandRegistrationState,
     typing_intro_payload,
     send_active_rules_response,
+    admin_configuration_diagnostics,
+    log_admin_access,
 )
+from admin_service import handle_admin_action
 
 # Load local development settings before resolving state paths. Northflank
 # injects environment variables directly, while local `.env` users get the
@@ -104,10 +107,10 @@ XP_CONFIG = {
     # reward: description, effect_type, effect_value, duration (minutes, None for permanent)
     "reward_tiers": [
         {"xp": 30, "name": "🌱 새싹", "reward": "도배 차단 면제 30분", "effect": {"type": "antispam", "duration": 30}},  # 메시지 2개
-        {"xp": 90, "name": "🌿 싹트기", "reward": "도배 차단 면제 3시간", "effect": {"type": "antispam", "duration": 180}},  # 메시지 6개
-        {"xp": 180, "name": "🌳 성장", "reward": "금칙어 + 링크 필터 면제 10회", "effect": {"type": "profanity", "count": 10}},  # 메시지 12개
-        {"xp": 300, "name": "🌲 거목", "reward": "VIP 배지 + 모든 제한 면제 3시간", "effect": {"type": "all", "duration": 180}},  # 메시지 20개
-        {"xp": 450, "name": "✨ 전설", "reward": "24시간 완전 면제 + 특별 축하 메시지", "effect": {"type": "all", "duration": 1440, "vip_winner": True}},  # 메시지 30개 (평일), 18개 (주말)
+        {"xp": 90, "name": "🌿 싹트기", "reward": "도배 차단 면제 3시간", "effect": {"type": "antispam", "duration": 180}},  # 평일 메시지 4개
+        {"xp": 180, "name": "🌳 성장", "reward": "금칙어 + 링크 필터 면제 10회", "effect": {"type": "profanity", "count": 10}},  # 평일 메시지 8개
+        {"xp": 300, "name": "🌲 거목", "reward": "VIP 배지 + 모든 제한 면제 3시간", "effect": {"type": "all", "duration": 180}},  # 평일 메시지 12개
+        {"xp": 450, "name": "✨ 전설", "reward": "24시간 완전 면제 + 특별 축하 메시지", "effect": {"type": "all", "duration": 1440, "vip_winner": True}},  # 평일 18개 / 금~일 10개
     ]
 }
 
@@ -329,9 +332,15 @@ def save_achievements_data():
         logging.error(f"업적 데이터 저장 실패: {e}")
 
 def init_user_achievements(user_id: int):
-    # 사용자 업적 데이터 초기화 (24시간 하드리셋)
-    if user_id not in achievements_data:
+    """Reset each user's daily ledger once, including lazy midnight rollover."""
+    today = get_today_date()
+    existing = achievements_data.get(user_id)
+    if isinstance(existing, dict) and not existing.get("date"):
+        # Historical files have no top-level date; preserve their contents.
+        existing["date"] = existing.get("stats", {}).get("last_message_date") or today
+    if not isinstance(existing, dict) or existing.get("date") != today:
         achievements_data[user_id] = {
+            "date": today,
             "unlocked": [],
             "stats": {
                 "total_messages": 0,
@@ -346,7 +355,7 @@ def init_user_achievements(user_id: int):
             }
         }
 
-def check_achievements(user_id: int, event_type: str = None, **kwargs) -> List[str]:
+def check_achievements(user_id: int, event_type: str = None, *, persist: bool = True, **kwargs) -> List[str]:
     
     # 업적 체크 및 해금
     # Returns: 새로 해금된 업적 ID 리스트
@@ -362,7 +371,7 @@ def check_achievements(user_id: int, event_type: str = None, **kwargs) -> List[s
     today = get_today_date()
     
     # 이벤트 타입별 통계 업데이트
-    if event_type == "message":
+    if event_type in {"message", "activity"} and kwargs.get("record_message", True):
         stats["total_messages"] += 1
         
         # 시간대별 메시지 카운트 추가
@@ -384,22 +393,21 @@ def check_achievements(user_id: int, event_type: str = None, **kwargs) -> List[s
         else:
             stats["daily_messages"] += 1
     
-    elif event_type == "tier_reached":
-        tier_idx = kwargs.get("tier_idx")
-        if tier_idx is not None:
-            if "tiers_reached" not in stats:
-                stats["tiers_reached"] = set()
-            stats["tiers_reached"].add(tier_idx)
-            
-            # 정오 전 전설 달성 체크
-            if tier_idx == 4 and current_hour < 12:  # 전설 티어
-                stats["legendary_before_noon"] = True
-    
-    elif event_type == "reward_claimed":
+    if event_type in {"tier_reached", "activity"}:
+        tier_indices = kwargs.get("tier_indices", [kwargs.get("tier_idx")])
+        reached = stats.setdefault("tiers_reached", set())
+        if not isinstance(reached, set):
+            reached = stats["tiers_reached"] = set(reached)
+        for tier_idx in tier_indices:
+            if tier_idx is not None:
+                reached.add(tier_idx)
+                if tier_idx == len(XP_CONFIG["reward_tiers"]) - 1 and current_hour < 12:
+                    stats["legendary_before_noon"] = True
+
+    if event_type == "reward_claimed":
         stats["rewards_claimed_count"] += 1
-    
-    elif event_type == "legendary_weekend":
-        stats["legendary_weekend_count"] += 1
+    elif event_type == "legendary_weekend" or kwargs.get("legendary_weekend", False):
+        stats["legendary_weekend_count"] = 1
     
     # 주말 여부 확인
     weekend_mode = is_weekend()
@@ -420,7 +428,7 @@ def check_achievements(user_id: int, event_type: str = None, **kwargs) -> List[s
         
         elif cond_type == "time_range":
             if condition["start"] <= current_hour < condition["end"]:
-                if event_type == "message":
+                if event_type in {"message", "activity"} and kwargs.get("record_message", True):
                     achieved = True
         
         elif cond_type == "time_messages":
@@ -466,20 +474,27 @@ def check_achievements(user_id: int, event_type: str = None, **kwargs) -> List[s
             unlocked.append(ach_id)
             newly_unlocked.append(ach_id)
             
-            # 업적 달성 시 보너스 XP 지급
-            bonus_xp = ach.get("reward_xp", 0)
-            if bonus_xp > 0:
-                add_xp(user_id, bonus_xp, record_message=False)
-            
-            # 업적 보상 효과 적용
-            reward_effect = ach.get("reward_effect")
-            if reward_effect:
-                apply_achievement_reward(user_id, reward_effect)
-    
-    save_achievements_data()
+            # The XP ledger is authoritative for payout idempotence even if
+            # the adjacent achievements file is restored from an older backup.
+            data = user_xp_data.get(user_id)
+            if isinstance(data, dict):
+                awards = data.setdefault("achievement_bonus_awards", [])
+                if ach_id not in awards:
+                    awards.append(ach_id)
+                    data["bonus_xp"] = data.get("bonus_xp", 0) + ach.get("reward_xp", 0)
+                    data["xp"] = data.get("legacy_xp", 0) + data.get("activity_xp", 0) + data["bonus_xp"]
+                    reward_effect = ach.get("reward_effect")
+                    if reward_effect:
+                        apply_achievement_reward(user_id, reward_effect, persist=False)
+
+    # Persist the payout ledger before the unlock file: recovery cannot pay
+    # an achievement twice. This function never calls add_xp.
+    if persist:
+        save_xp_data()
+        save_achievements_data()
     return newly_unlocked
 
-def apply_achievement_reward(user_id: int, effect: dict):
+def apply_achievement_reward(user_id: int, effect: dict, *, persist: bool = True):
     # 업적 보상 효과를 사용자에게 적용
     if user_id not in user_xp_data:
         return
@@ -520,7 +535,8 @@ def apply_achievement_reward(user_id: int, effect: dict):
         else:
             rewards[key] = {"expires_at": expires_at}
     
-    save_xp_data()
+    if persist:
+        save_xp_data()
 
 def get_user_achievements(user_id: int) -> dict:
     # 사용자 업적 정보 조회
@@ -548,6 +564,21 @@ def load_xp_data():
     try:
         loaded = XP_STORE.load(default={})
         user_xp_data = loaded if isinstance(loaded, dict) else {}
+        migrated = 0
+        for data in user_xp_data.values():
+            if isinstance(data, dict) and "activity_xp" not in data:
+                try:
+                    _migrate_xp_record(data)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    # Preserve the malformed row exactly for operator recovery;
+                    # one bad legacy total must never discard other users.
+                    logging.warning("event=xp_schema_migration result=record_rejected error_type=%s", type(exc).__name__)
+                else:
+                    migrated += 1
+        if migrated:
+            # PickleStore retains the exact pre-migration file as .bak.1.
+            save_xp_data()
+            logging.info("event=xp_schema_migration records=%s schema=2", migrated)
         logging.info(f"XP 데이터 로드 완료: {len(user_xp_data)}명")
     except Exception as e:
         logging.error(f"XP 데이터 로드 실패: {e}")
@@ -564,6 +595,46 @@ def get_today_date() -> str:
     # 서울 시간 기준 오늘 날짜
     return datetime.datetime.now(seoul_tz).strftime("%Y-%m-%d")
 
+
+def _new_daily_xp(today: str) -> dict:
+    return {
+        "schema_version": 2, "xp": 0, "activity_xp": 0, "bonus_xp": 0,
+        "legacy_xp": 0, "last_msg": 0, "date": today, "claimed": [],
+        "rewards_active": {}, "achievement_bonus_awards": [],
+    }
+
+
+def _migrate_xp_record(data: dict) -> dict:
+    """Preserve unreconstructable historical totals without counting them as activity.
+
+    Existing claims, exemptions and VIP flags remain intact for the current
+    day. Operators can inspect legacy_xp; no user record is discarded.
+    """
+    if "activity_xp" not in data:
+        data["legacy_xp"] = max(0, int(data.get("xp", 0)))
+        data["activity_xp"] = 0
+        data["bonus_xp"] = 0
+        data["migration_policy"] = "legacy_total_preserved_activity_unknown"
+    data.setdefault("bonus_xp", 0)
+    data.setdefault("legacy_xp", 0)
+    data.setdefault("claimed", [])
+    data.setdefault("rewards_active", {})
+    data.setdefault("achievement_bonus_awards", [])
+    data.setdefault("last_msg", 0)
+    data["schema_version"] = 2
+    data["xp"] = data["activity_xp"] + data["bonus_xp"] + data["legacy_xp"]
+    return data
+
+
+def calculate_xp_progression(activity_xp: int, amount: int) -> tuple[int, list[int]]:
+    """Pure tier calculation; bonuses must never be passed to this function."""
+    if type(amount) is not int or amount < 0:
+        raise ValueError("XP adjustment must be a non-negative integer")
+    updated = activity_xp + amount
+    crossed = [i for i, tier in enumerate(XP_CONFIG["reward_tiers"])
+               if activity_xp < tier["xp"] <= updated]
+    return updated, crossed
+
 def reset_daily_xp():
     # 자정 리셋 체크 및 실행 (경험치 + 업적 - 24시간 하드리셋)
     global user_xp_data, achievements_data
@@ -574,135 +645,84 @@ def reset_daily_xp():
         data = user_xp_data[uid]
         if data.get("date") != today:
             # 새로운 날 - 완전 리셋
-            user_xp_data[uid] = {
-                "xp": 0,
-                "last_msg": 0,
-                "date": today,
-                "claimed": [],
-                "rewards_active": {}
-            }
+            user_xp_data[uid] = _new_daily_xp(today)
     save_xp_data()
     
     # 업적 완전 리셋 (24시간 하드리셋)
     for uid in list(achievements_data.keys()):
-        achievements_data[uid] = {
-            "unlocked": [],
-            "stats": {
-                "total_messages": 0,
-                "daily_messages": 0,
-                "last_message_date": None,
-                "tiers_reached": set(),
-                "rewards_claimed_count": 0,
-                "legendary_weekend_count": 0,
-                "legendary_before_noon": False,
-                "time_messages": {},
-                "messages_timestamps": deque(maxlen=100),
-            }
-        }
+        init_user_achievements(uid)
     save_achievements_data()
 
-def add_xp(user_id: int, amount: int = None, *, record_message: bool = True) -> tuple[int, bool, int, list]:
-    # 경험치 추가
-    # Returns: (현재 xp, 레벨업 여부, 새 티어 인덱스 or None, 새로 달성한 업적 리스트)
-    
+def add_xp(user_id: int, amount: int = None, *, record_message: bool = True,
+           event_id: int = None) -> tuple[int, bool, Optional[int], list]:
+    """One synchronous progression transaction; no notification/network awaits.
+
+    Normal messages use configured activity XP. An explicit amount is a trusted
+    activity adjustment, never the achievement payout path. ``xp`` remains the
+    backwards-compatible display total; only activity_xp determines tiers.
+    """
     if amount is None:
-        # 주말 여부에 따라 경험치 결정
-        if is_weekend():
-            amount = XP_CONFIG["msg_xp_weekend"]
-        else:
-            amount = XP_CONFIG["msg_xp"]
-    
-    today = get_today_date()
-    now = time.time()
-    
-    # 초기화
-    if user_id not in user_xp_data:
-        user_xp_data[user_id] = {
-            "xp": 0,
-            "last_msg": 0,
-            "date": today,
-            "claimed": [],
-            "rewards_active": {}
-        }
-    
-    data = user_xp_data[user_id]
-    
-    # 날짜 체크 (자정 넘어갔는지)
-    if data["date"] != today:
-        data["xp"] = 0
-        data["claimed"] = []
-        data["date"] = today
-        data["rewards_active"] = {}
-    
-    # 쿨다운 체크
-    if record_message and now - data["last_msg"] < XP_CONFIG["msg_cooldown"]:
+        amount = XP_CONFIG["msg_xp_weekend"] if is_weekend() else XP_CONFIG["msg_xp"]
+    # Validate before mutating state, including trusted explicit adjustments.
+    calculate_xp_progression(0, amount)
+    today, now = get_today_date(), time.time()
+    if user_id not in user_xp_data or user_xp_data[user_id].get("date") != today:
+        user_xp_data[user_id] = _new_daily_xp(today)
+    data = _migrate_xp_record(user_xp_data[user_id])
+
+    # Discord snowflakes increase monotonically. Ignore replays and older
+    # deliveries even after the five-second cooldown or a process restart.
+    if record_message and event_id is not None:
+        if type(event_id) is not int or event_id <= data.get("last_message_id", 0):
+            return data["xp"], False, None, []
+        data["last_message_id"] = event_id
+    if record_message and data["last_msg"] and now - data["last_msg"] < XP_CONFIG["msg_cooldown"]:
         return data["xp"], False, None, []
-    
-    # 이전 XP
-    old_xp = data["xp"]
-    
-    # XP 추가
-    data["xp"] += amount
+
+    data["activity_xp"], crossed = calculate_xp_progression(data["activity_xp"], amount)
+    data["xp"] = data["activity_xp"] + data["bonus_xp"] + data["legacy_xp"]
     if record_message:
         data["last_msg"] = now
-    
-    # 새 티어 도달 체크 및 VIP Winner 플래그
-    leveled_up = False
-    new_tier_idx = None
-    for i, tier in enumerate(XP_CONFIG["reward_tiers"]):
-        if old_xp < tier["xp"] <= data["xp"]:
-            leveled_up = True
-            new_tier_idx = i
-            break
+    top_idx = len(XP_CONFIG["reward_tiers"]) - 1
+    legendary_reached = top_idx in crossed
+    if legendary_reached and data.get("vip_winner_date") != today:
+        data["vip_winner_date"] = today
+        data["vip_winner_announced"] = False
+        data["legendary_on_weekend"] = is_weekend()
 
-    # 업적 체크 리스트
-    new_achievements = []
-
-    # VIP Winner: 최고 등급 달성 시 오늘 첫 메시지에만 플래그
-    if new_tier_idx is not None and new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1:
-        # 최고 등급 (전설)
-        today = get_today_date()
-        if data.get("vip_winner_date") != today:
-            data["vip_winner_date"] = today
-            data["vip_winner_announced"] = False
-            # 주말에 전설 달성 여부 기록
-            data["legendary_on_weekend"] = is_weekend()
-            
-            # 업적: 주말에 전설 달성
-            if is_weekend():
-                new_achievements.extend(check_achievements(user_id, "legendary_weekend"))
-    
-    # 업적: 티어 도달
-    if new_tier_idx is not None:
-        new_achievements.extend(check_achievements(user_id, "tier_reached", tier_idx=new_tier_idx))
-    
-    # Count a real message once. Achievement XP bonuses do not consume the
-    # message cooldown or create a second message event.
-    if record_message:
-        new_achievements.extend(check_achievements(user_id, "message"))
-
+    new_achievements = check_achievements(
+        user_id, "activity", persist=False, record_message=record_message, tier_indices=crossed,
+        legendary_weekend=legendary_reached and is_weekend(),
+    )
+    # Claim every crossed tier before yielding to Discord, so notifications
+    # and concurrent incoming messages cannot leave intermediate rewards out.
+    for idx in crossed:
+        before = set(achievements_data[user_id]["unlocked"])
+        claim_reward(user_id, idx, persist=False)
+        new_achievements.extend(ach_id for ach_id in achievements_data[user_id]["unlocked"] if ach_id not in before)
     save_xp_data()
-    return data["xp"], leveled_up, new_tier_idx, new_achievements
+    save_achievements_data()
+    return data["xp"], bool(crossed), crossed[-1] if crossed else None, new_achievements
 
 def get_user_xp(user_id: int) -> dict:
     # 사용자 경험치 정보 조회
     today = get_today_date()
     
     if user_id not in user_xp_data:
-        return {"xp": 0, "last_msg": 0, "date": today, "claimed": [], "rewards_active": {}}
+        return {"xp": 0, "activity_xp": 0, "bonus_xp": 0, "legacy_xp": 0, "last_msg": 0, "date": today, "claimed": [], "rewards_active": {}}
     
     data = user_xp_data[user_id]
     
     # 날짜 체크
-    if data["date"] != today:
-        return {"xp": 0, "last_msg": 0, "date": today, "claimed": [], "rewards_active": {}}
+    if data.get("date") != today:
+        return {"xp": 0, "activity_xp": 0, "bonus_xp": 0, "legacy_xp": 0, "last_msg": 0, "date": today, "claimed": [], "rewards_active": {}}
     
     return data
 
 def get_available_rewards(user_id: int) -> list:
     # 받을 수 있는 리워드 목록
     data = get_user_xp(user_id)
-    xp = data["xp"]
+    xp = data.get("activity_xp", data.get("xp", 0))
     claimed = data.get("claimed", [])
     
     available = []
@@ -712,15 +732,17 @@ def get_available_rewards(user_id: int) -> list:
     
     return available
 
-def claim_reward(user_id: int, tier_idx: int) -> bool:
+def claim_reward(user_id: int, tier_idx: int, *, persist: bool = True) -> bool:
     # 리워드 수령
     data = user_xp_data.get(user_id)
-    if not data:
+    if not data or data.get("date") != get_today_date():
+        return False
+    if type(tier_idx) is not int or not 0 <= tier_idx < len(XP_CONFIG["reward_tiers"]):
         return False
     if tier_idx in data.get("claimed", []):
         return False
     tier = XP_CONFIG["reward_tiers"][tier_idx]
-    if data["xp"] < tier["xp"]:
+    if data.get("activity_xp", data.get("xp", 0)) < tier["xp"]:
         return False
     # Activate reward effect
     effect = tier.get("effect", {})
@@ -737,8 +759,52 @@ def claim_reward(user_id: int, tier_idx: int) -> bool:
     data["claimed"].append(tier_idx)
     
     # 업적: 보상 수령
-    check_achievements(user_id, "reward_claimed")
+    check_achievements(user_id, "reward_claimed", persist=False)
     
+    if persist:
+        save_xp_data()
+        save_achievements_data()
+    return True
+
+
+async def _announce_vip_winner(message) -> bool:
+    """Reserve once per user/day before the first network await.
+
+    Discord send has no durable idempotency key. A failed/ambiguous delivery is
+    recorded without automatic retry to prevent duplicate congratulations.
+    """
+    user_id = message.author.id
+    data = get_user_xp(user_id)
+    today = get_today_date()
+    if (data.get("activity_xp", 0) < XP_CONFIG["reward_tiers"][-1]["xp"]
+            or data.get("vip_winner_date") != today
+            or data.get("vip_winner_announced", False)):
+        return False
+    data["vip_winner_announced"] = True
+    data["vip_announcement_delivery"] = "reserved"
+    save_xp_data()
+    weekend = data.get("legendary_on_weekend", False)
+    embed = discord.Embed(
+        title="🎊 주말 VIP Winner!" if weekend else "🏆 VIP Winner!",
+        description=(f"{message.author.mention}님이 오늘의 **✨ 전설** 등급을 달성했어요!\n"
+                     f"적격 채팅 활동 **{data['activity_xp']} XP** · 축하합니다! 🎉"),
+        color=0xFFD700, timestamp=datetime.datetime.now(seoul_tz),
+    )
+    embed.set_thumbnail(url=message.author.display_avatar.url)
+    embed.set_footer(text="사용자마다 하루 한 번 축하 · 등급은 활동 XP만 반영")
+    try:
+        await message.channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                users=[message.author], roles=False, everyone=False, replied_user=False,
+            ),
+        )
+    except Exception as exc:
+        data["vip_announcement_delivery"] = "failed_or_unknown"
+        logging.warning("event=vip_announcement result=failed error_type=%s", type(exc).__name__)
+        save_xp_data()
+        return False
+    data["vip_announcement_delivery"] = "sent"
     save_xp_data()
     return True
 
@@ -1498,15 +1564,31 @@ async def jina_summary(url: str) -> Optional[str]:
     except Exception:
         return None
     
-# ────────── 타이핑 알림(5초 딜레이) ──────────
+# ────────── 타이핑 / 첫 메시지 빠른 실행 안내 ──────────
 ChannelT = Union[discord.TextChannel, discord.Thread, discord.DMChannel]
 UserT    = Union[discord.Member, discord.User]
+# The task key is (guild, user), shared across channels within that guild.
 _typing_tasks: Dict[tuple[int, int], asyncio.Task] = {}
 
-# A user sees at most one typing notice in a rolling 24 hours, across channels.
+# One successful notice per guild/user in a rolling 24 hours.
 TYPE_REMINDER_COOLDOWN = 60 * 60 * 24
-TYPE_REMINDER_CHANNEL_COOLDOWN = 60
 TYPE_REMINDER_COOLDOWN_FILE = _state_path("typing_cooldowns.json")
+
+
+def _typing_intro_delay() -> float:
+    default = 1.3
+    try:
+        value = float(os.getenv("TYPING_INTRO_DELAY_SECONDS", str(default)))
+        if not math.isfinite(value) or not 0.1 <= value <= 1.5:
+            raise ValueError("invalid typing delay")
+        return value
+    except (TypeError, ValueError, OverflowError):
+        logging.warning("event=typing_delay_config result=default reason=invalid_value")
+        return default
+
+
+TYPING_INTRO_DELAY_SECONDS = _typing_intro_delay()
+
 
 def _load_typing_cooldowns() -> Dict[str, float]:
     try:
@@ -1516,16 +1598,21 @@ def _load_typing_cooldowns() -> Dict[str, float]:
         notices = {}
         for key, value in raw.items():
             parts = str(key).split(":")
-            # Current user:<id>, previous guild:channel:user, and legacy user ID.
-            if len(parts) == 2 and parts[0] == "user":
-                user_id = parts[1]
-            elif len(parts) in (1, 3) and all(part.isascii() and part.isdecimal() for part in parts):
-                user_id = parts[-1]
+            # Preserve unscoped historical notices conservatively for their
+            # remaining 24h, because their original guild cannot be recovered.
+            if len(parts) == 4 and parts[0] == "guild" and parts[2] == "user":
+                identifiers = (parts[1], parts[3])
+            elif len(parts) == 3:
+                identifiers = (parts[0], parts[1], parts[2])
+            elif len(parts) == 2 and parts[0] == "user":
+                identifiers = (parts[1],)
+            elif len(parts) == 1:
+                identifiers = (parts[0],)
             else:
                 continue
-            if (
-                len(user_id) > 20 or not user_id.isascii() or not user_id.isdecimal()
-                or not 0 < int(user_id) < 2**64
+            if any(
+                len(item) > 20 or not item.isascii() or not item.isdecimal()
+                or not 0 < int(item) < 2**64 for item in identifiers
             ):
                 continue
             try:
@@ -1534,7 +1621,10 @@ def _load_typing_cooldowns() -> Dict[str, float]:
                 continue
             if isinstance(value, bool) or not math.isfinite(timestamp) or timestamp <= 0:
                 continue
-            canonical = f"user:{int(user_id)}"
+            if len(identifiers) == 1:
+                canonical = f"user:{int(identifiers[0])}"
+            else:
+                canonical = f"guild:{int(identifiers[0])}:user:{int(identifiers[-1])}"
             notices[canonical] = max(notices.get(canonical, 0), timestamp)
         return notices
     except FileNotFoundError:
@@ -1544,12 +1634,12 @@ def _load_typing_cooldowns() -> Dict[str, float]:
         return {}
 
 
-def _save_typing_cooldowns() -> None:
+def _save_typing_cooldowns(snapshot=None) -> None:
     temp = TYPE_REMINDER_COOLDOWN_FILE.with_suffix(".tmp")
     try:
         TYPE_REMINDER_COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
         with temp.open("w", encoding="utf-8") as handle:
-            json.dump(_last_typing_notice, handle, allow_nan=False)
+            json.dump(_last_typing_notice if snapshot is None else snapshot, handle, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, TYPE_REMINDER_COOLDOWN_FILE)
@@ -1562,47 +1652,61 @@ def _save_typing_cooldowns() -> None:
 
 
 _last_typing_notice: Dict[str, float] = _load_typing_cooldowns()
-_last_typing_channel_notice: Dict[int, float] = {}
-_typing_notice_send_lock = asyncio.Lock()
+_typing_notice_inflight: Set[str] = set()
+_typing_state_save_lock = asyncio.Lock()
 
 def _typing_scope_key(channel: ChannelT, user: UserT) -> str:
-    return f"user:{user.id}"
+    return f"guild:{channel.guild.id}:user:{user.id}"
+
+
+def _typing_notice_on_cooldown(channel: ChannelT, user: UserT) -> bool:
+    now_ts = time.time()
+    # The legacy guard expires naturally; all new deliveries are guild scoped.
+    latest = max(
+        _last_typing_notice.get(_typing_scope_key(channel, user), 0),
+        _last_typing_notice.get(f"user:{user.id}", 0),
+    )
+    return latest > 0 and now_ts - latest < TYPE_REMINDER_COOLDOWN
+
+
+async def _persist_typing_cooldowns() -> None:
+    # Serialize only file writes, never Discord requests. Snapshot after taking
+    # the lock so a later writer cannot overwrite a newer successful delivery.
+    async with _typing_state_save_lock:
+        snapshot = dict(_last_typing_notice)
+        await asyncio.to_thread(_save_typing_cooldowns, snapshot)
 
 
 async def _deliver_typing_reminder(channel: ChannelT, user: UserT, payload):
-    # This worker owns the lock and survives cancellation of the typing timer.
-    # Keep the final check, send, and cooldown write under the same lock.
     scope_key = _typing_scope_key(channel, user)
-    async with _typing_notice_send_lock:
-        now_ts = time.time()
-        last_ts = _last_typing_notice.get(scope_key)
-        if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
-            return
-        channel_last_ts = _last_typing_channel_notice.get(channel.id)
-        if channel_last_ts is not None and (now_ts - channel_last_ts) < TYPE_REMINDER_CHANNEL_COOLDOWN:
-            return
+    # Reserving contains no await: same-scope contenders cannot both send.
+    # Different users/guilds can await Discord independently.
+    if scope_key in _typing_notice_inflight or _typing_notice_on_cooldown(channel, user):
+        return
+    _typing_notice_inflight.add(scope_key)
+    try:
         await channel.send(**payload)
         sent_at = time.time()
         _last_typing_notice[scope_key] = sent_at
-        _last_typing_channel_notice[channel.id] = sent_at
-        _save_typing_cooldowns()
+        legacy_key = f"user:{user.id}"
+        legacy_ts = _last_typing_notice.get(legacy_key)
+        if legacy_ts is not None and sent_at - legacy_ts >= TYPE_REMINDER_COOLDOWN:
+            _last_typing_notice.pop(legacy_key, None)
+        await _persist_typing_cooldowns()
         _metric("intro_viewed")
+    finally:
+        # A failed request consumes no cooldown and is eligible for retry.
+        _typing_notice_inflight.discard(scope_key)
 
 
 async def _send_typing_reminder(channel: ChannelT, user: UserT,
-                                key: tuple[int, int], started_at: float):
-    scope_key = _typing_scope_key(channel, user)
+                                key: tuple[int, int], started_at: float,
+                                *, wait_for_typing: bool = True):
     try:
-        now_ts = time.time()
-        last_ts = _last_typing_notice.get(scope_key)
-        if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
+        if _typing_notice_on_cooldown(channel, user):
             return
-
-        await asyncio.sleep(5)
-
-        async for msg in channel.history(limit=1, after=datetime.datetime.fromtimestamp(started_at)):
-            if msg.author.id == user.id:
-                return
+        if wait_for_typing:
+            await asyncio.sleep(TYPING_INTRO_DELAY_SECONDS)
 
         payload = typing_intro_payload(
             user,
@@ -1615,8 +1719,8 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
         try:
             await asyncio.shield(delivery)
         except asyncio.CancelledError:
-            # A new typing event may replace the timer while Discord accepts
-            # the message. Finish recording that delivery before propagating.
+            # Finish an already-started send and its cooldown record before
+            # propagating cancellation, preventing a duplicate accepted send.
             try:
                 await delivery
             except Exception:
@@ -1627,6 +1731,43 @@ async def _send_typing_reminder(channel: ChannelT, user: UserT,
     finally:
         if _typing_tasks.get(key) is asyncio.current_task():
             _typing_tasks.pop(key, None)
+
+
+def _schedule_typing_reminder(channel: ChannelT, user: UserT, *, wait_for_typing=True):
+    if user.bot or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+    if _typing_notice_on_cooldown(channel, user):
+        return
+    key = (channel.guild.id, user.id)
+    task = _typing_tasks.get(key)
+    if (task is not None and not task.done()) or _typing_scope_key(channel, user) in _typing_notice_inflight:
+        return
+    _typing_tasks[key] = asyncio.create_task(
+        _send_typing_reminder(channel, user, key, time.time(), wait_for_typing=wait_for_typing)
+    )
+
+
+def _observe_typing_message(message):
+    """A sent message ends its pending timer, including censored commands.
+
+    Discord provides no stop-typing event, so silence alone does not cancel a
+    notice. An accepted ordinary message may schedule the immediate fallback.
+    """
+    if message.guild is None or message.author.bot:
+        return
+    key = (message.guild.id, message.author.id)
+    if _typing_scope_key(message.channel, message.author) not in _typing_notice_inflight:
+        task = _typing_tasks.pop(key, None)
+        if task is not None:
+            task.cancel()
+
+
+def _typing_message_fallback(message):
+    # Invoke only after moderation. Unknown commands are excluded as well.
+    if (message.author.bot or message.guild is None
+            or not message.content.strip() or message.content.lstrip().startswith(("!", "/"))):
+        return
+    _schedule_typing_reminder(message.channel, message.author, wait_for_typing=False)
 
 # ────────── AI / Discord 설정 ──────────
 # Text questions and image generation have independent, fixed providers.
@@ -2297,30 +2438,16 @@ GAME_CARDS: dict[str, dict] = {
 # ────────── 메인 on_message ──────────
 @bot.event
 async def on_typing(channel: ChannelT, user: UserT, when):
-    if user.bot or not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return
-
-    # 쿨다운 중이면 태스크 자체를 만들지 않음 (불필요한 작업 방지)
-    now_ts = time.time()
-    last_ts = _last_typing_notice.get(_typing_scope_key(channel, user))
-    if last_ts is not None and (now_ts - last_ts) < TYPE_REMINDER_COOLDOWN:
-        return
-
-    key = (channel.id, user.id)
-    if task := _typing_tasks.pop(key, None):
-        task.cancel()
-
-    # typing 이벤트가 발생한 실제 시각을 사용해 필터 정확도 향상
-    started = when.timestamp() if isinstance(when, datetime.datetime) else now_ts
-    _typing_tasks[key] = asyncio.create_task(
-        _send_typing_reminder(channel, user, key, started)
-    )
+    # Keep the first deadline even when the user types continuously.
+    _schedule_typing_reminder(channel, user)
 
 @bot.event
 async def on_message(message: discord.Message):
     # 1 자기 자신 무시
     if bot.user is not None and message.author.id == bot.user.id:
         return
+
+    _observe_typing_message(message)
 
     guild_id = message.guild.id if message.guild else 0
     ch_id    = message.channel.id
@@ -2341,192 +2468,8 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Reaching this point means the message was accepted by moderation and may
-    # participate in the existing XP/reward flow.
-    xp_eligible = True
-
-    # ───── 경험치 획득 (봇이 아닌 경우만) ─────
-    if not message.author.bot and xp_eligible:
-        xp, leveled_up, new_tier_idx, new_achievements = add_xp(user_id)
-        
-        # 업적 달성 알림 (상세 보상 정보 포함)
-        if new_achievements:
-            for ach_id in new_achievements:
-                ach = ACHIEVEMENTS.get(ach_id)
-                if not ach:
-                    continue
-
-                weekend_bonus = is_weekend()
-                bonus_xp = ach.get('reward_xp', 0)
-                reward_effect = ach.get('reward_effect', {})
-                badge = "🎊" if weekend_bonus else "🏆"
-                
-                # 보상 효과 설명 생성
-                reward_desc = ""
-                if reward_effect:
-                    effect_type = reward_effect.get("type")
-                    if effect_type == "antispam":
-                        count = reward_effect.get("count", 0)
-                        reward_desc = f"🛡️ 도배 차단 면제 **{count}회**"
-                    elif effect_type == "profanity":
-                        count = reward_effect.get("count", 0)
-                        reward_desc = f"💬 금칙어 면제 **{count}회**"
-                    elif effect_type == "all":
-                        duration = reward_effect.get("duration", 0)
-                        hours = duration // 60
-                        minutes = duration % 60
-                        if hours > 0:
-                            reward_desc = f"✨ 모든 제한 면제 **{hours}시간 {minutes}분**"
-                        else:
-                            reward_desc = f"✨ 모든 제한 면제 **{minutes}분**"
-                
-                # 업적 달성 카드
-                desc = (
-                    f"**{message.author.mention}** 님이\n"
-                    f"**{ach['name']}** 업적을 달성했습니다!\n\n"
-                    f"📝 *{ach['description']}*\n\n"
-                    f"**보상:**\n"
-                    f"💰 경험치 **+{bonus_xp} XP**\n"
-                    f"{reward_desc if reward_desc else '🎁 특별 보상 없음'}"
-                )
-
-                ach_embed = discord.Embed(
-                    title=f"{badge} 업적 달성!",
-                    description=desc,
-                    color=0xFFD700 if weekend_bonus else 0x00E5FF,
-                    timestamp=datetime.datetime.now(seoul_tz)
-                )
-                ach_embed.set_thumbnail(url=message.author.display_avatar.url)
-                ach_embed.set_footer(text="⏰ 자정 리셋 · !업적 으로 전체 확인")
-
-                try:
-                    await message.channel.send(embed=ach_embed, delete_after=15)
-                except discord.errors.DiscordServerError as e:
-                    logging.error(f"Discord 서버 오류로 업적 알림 전송 실패 (520 등): {e}")
-                except Exception as e:
-                    logging.error(f"업적 알림 전송 실패: {e}")
-        
-        # 레벨업 알림 + 자동 보상 수령
-        if leveled_up and new_tier_idx is not None:
-            tier = XP_CONFIG["reward_tiers"][new_tier_idx]
-
-            # 레벨업 시 수령 가능한 모든 보상을 자동 수령
-            claimed_tiers: list[str] = []
-            try:
-                available = get_available_rewards(user_id)
-                for idx, t in available:
-                    if claim_reward(user_id, idx):
-                        claimed_tiers.append(t["name"])
-            except Exception as e:
-                logging.error(f"Auto-claim failed: {e}")
-                claimed_tiers = []
-
-            # 전설 등급 + 주말 보너스 체크
-            is_legendary = new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1
-            is_weekend_bonus = is_weekend()
-
-            # 타이틀 설정
-            if is_legendary and is_weekend_bonus:
-                title = f"🎊 주말 보너스 레벨업! {tier['name']} 🎊"
-            else:
-                title = f"🎉 레벨업! {tier['name']}"
-
-            # 주말 보너스 메시지
-            weekend_msg = ""
-            if is_weekend_bonus:
-                weekend_msg = "\n🎁 **주말 보너스 적용 중!** (메시지당 35 XP)\n"
-
-            # 자동 수령 결과 문구
-            if claimed_tiers:
-                claim_line = "🎁 **자동 보상 수령 완료**: " + ", ".join(claimed_tiers) + "\n"
-            else:
-                claim_line = "🎁 **보상**: 이미 수령된 상태예요.\n"
-
-            embed = discord.Embed(
-                title=title,
-                description=(
-                    f"**{message.author.mention}** 님이 **{tier['name']}** 등급에 도달했습니다!\n"
-                    f"{weekend_msg}"
-                    f"\n"
-                    f"**현재 경험치:** {xp} XP\n"
-                    f"**보상 안내:** {tier['reward']}\n"
-                    f"{claim_line}"
-                    f"⏰ **자정(00:00)에 경험치와 보상 효과가 초기화됩니다!**"
-                ),
-                color=0xFFD700,
-                timestamp=datetime.datetime.now(seoul_tz)
-            )
-            embed.set_thumbnail(url=message.author.display_avatar.url)
-            embed.set_footer(text="⚠️ 매일 자정 하드리셋 | 보상은 당일만 유효")
-            
-            # Discord 서버 오류 대비 예외 처리
-            try:
-                await message.channel.send(embed=embed, delete_after=20)
-            except discord.errors.DiscordServerError as e:
-                logging.error(f"Discord 서버 오류로 레벨업 알림 전송 실패 (520 등): {e}")
-            except Exception as e:
-                logging.error(f"레벨업 알림 전송 실패: {e}")
-
-        # VIP Winner 축하: 최고 등급 달성 후 첫 메시지에만
-        data = get_user_xp(user_id)
-        top_idx = len(XP_CONFIG["reward_tiers"]) - 1
-        if data["xp"] >= XP_CONFIG["reward_tiers"][top_idx]["xp"]:
-            today = get_today_date()
-            if data.get("vip_winner_date") == today and not data.get("vip_winner_announced", False):
-                # 주말에 전설 달성 여부 체크
-                is_weekend_legend = data.get("legendary_on_weekend", False)
-                
-                if is_weekend_legend:
-                    # 주말 전설 달성
-                    vip_title = "🎊 주말 보너스 VIP Winner! 🎊"
-                    vip_description = (
-                        f"✨ **{message.author.mention}** 님이 **주말 보너스**로 \n\n오늘의 **최고 등급(전설)**에 도달했습니다!\n"
-                        f"\n"
-                        f"🎁 **주말 특별 달성!** (메시지당 35 XP 적용)\n"
-                        f"모두가 우러러보는 진정한 챔피언!\n"
-                        f"🎉 축하와 환호를 보냅니다! 🎉\n"
-                        f"\n"
-                        f"**주말 보너스 VIP Winner**는 오늘 하루 동안 숭배의 대상입니다. 👑"
-                    )
-                    footer_text = "🎊 주말 보너스로 전설 달성!"
-                else:
-                    # 평일 전설 달성
-                    vip_title = "🏆 진정한 VIP Winner!"
-                    vip_description = (
-                        f"✨ **{message.author.mention}** 님이 오늘의 **최고 등급(전설)**에 도달했습니다!\n"
-                        f"\n"
-                        f"모두가 우러러보는 진정한 챔피언!\n"
-                        f"🎉 축하와 환호를 보냅니다! 🎉\n"
-                        f"\n"
-                        f"**VIP Winner**는 오늘 하루 동안 숭배의 대상입니다. 👑"
-                    )
-                    footer_text = "✨ VIP Winner는 하루 1회만 선정됩니다!"
-                
-                vip_embed = discord.Embed(
-                    title=vip_title,
-                    description=vip_description,
-                    color=0xFFD700,
-                    timestamp=datetime.datetime.now(seoul_tz)
-                )
-                vip_embed.set_thumbnail(url=message.author.display_avatar.url)
-                vip_embed.set_footer(text=footer_text)
-                
-                try:
-                    await message.channel.send(embed=vip_embed)
-                except discord.errors.DiscordServerError as e:
-                    logging.error(f"Discord 서버 오류로 VIP 알림 전송 실패 (520 등): {e}")
-                except Exception as e:
-                    logging.error(f"VIP 알림 전송 실패: {e}")
-                
-                # 플래그 저장
-                user_xp_data[user_id]["vip_winner_announced"] = True
-                save_xp_data()
-        
-        # 업적 달성 알림 (레벨업 후 체크)
-        # add_xp 함수에서 이미 check_achievements가 호출되었으므로,
-        # 여기서는 최근 달성된 업적만 확인하여 알림
-        # 대신 레벨업과 별개로 업적 체크는 add_xp에서 이미 완료됨
-        # 필요시 여기서 추가 알림 로직 구현 가능
+    if await _plain_admin_message_hint(message):
+        return
 
     # ───── 제한 사용자 처리 (면제권 기능 추가) ─────
     # 영구 제한 사용자는 어떠한 경우에도 제한 유지
@@ -2699,6 +2642,146 @@ async def on_message(message: discord.Message):
             
             return
             
+    # Reaching this point means the message was accepted by moderation and may
+    # participate in the existing XP/reward flow.
+    _typing_message_fallback(message)
+
+    xp_eligible = (message.guild is not None and bool(message.content.strip())
+                   and not message.content.lstrip().startswith(("!", "/")))
+
+    # ───── 경험치 획득 (봇이 아닌 경우만) ─────
+    if not message.author.bot and xp_eligible:
+        xp, leveled_up, new_tier_idx, new_achievements = add_xp(user_id, event_id=message.id)
+
+        # 업적 달성 알림 (상세 보상 정보 포함)
+        if new_achievements:
+            for ach_id in new_achievements:
+                ach = ACHIEVEMENTS.get(ach_id)
+                if not ach:
+                    continue
+
+                weekend_bonus = is_weekend()
+                bonus_xp = ach.get('reward_xp', 0)
+                reward_effect = ach.get('reward_effect', {})
+                badge = "🎊" if weekend_bonus else "🏆"
+
+                # 보상 효과 설명 생성
+                reward_desc = ""
+                if reward_effect:
+                    effect_type = reward_effect.get("type")
+                    if effect_type == "antispam":
+                        count = reward_effect.get("count", 0)
+                        reward_desc = f"🛡️ 도배 차단 면제 **{count}회**"
+                    elif effect_type == "profanity":
+                        count = reward_effect.get("count", 0)
+                        reward_desc = f"💬 금칙어 면제 **{count}회**"
+                    elif effect_type == "all":
+                        duration = reward_effect.get("duration", 0)
+                        hours = duration // 60
+                        minutes = duration % 60
+                        if hours > 0:
+                            reward_desc = f"✨ 모든 제한 면제 **{hours}시간 {minutes}분**"
+                        else:
+                            reward_desc = f"✨ 모든 제한 면제 **{minutes}분**"
+
+                # 업적 달성 카드
+                desc = (
+                    f"**{message.author.mention}** 님이\n"
+                    f"**{ach['name']}** 업적을 달성했습니다!\n\n"
+                    f"📝 *{ach['description']}*\n\n"
+                    f"**보상:**\n"
+                    f"💰 업적 보너스 **+{bonus_xp} XP** (등급에 미반영)\n"
+                    f"{reward_desc if reward_desc else '🎁 특별 보상 없음'}"
+                )
+
+                ach_embed = discord.Embed(
+                    title=f"{badge} 업적 달성!",
+                    description=desc,
+                    color=0xFFD700 if weekend_bonus else 0x00E5FF,
+                    timestamp=datetime.datetime.now(seoul_tz)
+                )
+                ach_embed.set_thumbnail(url=message.author.display_avatar.url)
+                ach_embed.set_footer(text="⏰ 자정 리셋 · !업적 으로 전체 확인")
+
+                try:
+                    await message.channel.send(embed=ach_embed, delete_after=15)
+                except discord.errors.DiscordServerError as e:
+                    logging.error(f"Discord 서버 오류로 업적 알림 전송 실패 (520 등): {e}")
+                except Exception as e:
+                    logging.error(f"업적 알림 전송 실패: {e}")
+
+        # 레벨업 알림 + 자동 보상 수령
+        if leveled_up and new_tier_idx is not None:
+            tier = XP_CONFIG["reward_tiers"][new_tier_idx]
+
+            # 레벨업 시 수령 가능한 모든 보상을 자동 수령
+            claimed_tiers = [XP_CONFIG["reward_tiers"][idx]["name"]
+                             for idx in get_user_xp(user_id).get("claimed", [])
+                             if type(idx) is int and 0 <= idx < len(XP_CONFIG["reward_tiers"])]
+            try:
+                available = get_available_rewards(user_id)
+                for idx, t in available:
+                    if claim_reward(user_id, idx):
+                        claimed_tiers.append(t["name"])
+            except Exception as e:
+                logging.error(f"Auto-claim failed: {e}")
+                claimed_tiers = []
+
+            # 전설 등급 + 주말 보너스 체크
+            is_legendary = new_tier_idx == len(XP_CONFIG["reward_tiers"]) - 1
+            is_weekend_bonus = is_weekend()
+
+            # 타이틀 설정
+            if is_legendary and is_weekend_bonus:
+                title = f"🎊 주말 보너스 레벨업! {tier['name']} 🎊"
+            else:
+                title = f"🎉 레벨업! {tier['name']}"
+
+            # 주말 보너스 메시지
+            weekend_msg = ""
+            if is_weekend_bonus:
+                weekend_msg = "\n🎁 **주말 보너스 적용 중!** (메시지당 45 XP)\n"
+
+            # 자동 수령 결과 문구
+            if claimed_tiers:
+                claim_line = "🎁 **자동 보상 수령 완료**: " + ", ".join(claimed_tiers) + "\n"
+            else:
+                claim_line = "🎁 **보상**: 이미 수령된 상태예요.\n"
+
+            embed = discord.Embed(
+                title=title,
+                description=(
+                    f"**{message.author.mention}** 님이 **{tier['name']}** 등급에 도달했습니다!\n"
+                    f"{weekend_msg}"
+                    f"\n"
+                    f"**등급 판단 XP:** {get_user_xp(user_id).get('activity_xp', 0)} XP\n"
+                    f"**총 XP:** {get_user_xp(user_id)['xp']} (활동 + 업적 보너스 + 이전 기록)\n"
+                    f"**보상 안내:** {tier['reward']}\n"
+                    f"{claim_line}"
+                    f"⏰ **자정(00:00)에 경험치와 보상 효과가 초기화됩니다!**"
+                ),
+                color=0xFFD700,
+                timestamp=datetime.datetime.now(seoul_tz)
+            )
+            embed.set_thumbnail(url=message.author.display_avatar.url)
+            embed.set_footer(text="⚠️ 매일 자정 하드리셋 | 보상은 당일만 유효")
+
+            # Discord 서버 오류 대비 예외 처리
+            try:
+                await message.channel.send(embed=embed, delete_after=20)
+            except discord.errors.DiscordServerError as e:
+                logging.error(f"Discord 서버 오류로 레벨업 알림 전송 실패 (520 등): {e}")
+            except Exception as e:
+                logging.error(f"레벨업 알림 전송 실패: {e}")
+
+        await _announce_vip_winner(message)
+
+        # 업적 달성 알림 (레벨업 후 체크)
+        # add_xp 함수에서 이미 check_achievements가 호출되었으므로,
+        # 여기서는 최근 달성된 업적만 확인하여 알림
+        # 대신 레벨업과 별개로 업적 체크는 add_xp에서 이미 완료됨
+        # 필요시 여기서 추가 알림 로직 구현 가능
+
     # ---------------------------------------------
     # 2-2) 게임 홍보 카드 (슬래시/프리픽스 명령 제외)
     # ---------------------------------------------
@@ -2951,7 +3034,7 @@ async def img(ctx: commands.Context, *, prompt: Optional[str] = None):
 async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = None):
     target = member or ctx.author
     data = get_user_xp(target.id)
-    xp = data["xp"]
+    xp = data.get("activity_xp", data.get("xp", 0))
     
     # 현재 티어 찾기
     current_tier = None
@@ -2988,7 +3071,8 @@ async def xp_command(ctx: commands.Context, member: Optional[discord.Member] = N
     embed = discord.Embed(
         title=f"📊 {target.display_name}",
         description=(
-            f"**{xp} XP** │ {current_tier['name'] if current_tier else '🥚 알'}\n"
+            f"**등급 판단 XP: {xp}** │ {current_tier['name'] if current_tier else '🥚 알'}\n"
+            f"총 XP: **{data['xp']}** = 활동 {xp} + 업적 보너스 {data.get('bonus_xp', 0)} + 이전 기록 {data.get('legacy_xp', 0)}\n"
             f"\n"
             f"▸ {next_tier['name'] if next_tier else '완료'}\n"
             f"{progress_text} ({progress_detail})"
@@ -3119,7 +3203,7 @@ async def claim_command(ctx: commands.Context):
     else:
         await ctx.reply("⚠️ 보상 수령에 실패했습니다. 다시 시도해주세요.")
 
-@bot.command(name="leaderboard", aliases=["lb", "랭킹"], help="!leaderboard — 오늘의 XP 순위")
+@bot.command(name="leaderboard", aliases=["lb", "랭킹"], help="!leaderboard — 오늘의 활동 XP 순위")
 async def leaderboard_command(ctx: commands.Context):
     # 경험치 리더보드 (서버별 독립 랭킹)
     today = get_today_date()
@@ -3135,8 +3219,8 @@ async def leaderboard_command(ctx: commands.Context):
     # 오늘 날짜 + 현재 서버 멤버만 필터링
     rankings = []
     for uid, data in user_xp_data.items():
-        if uid in member_ids and data.get("date") == today and data.get("xp", 0) > 0:
-            rankings.append((uid, data["xp"]))
+        if uid in member_ids and data.get("date") == today and data.get("activity_xp", 0) > 0:
+            rankings.append((uid, data["activity_xp"]))
     
     # 정렬
     rankings.sort(key=lambda x: x[1], reverse=True)
@@ -3167,7 +3251,7 @@ async def leaderboard_command(ctx: commands.Context):
                 tier_name = tier["name"]
         
         medal = medals[i-1] if i <= 3 else f"**{i}.**"
-        description += f"{medal} **{name}** - {xp} XP ({tier_name})\n"
+        description += f"{medal} **{name}** - 활동 {xp} XP ({tier_name})\n"
     
     embed = discord.Embed(
         title=f"🏆 {guild.name} 오늘의 활동 순위 TOP 10",
@@ -3176,7 +3260,7 @@ async def leaderboard_command(ctx: commands.Context):
         timestamp=datetime.datetime.now(seoul_tz)
     )
     
-    embed.set_footer(text=f"🔄 자정 리셋 | {guild.name} 서버 랭킹")
+    embed.set_footer(text=f"🔄 자정 리셋 | 활동 XP만 반영 | {guild.name} 서버 랭킹")
     
     # 요청자 순위
     if ctx.author.id in [uid for uid, _ in rankings]:
@@ -3211,9 +3295,10 @@ async def xphelp_command(ctx: commands.Context):
         name="💎 경험치 획득 방법",
         value=(
             "• **평일 (월~목)**: 메시지당 **25 XP**\n"
-            "• **주말 (금~일)**: 메시지당 **35 XP** 🎊\n"
+            "• **주말 (금~일)**: 메시지당 **45 XP** 🎊\n"
             "• 쿨다운: **5초** (연속 메시지는 XP 없음)\n"
-            "• 봇 명령어도 XP 획득 가능!\n"
+            "• 검열을 통과한 일반 채팅만 적립 (봇·DM·명령어 제외)\n"
+            "• 등급은 활동 XP만 반영 · 업적 보너스는 별도 합산\n"
             "• 이모지, 짧은 메시지도 동일하게 적용"
         ),
         inline=False
@@ -3235,7 +3320,7 @@ async def xphelp_command(ctx: commands.Context):
         tiers_text += f"**{t['name']}** - {t['xp']} XP\n└ {t['reward']} {eff_desc}\n"
     
     # 주말 보너스 안내 추가
-    tiers_text += "\n💡 **주말 보너스 (금~일)**: 메시지당 35 XP로 더 빠른 달성!"
+    tiers_text += "\n💡 **주말 보너스 (금~일)**: 메시지당 45 XP로 더 빠른 달성!"
     
     embed.add_field(
         name="🏆 등급 시스템",
@@ -3267,7 +3352,7 @@ async def xphelp_command(ctx: commands.Context):
             "   • 순위도 **완전히 리셋**\n"
             "\n"
             "🎊 **주말 보너스 (금~일)**\n"
-            "   • 메시지당 35 XP (평일 25 XP)\n"
+            "   • 메시지당 45 XP (평일 25 XP)\n"
             "   • 주말에 전설 달성 시 특별 표시!\n"
             "   • 평일 달성자와 차별화\n"
             "\n"
@@ -3303,16 +3388,9 @@ async def legend_trial_command(ctx: commands.Context):
     today = get_today_date()
     
     # 사용자 데이터 확인
-    if user_id not in user_xp_data:
-        user_xp_data[user_id] = {
-            "xp": 0,
-            "last_msg": 0,
-            "date": today,
-            "claimed": [],
-            "rewards_active": {}
-        }
-    
-    data = user_xp_data[user_id]
+    if user_id not in user_xp_data or user_xp_data[user_id].get("date") != today:
+        user_xp_data[user_id] = _new_daily_xp(today)
+    data = _migrate_xp_record(user_xp_data[user_id])
     
     # 오늘 이미 사용했는지 확인
     if data.get("trial_used_date") == today:
@@ -3332,7 +3410,7 @@ async def legend_trial_command(ctx: commands.Context):
     
     # 이미 전설 등급인지 확인
     top_tier = XP_CONFIG["reward_tiers"][-1]
-    if data["xp"] >= top_tier["xp"]:
+    if data["activity_xp"] >= top_tier["xp"]:
         await ctx.reply(
             embed=discord.Embed(
                 title="✨ 이미 전설!",
@@ -3401,8 +3479,8 @@ async def legend_trial_command(ctx: commands.Context):
             f"💡 **이 혜택을 계속 누리려면**:\n"
             f"   • 메시지를 보내 경험치를 모으세요\n"
             f"   • 평일: 메시지당 25 XP\n"
-            f"   • 주말: 메시지당 35 XP 🎊\n"
-            f"   • 목표: **450 XP** (평일 30개, 주말 10개)\n"
+            f"   • 주말: 메시지당 45 XP 🎊\n"
+            f"   • 목표: **450 XP** (평일 18개, 주말 10개)\n"
             f"\n"
             f"🎊 **주말 보너스**: 업적 달성 조건도 1/3로 완화!\n"
             f"\n"
@@ -3497,7 +3575,7 @@ async def achievements_command(ctx: commands.Context, member: discord.Member = N
         unlocked_text = ""
         for ach_id, ach in unlocked_list[:10]:  # 최대 10개만 표시
             reward_xp = ach.get('reward_xp', 0)
-            unlocked_text += f"✅ **{ach['name']}** (+{reward_xp}XP)\n"
+            unlocked_text += f"✅ **{ach['name']}** (+{reward_xp} 보너스 XP)\n"
         
         if len(unlocked_list) > 10:
             unlocked_text += f"\n*...외 {len(unlocked_list) - 10}개 더*"
@@ -3530,7 +3608,7 @@ async def achievements_command(ctx: commands.Context, member: discord.Member = N
                     hours = duration // 60
                     reward_icon = f" ✨{hours}h"
             
-            locked_text += f"🔒 **{ach['name']}** (+{reward_xp}XP{reward_icon})\n"
+            locked_text += f"🔒 **{ach['name']}** (+{reward_xp} 보너스 XP{reward_icon})\n"
         
         if len(locked_list) > 5:
             locked_text += f"\n*...외 {len(locked_list) - 5}개* (전체: `!업적상세`)"
@@ -3573,7 +3651,7 @@ async def achievement_detail_command(ctx: commands.Context):
             "달성 가능한 모든 업적과 보상을 확인하세요!\n"
             f"{weekend_notice}"
             f"⏰ **중요**: 모든 업적은 매일 자정(00:00)에 하드리셋됩니다!\n"
-            f"💡 업적 달성 시 **보너스 XP + 특별 보상**이 즉시 지급됩니다."
+            f"💡 업적 달성 시 **보너스 XP(등급 미반영) + 특별 보상**이 즉시 지급됩니다."
         ),
         color=0xFFD700 if weekend_mode else 0x00E5FF,
         timestamp=datetime.datetime.now(seoul_tz)
@@ -3603,7 +3681,7 @@ async def achievement_detail_command(ctx: commands.Context):
                         hours = duration // 60
                         reward_text = f" | ✨{hours}h"
                 
-                text += f"{status} **{ach['name']}** (+{reward_xp}XP{reward_text})\n    _{ach['description']}_\n"
+                text += f"{status} **{ach['name']}** (+{reward_xp} 보너스 XP{reward_text})\n    _{ach['description']}_\n"
         
         if text:
             embed.add_field(
@@ -4268,6 +4346,34 @@ async def pubg_mobile_gallery(ctx):
 _slash_registration_state = SlashCommandRegistrationState()
 _runtime_tasks_started = False
 _intro_view_registered = False
+_admin_text_hint_cooldowns = {}
+
+
+async def _plain_admin_message_hint(message):
+    """Explain literal /관리 once per member/day without opening admin tools."""
+    if (getattr(message, "guild", None) is None
+            or getattr(message.author, "bot", False)
+            or message.content.strip() != "/관리"):
+        return False
+    key = (message.guild.id, message.author.id)
+    now = time.monotonic()
+    previous = _admin_text_hint_cooldowns.get(key)
+    if previous is not None and now - previous < 86400:
+        return True
+    if len(_admin_text_hint_cooldowns) >= 2048:
+        _admin_text_hint_cooldowns.pop(next(iter(_admin_text_hint_cooldowns)))
+    _admin_text_hint_cooldowns[key] = now
+    try:
+        await message.channel.send(
+            "`/관리`가 일반 메시지로 전송됐어요. `/` 입력 후 도리봇의 **관리** 명령을 선택해 주세요. "
+            "목록에 없다면 서버 운영자가 앱 설치 범위·명령 권한·게시 상태를 확인해야 합니다.",
+            allowed_mentions=discord.AllowedMentions.none(), delete_after=30,
+        )
+    except Exception:
+        if _admin_text_hint_cooldowns.get(key) == now:
+            _admin_text_hint_cooldowns.pop(key, None)
+        logging.warning("event=admin_text_hint result=failed guild_id=%s", message.guild.id)
+    return True
 
 
 def _metric(event: str) -> None:
@@ -4320,13 +4426,15 @@ async def _publish_question_answer(sender, answer: str, *, requester=None, **kwa
 
 def _growth_embed(user) -> discord.Embed:
     data = get_user_xp(user.id)
-    xp = data.get("xp", 0)
+    xp = data.get("activity_xp", data.get("xp", 0))
     current = next((tier for tier in reversed(XP_CONFIG["reward_tiers"]) if xp >= tier["xp"]), None)
     next_tier = next((tier for tier in XP_CONFIG["reward_tiers"] if xp < tier["xp"]), None)
     detail = f"다음 목표: {next_tier['name']} ({next_tier['xp'] - xp} XP)" if next_tier else "최고 등급을 달성했습니다."
     embed = discord.Embed(
         title=f"🏆 {getattr(user, 'display_name', '사용자')}님의 성장",
-        description=f"현재 XP: **{xp}**\n등급: **{current['name'] if current else '🥚 알'}**\n{detail}",
+        description=(f"등급 판단 XP: **{xp}**\n"
+                     f"총 XP: **{data.get('xp', 0)}** (활동 + 업적 보너스 {data.get('bonus_xp', 0)} + 이전 기록 {data.get('legacy_xp', 0)})\n"
+                     f"등급: **{current['name'] if current else '🥚 알'}**\n{detail}"),
         color=0x00E5FF,
     )
     progress = get_achievement_progress(user.id)
@@ -4454,21 +4562,30 @@ async def _menu_interaction_service(interaction):
 
 
 async def _admin_action_service(interaction, action_id):
-    if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
+    if log_admin_access(interaction, source="service", event="admin_action") is not None:
         await _interaction_send(interaction, "⛔ 관리 권한이 없습니다.")
         return
     if action_id == "admin:rules":
         await send_active_rules_response(interaction, active_bad_roots(), test_service=_admin_test_service)
         return
-    messages = {
-        "admin:logs": "📋 이 패널의 관리 로그 조회는 아직 지원하지 않습니다. 운영 로그와 삭제 기록은 메시지 원문을 보관하지 않습니다.",
-        "admin:settings": "⚙️ 이 패널의 운영 설정 변경은 아직 지원하지 않습니다. 환경변수와 기존 Pickle 파일 정책을 따릅니다.",
-    }
-    await _interaction_send(interaction, messages.get(action_id, "관리 작업을 선택해 주세요."))
+    state_root = XP_DATA_FILE.parent
+    status_text = (
+        f"⚙️ 운영 상태\n활성 금칙어: {len(active_bad_roots())}개\n"
+        f"저장 경로 설정: {'DATA_DIR/STATE_DIR' if os.getenv('DATA_DIR') or os.getenv('STATE_DIR') else '작업 디렉터리'}\n"
+        f"저장 디렉터리 쓰기 가능: {'예' if state_root.is_dir() and os.access(state_root, os.W_OK) else '아니오'}\n"
+        "영속 볼륨 연결 여부는 호스팅에서 확인해야 합니다.\n"
+        f"슬래시 로컬 등록: {len(bot.tree.get_commands())}개\n"
+        f"이번 프로세스 원격 게시 성공: {'예' if _slash_registration_state.synced else '미확인'}\n"
+        "로컬 등록은 Discord 명령 선택기 표시를 보장하지 않습니다.\n"
+        "관리 기록과 중복 실행 방지는 메모리이며 재시작 시 초기화됩니다."
+    )
+    if await handle_admin_action(interaction, action_id, status_text=status_text):
+        return
+    await _interaction_send(interaction, "관리 작업을 선택해 주세요.")
 
 
 async def _admin_test_service(interaction, content: str):
-    if not is_admin_authorized(getattr(interaction, "user", None), getattr(interaction, "guild", None)):
+    if log_admin_access(interaction, source="test_service", event="admin_action") is not None:
         await _interaction_send(interaction, "⛔ 관리 권한이 없습니다.")
         return
     detected = find_badroot(content)
@@ -4488,6 +4605,13 @@ def _slash_sync_requested() -> bool:
 
 
 async def _register_slash_commands_once(*, sync=False):
+    diagnostics = admin_configuration_diagnostics()
+    logging.info(
+        "event=admin_configuration special_ids_valid=%s special_id_count=%d reason=%s guild_scope_configured=%s guild_scope_valid=%s guild_scope_count=%d",
+        diagnostics["special_ids_valid"], diagnostics["special_id_count"],
+        diagnostics["special_ids_reason"], diagnostics["guild_scope_configured"],
+        diagnostics["guild_scope_valid"], diagnostics["guild_scope_count"],
+    )
     def _register() -> None:
         register_slash_commands(
             bot,
@@ -4511,6 +4635,17 @@ async def _register_slash_commands_once(*, sync=False):
         if names != SLASH_COMMAND_NAMES:
             logging.error("event=slash_sync_rejected scope=global reason=unexpected_local_commands count=%d", len(names))
             raise RuntimeError("unexpected_slash_command_set")
+        app_id, bot_id = bot.application_id, getattr(bot.user, "id", None)
+        if app_id is not None and bot_id is not None and app_id != bot_id:
+            logging.error("event=slash_sync_rejected scope=global reason=application_bot_mismatch")
+            raise RuntimeError("application_bot_mismatch")
+        # Bulk sync replaces all remote commands for this application. Inspect
+        # first so commands owned by another extension are never deleted.
+        remote = await bot.tree.fetch_commands()
+        foreign_count = sum(command.name not in SLASH_COMMAND_NAMES for command in remote)
+        if foreign_count:
+            logging.error("event=slash_sync_rejected scope=global reason=unexpected_remote_commands count=%d", foreign_count)
+            raise RuntimeError("unexpected_remote_commands")
         synced = await bot.tree.sync()
         logging.info(
             "event=slash_sync_success scope=global count=%d names=%s application_id=%s bot_id=%s",

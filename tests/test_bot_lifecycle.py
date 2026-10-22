@@ -30,6 +30,7 @@ def lifecycle():
     namespace = {
         "commands": commands, "os": os, "logging": logging, "asyncio": asyncio,
         "register_slash_commands": bot_ui.register_slash_commands,
+        "admin_configuration_diagnostics": bot_ui.admin_configuration_diagnostics,
         "SLASH_COMMAND_NAMES": frozenset(("시작", "질문", "그림", "내정보", "관리")),
         "_slash_registration_state": bot_ui.SlashCommandRegistrationState(),
         "_intro_view_registered": False, "_runtime_tasks_started": True,
@@ -45,6 +46,7 @@ def lifecycle():
     async def remote_sync():
         return [SimpleNamespace(name=command.name) for command in bot.tree.get_commands()]
     bot.tree.sync = AsyncMock(side_effect=remote_sync)
+    bot.tree.fetch_commands = AsyncMock(return_value=[])
     return namespace
 
 
@@ -64,6 +66,7 @@ class BotLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await ns["bot"].setup_hook()
             self.assert_five_commands(ns["bot"])
             ns["bot"].tree.sync.assert_not_awaited()
+            ns["bot"].tree.fetch_commands.assert_not_awaited()
         finally:
             await ns["bot"].close()
 
@@ -157,6 +160,40 @@ class BotLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await ns["_register_slash_commands_once"](sync=True)
             ns["bot"].tree.sync.assert_not_awaited()
             self.assertFalse(ns["_slash_registration_state"].synced)
+        finally:
+            await ns["bot"].close()
+
+    async def test_unrelated_remote_commands_are_never_deleted_by_bulk_sync(self):
+        ns = lifecycle()
+        try:
+            ns["bot"].tree.fetch_commands.return_value = [SimpleNamespace(name="other_extension")]
+            with self.assertLogs(level="ERROR"):
+                await ns["_register_slash_commands_once"](sync=True)
+            ns["bot"].tree.sync.assert_not_awaited()
+            self.assertFalse(ns["_slash_registration_state"].synced)
+        finally:
+            await ns["bot"].close()
+
+    async def test_remote_inspection_failure_does_not_attempt_bulk_sync(self):
+        ns = lifecycle()
+        try:
+            ns["bot"].tree.fetch_commands.side_effect = RuntimeError("private transport data")
+            with self.assertLogs(level="ERROR") as captured:
+                await ns["_register_slash_commands_once"](sync=True)
+            ns["bot"].tree.sync.assert_not_awaited()
+            self.assertNotIn("private transport data", "\n".join(captured.output))
+        finally:
+            await ns["bot"].close()
+
+    async def test_application_bot_identity_mismatch_never_publishes(self):
+        ns = lifecycle()
+        try:
+            ns["bot"]._connection.user = SimpleNamespace(id=456)
+            with self.assertLogs(level="ERROR") as captured:
+                await ns["_register_slash_commands_once"](sync=True)
+            ns["bot"].tree.fetch_commands.assert_not_awaited()
+            ns["bot"].tree.sync.assert_not_awaited()
+            self.assertIn("application_bot_mismatch", "\n".join(captured.output))
         finally:
             await ns["bot"].close()
 
