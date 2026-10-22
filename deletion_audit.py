@@ -176,6 +176,28 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
     return embed
 
 
+def build_restricted_deletion_embed(*, deleted_at: datetime | None = None) -> discord.Embed:
+    """Non-identifying receipt when a source has a narrower readership.
+
+    This card intentionally contains NO source/channel/user/message identifiers,
+    reason details, attachment names or original message content. The record
+    destination is public and must not widen private-channel visibility.
+    """
+    deleted_at = deleted_at or datetime.now(timezone.utc)
+    if deleted_at.tzinfo is None:
+        deleted_at = deleted_at.replace(tzinfo=timezone.utc)
+    return discord.Embed(
+        title="🗑️ 메시지 삭제 감지 · 열람 범위 제한",
+        description=(
+            f"**확인 시각** {deleted_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST\n"
+            "이 서버에서 메시지 삭제가 감지되었습니다.\n"
+            "원본 채널의 열람 권한을 공용 기록 채널에 그대로 적용할 수 없어 "
+            "작성자·채널·원문·첨부 정보는 공개하지 않습니다."
+        ),
+        colour=0xED4245,
+    )
+
+
 def _operator_permissions(value: Any) -> bool:
     return any(getattr(value, name, False) is True for name in ("administrator", "manage_guild", "manage_messages"))
 
@@ -384,7 +406,8 @@ class DeletionAuditService:
                  cache: MessageAuditCache | None = None, clock: Callable[[], float] = monotonic,
                  delivery_limit: int = 4096, delivery_ttl: float = 600, concurrency: int = 4, pending_limit: int = 64,
                  wall_clock: Callable[[], datetime] | None = None, guild_resolver: Callable[[int], Any] | None = None,
-                 enabled: bool | None = None, all_guild_channels: bool | None = None):
+                 enabled: bool | None = None, all_guild_channels: bool | None = None,
+                 channel_fetcher: Callable[[int], Any] | None = None):
         self.routes = dict(routes)
         self.channel_resolver = channel_resolver
         self.cache = cache if cache is not None else MessageAuditCache()
@@ -394,6 +417,10 @@ class DeletionAuditService:
         self.all_guild_channels = os.getenv("DELETION_LOG_ALL_GUILD_CHANNELS", "1").strip() == "1" if all_guild_channels is None else all_guild_channels is True
         self.extra_sources, self.extra_sources_valid = _configured_ids(os.getenv("DELETION_LOG_EXTRA_SOURCE_CHANNEL_IDS", ""))
         self.guild_resolver = guild_resolver
+        # The gateway channel cache can be incomplete even for configured
+        # destination IDs. A bounded REST fallback avoids silent lost logs.
+        self.channel_fetcher = channel_fetcher
+        self._fetched_channels: OrderedDict[int, tuple[float, Any]] = OrderedDict()
         self.admin_ids = None if configured_admin_ids is None else frozenset(configured_admin_ids)
         self.clock, self.delivery_limit, self.delivery_ttl = clock, max(1, delivery_limit), max(1, delivery_ttl)
         self.wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
@@ -427,10 +454,83 @@ class DeletionAuditService:
         except Exception:
             return None
 
+    async def _resolve_channel(self, channel_id: int) -> Any:
+        channel = self._resolve_cached(channel_id)
+        if channel is not None:
+            return channel
+        previous = self._fetched_channels.get(channel_id)
+        if previous is not None and self.clock() - previous[0] < 30:
+            return previous[1]
+        if self.channel_fetcher is None:
+            return None
+        try:
+            fetched = self.channel_fetcher(channel_id)
+            if inspect.isawaitable(fetched):
+                fetched = await fetched
+            if fetched is not None and getattr(fetched, "id", None) != channel_id:
+                fetched = None
+        except Exception as exc:
+            LOGGER.warning("event=deletion_audit_channel_resolve result=failed reason=%s channel_id=%s",
+                           self._delivery_error(exc), channel_id)
+            fetched = None
+        # Cache success and failure for a short interval to avoid a REST
+        # request per message when a channel is inaccessible or missing.
+        self._fetched_channels[channel_id] = (self.clock(), fetched)
+        self._fetched_channels.move_to_end(channel_id)
+        while len(self._fetched_channels) > 64:
+            self._fetched_channels.popitem(last=False)
+        return fetched
+
+    async def probe_configured_destinations(self) -> dict[int, str]:
+        """Startup diagnostics for the EXISTING hard-coded record channels.
+
+        No messages or user content are sent and no new channel is created.
+        """
+        results: dict[int, str] = {}
+        for destination_id in sorted(set(self.routes.values())):
+            channel = await self._resolve_channel(destination_id)
+            if getattr(channel, "id", None) != destination_id:
+                reason = "channel_missing_or_forbidden"
+            elif not isinstance(channel, discord.TextChannel):
+                reason = "destination_not_text_channel"
+            else:
+                try:
+                    guild = channel.guild
+                    bot_member = guild.me
+                    perms = channel.permissions_for(bot_member) if bot_member is not None else None
+                    missing = next((name for name in ("view_channel", "send_messages", "embed_links")
+                                    if getattr(perms, name, None) is not True), None)
+                    reason = "destination_bot_" + missing if missing else "ready"
+                except Exception:
+                    reason = "destination_permissions_unavailable"
+            results[destination_id] = reason
+            LOGGER.info("event=deletion_audit_destination_probe destination_id=%s result=%s",
+                        destination_id, reason)
+        return results
+
+    async def _async_destination_ids(self, guild_id: int) -> set[int]:
+        ids = self._destination_ids(guild_id)
+        if ids:
+            return ids
+        for destination_id in set(self.routes.values()):
+            destination = await self._resolve_channel(destination_id)
+            if (getattr(destination, "id", None) == destination_id and
+                    getattr(getattr(destination, "guild", None), "id", None) == guild_id):
+                ids.add(destination_id)
+        return ids
+
     def _destination_ids(self, guild_id: int) -> set[int]:
-        return {destination_id for destination_id in set(self.routes.values())
-                if (getattr(self._resolve_cached(destination_id), "id", None) == destination_id and
-                    getattr(getattr(self._resolve_cached(destination_id), "guild", None), "id", None) == guild_id)}
+        destinations = set()
+        for destination_id in set(self.routes.values()):
+            destination = self._resolve_cached(destination_id)
+            if destination is None:
+                cached = self._fetched_channels.get(destination_id)
+                if cached is not None and self.clock() - cached[0] < 30:
+                    destination = cached[1]
+            if (getattr(destination, "id", None) == destination_id and
+                    getattr(getattr(destination, "guild", None), "id", None) == guild_id):
+                destinations.add(destination_id)
+        return destinations
 
     def destination_for(self, guild_id: int, channel_id: int) -> int | None:
         """Reuse the same guild's existing destination; never invent a channel."""
@@ -514,16 +614,26 @@ class DeletionAuditService:
         if hasattr(guild_or_id, "guild"):
             guild_or_id = guild_or_id.guild
         status = self.diagnostics(guild_or_id)
-        if status["result"] != "ready":
-            return status
         guild_id = getattr(guild_or_id, "id", guild_or_id)
-        destination_ids = self._destination_ids(guild_id)
+        if not self.enabled:
+            return status
+        destination_ids = await self._async_destination_ids(guild_id)
         if len(destination_ids) != 1:
-            return {**status, "result": "failed", "reason": "destination_missing"}
+            return {**status, "result": "failed", "reason": "destination_ambiguous" if destination_ids else "destination_missing"}
         destination_id = next(iter(destination_ids))
-        destination = self._resolve_cached(destination_id)
+        destination = await self._resolve_channel(destination_id)
         if getattr(destination, "id", None) != destination_id:
             return {**status, "result": "failed", "reason": "destination_id_mismatch"}
+        if getattr(getattr(destination, "guild", None), "id", None) != guild_id:
+            return {**status, "result": "failed", "reason": "destination_guild_mismatch"}
+        try:
+            bot_member = destination.guild.me
+            perms = destination.permissions_for(bot_member)
+            for required in ("view_channel", "send_messages", "embed_links"):
+                if getattr(perms, required, None) is not True:
+                    return {**status, "result": "failed", "reason": "destination_bot_" + required}
+        except Exception:
+            return {**status, "result": "failed", "reason": "destination_permissions_unavailable"}
         embed = discord.Embed(title="🧪 삭제 로그 전송 테스트", description=(
             "기존 공용 기록 채널 전송 확인입니다.\n실제 사용자 원문·파일은 포함하지 않습니다.\n"
             f"확인 시각: {self._observation_time().astimezone(KST):%Y-%m-%d %H:%M:%S} KST"), colour=0xED4245)
@@ -556,7 +666,20 @@ class DeletionAuditService:
         return observed_at if observed_at.tzinfo is not None else observed_at.replace(tzinfo=timezone.utc)
 
     def _routed(self, guild_id: int, channel_id: int) -> bool:
-        return self.destination_for(guild_id, channel_id) is not None
+        if not self.enabled or not guild_id or not channel_id or channel_id in self.routes.values():
+            return False
+        if self.destination_for(guild_id, channel_id) is not None:
+            return True
+        # Explicit sources can proceed even if the destination is missing
+        # from the gateway cache. New channels still require a known source
+        # channel, preventing noisy queries in unrelated/unknown guilds.
+        if channel_id in self.extra_sources:
+            return True
+        if self.all_guild_channels:
+            source = self._resolve_cached(channel_id)
+            return (getattr(source, "id", None) == channel_id and
+                    getattr(getattr(source, "guild", None), "id", None) == guild_id)
+        return False
 
     def remember(self, message: Any) -> MessageAuditSnapshot | None:
         guild_id = getattr(getattr(message, "guild", None), "id", 0)
@@ -768,28 +891,55 @@ class DeletionAuditService:
         try:
             async with self._semaphore:
                 destination_id = self.destination_for(snapshot.guild_id, snapshot.channel_id)
+                if destination_id is None and (self.all_guild_channels or snapshot.channel_id in self.extra_sources):
+                    candidates = await self._async_destination_ids(snapshot.guild_id)
+                    if len(candidates) == 1:
+                        destination_id = next(iter(candidates))
+                    elif len(candidates) > 1:
+                        self._record(snapshot.guild_id, "destination_ambiguous", failure=True)
+                        return False
                 if destination_id is None:
                     self._record(snapshot.guild_id, "destination_missing", failure=True)
                     return False
-                channel = self.channel_resolver(destination_id)
-                if inspect.isawaitable(channel):
-                    channel = await channel
-                source = self.channel_resolver(snapshot.channel_id)
-                if inspect.isawaitable(source):
-                    source = await source
-                if channel is not None and getattr(channel, "id", None) != destination_id:
+                # Never trust a channel returned for the wrong ID or guild.
+                cached_destination = self._resolve_cached(destination_id)
+                if cached_destination is not None and getattr(cached_destination, "id", None) != destination_id:
                     reason = "destination_id_mismatch"
-                elif source is not None and getattr(source, "id", None) != snapshot.channel_id:
-                    reason = "source_id_mismatch"
+                    channel = cached_destination
                 else:
+                    channel = await self._resolve_channel(destination_id)
+                    reason = None
+                cached_source = self._resolve_cached(snapshot.channel_id)
+                if cached_source is not None and getattr(cached_source, "id", None) != snapshot.channel_id:
+                    source, reason = cached_source, "source_id_mismatch"
+                else:
+                    source = await self._resolve_channel(snapshot.channel_id)
+                if reason is None:
                     reason = public_destination_reason(source, channel, snapshot.guild_id)
-                if reason:
+                if (source is not None and getattr(getattr(source, "guild", None), "id", None) != snapshot.guild_id):
+                    reason = "source_guild_mismatch"
+                if channel is None:
+                    reason = "destination_unavailable"
+                elif getattr(getattr(channel, "guild", None), "id", None) != snapshot.guild_id:
+                    reason = "destination_guild_mismatch"
+                # A missing or inaccessible destination remains a hard
+                # failure. Source scope mismatches, however, get an entirely
+                # anonymous receipt instead of disappearing silently.
+                restricted = reason in {
+                    "source_reader_scope_exceeded", "source_member_scope_exceeded",
+                    "source_permissions_unavailable", "source_not_text_channel",
+                }
+                if reason and not restricted:
                     LOGGER.warning("event=deletion_audit result=skipped reason=%s guild_id=%s message_id=%s", reason, *key)
                     self._record(snapshot.guild_id, reason, failure=True)
                     return False
-                if not snapshot.content_available:
-                    self._record(snapshot.guild_id, "snapshot_unavailable")
-                embed = build_deletion_embed(snapshot, deleted_at=deleted_at, include_content=self.include_content)
+                if restricted:
+                    self._record(snapshot.guild_id, "restricted_" + reason)
+                    embed = build_restricted_deletion_embed(deleted_at=deleted_at)
+                else:
+                    if not snapshot.content_available:
+                        self._record(snapshot.guild_id, "snapshot_unavailable")
+                    embed = build_deletion_embed(snapshot, deleted_at=deleted_at, include_content=self.include_content)
                 await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                 self._delivered[key] = self.clock()
                 self._delivered.move_to_end(key)
