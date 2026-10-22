@@ -107,10 +107,13 @@ class AdminRequest:
 class AdminService:
     """Resolve current guild state and revalidate at prepare AND commit."""
 
-    def __init__(self, *, audit_limit: int = 200):
+    def __init__(self, *, audit_limit: int = 200, delete_service: Any = None):
         self.audit: deque[dict[str, Any]] = deque(maxlen=audit_limit)
         self._pending: OrderedDict[str, AdminRequest] = OrderedDict()
         self._claim_lock = asyncio.Lock()
+        # Production injects the shared deletion audit coordinator. Lightweight
+        # standalone adapters may continue using Discord's individual purge.
+        self.delete_service = delete_service
 
     async def _member(self, guild: Any, member_id: int) -> Any:
         fetch = getattr(guild, "fetch_member", None)
@@ -269,6 +272,21 @@ class AdminService:
             elif action == "kick":
                 await target.kick(reason=audit_reason)
             elif action == "cleanup":
+                if self.delete_service is not None:
+                    deleted_count, failed_count, matched_count = 0, 0, 0
+                    async for message in channel.history(limit=100):
+                        if getattr(message.author, "id", None) != request.target_id:
+                            continue
+                        matched_count += 1
+                        if await self.delete_service(message, reason="admin_cleanup"):
+                            deleted_count += 1
+                        else:
+                            failed_count += 1
+                        if matched_count >= request.value:
+                            break
+                    await self._record(interaction, request, "partial_failure" if failed_count else "success")
+                    suffix = f" 실패/이미 삭제 {failed_count}개." if failed_count else ""
+                    return f"최근 메시지 {deleted_count}개를 삭제했습니다.{suffix}"
                 matched = 0
 
                 def check(message: Any) -> bool:

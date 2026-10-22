@@ -50,6 +50,7 @@ def services(day="2026-10-22", hour=14):
         "seoul_tz": datetime.timezone(datetime.timedelta(hours=9)),
         "deque": deque, "logging": logging, "discord": discord,
         "user_xp_data": {}, "achievements_data": {},
+        "DELETION_AUDIT": SimpleNamespace(remember=Mock()),
         "XP_STORE": Mock(), "ACHIEVEMENTS_STORE": Mock(),
         "lookup_rule_exemption": lookup_exemption,
     }

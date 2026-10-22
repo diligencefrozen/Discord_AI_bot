@@ -210,6 +210,16 @@ except ImportError:  # pragma: no cover - exercised in dependency-free CI
             def __init__(self, content: str):
                 self.content = content
 
+        class SeparatorSpacing:
+            small = 1
+            large = 2
+
+        class Separator:
+            def __init__(self, *, visible: bool = True, spacing: Any = 1, id: int | None = None):
+                self.visible = visible
+                self.spacing = spacing
+                self.id = id
+
         class Modal:
             def __init__(self, *args: Any, **kwargs: Any):
                 pass
@@ -219,7 +229,7 @@ except ImportError:  # pragma: no cover - exercised in dependency-free CI
                 self.value = ""
 
         class ButtonStyle:
-            primary = secondary = success = danger = 1
+            primary, secondary, success, danger = 1, 2, 3, 4
 
         class AllowedMentions:
             def __init__(self, **kwargs: Any):
@@ -257,6 +267,7 @@ if DISCORD_AVAILABLE:
     _Container = discord.ui.Container
     _ActionRow = discord.ui.ActionRow
     _TextDisplay = discord.ui.TextDisplay
+    _Separator = discord.ui.Separator
 else:
     _ViewBase = discord.View
     _LayoutViewBase = discord.LayoutView
@@ -265,6 +276,7 @@ else:
     _Container = discord.Container
     _ActionRow = discord.ActionRow
     _TextDisplay = discord.TextDisplay
+    _Separator = discord.Separator
 
 
 class QuestionModal(_ModalBase):
@@ -427,6 +439,21 @@ class IntroView(_IntroActions, _ViewBase):
             self.add_item(button)
 
 
+def _typing_display_name(user: Any) -> str:
+    """Bound untrusted names and display them literally without notifying anyone."""
+    name = getattr(user, "display_name", None) or getattr(user, "name", None) or "사용자"
+    if not isinstance(name, str):
+        name = "사용자"
+    # Flatten line breaks, drop control/bidi formatting, and preserve emoji ZWJ.
+    name = "".join(" " if char.isspace() else char for char in name
+                   if char.isspace() or not unicodedata.category(char).startswith("C") or char == "\u200d")
+    name = " ".join(name.split()) or "사용자"
+    if len(name) > 40:
+        name = name[:40] + "…"
+    name = name.replace("@", "@\u200b")
+    return "".join("\\" + char if char in "\\`*_~|><[]()#" else char for char in name)
+
+
 class TypingIntroView(_IntroActions, _LayoutViewBase):
     """One Components V2 box containing notice text and both button rows.
 
@@ -439,11 +466,18 @@ class TypingIntroView(_IntroActions, _LayoutViewBase):
                  growth_service=None, menu_service=None):
         super().__init__(timeout=None)
         self._configure_services(question_service, image_service, growth_service, menu_service)
-        user_id = getattr(user, "id", None)
-        mention = f"<@{user_id}>" if _is_integer_id(user_id) else "사용자"
-        self.text = f"**🐻 도리봇 · 빠른 실행**\n{mention}님, 무엇을 도와드릴까요?\n아래에서 원하는 기능을 선택해 주세요."
+        display_name = _typing_display_name(user)
+        self.text = f"**👀 {display_name}님, 채팅을 작성 중이셨네요!**\n\n필요하시면 도리봇이 도와드릴게요."
         buttons = self._intro_buttons()
-        self.add_item(_Container(_TextDisplay(self.text), _ActionRow(*buttons[:2]), _ActionRow(*buttons[2:])))
+        buttons[0].style = discord.ButtonStyle.primary
+        self.add_item(_Container(
+            _TextDisplay(self.text),
+            _Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            _TextDisplay("**🐻 도리봇 · 빠른 실행**"),
+            _ActionRow(*buttons[:2]),
+            _Separator(visible=False, spacing=discord.SeparatorSpacing.large),
+            _ActionRow(*buttons[2:]),
+        ))
 
 
 class FeatureMenuView(_ViewBase):
@@ -773,10 +807,10 @@ class SlashCommandRegistrationState:
 
 
 def typing_intro_payload(user: Any, **services: Any) -> dict[str, Any]:
-    """Build a V2-only public notice, permitting mentions of its target alone."""
+    """Build one V2 public notice with a plain display name and no mentions."""
     return {
         "view": TypingIntroView(user, **services),
-        "allowed_mentions": discord.AllowedMentions(users=[user], everyone=False, roles=False, replied_user=False),
+        "allowed_mentions": _no_mentions(),
     }
 
 

@@ -82,6 +82,28 @@ class AdminServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.target.timeout.await_count, 3)
         self.target.timeout.assert_awaited_with(timedelta(minutes=5), reason=f"Doribot timeout; actor={SECOND}")
 
+    async def test_cleanup_uses_shared_deletion_pipeline_with_limits_and_partial_results(self):
+        deleted = AsyncMock(side_effect=[True, False])
+        self.service.delete_service = deleted
+        messages = [SimpleNamespace(id=index, author=SimpleNamespace(id=author))
+                    for index, author in enumerate((30, 20, 30, 20, 20), 1)]
+
+        async def history(**kwargs):
+            self.assertEqual(kwargs, {"limit": 100})
+            for message in messages:
+                yield message
+
+        self.interaction.channel.history = history
+        request = await self.request("cleanup", value=2)
+        text = await self.service.execute(self.interaction, request)
+        self.assertIn("1개를 삭제", text)
+        self.assertIn("실패/이미 삭제 1개", text)
+        self.assertEqual(deleted.await_count, 2)
+        self.assertEqual([call.args[0].id for call in deleted.call_args_list], [2, 4])
+        self.assertTrue(all(call.kwargs == {"reason": "admin_cleanup"} for call in deleted.call_args_list))
+        self.interaction.channel.purge.assert_not_awaited()
+        self.assertEqual(self.service.audit[-1]["result"], "partial_failure")
+
     async def test_unauthorized_dm_and_scoped_admins_fail_before_execution(self):
         for actor_id, guild, scope in ((30, self.interaction.guild, ""), (SPECIAL, None, ""),
                                       (SPECIAL, self.interaction.guild, "101")):

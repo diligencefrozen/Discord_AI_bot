@@ -45,7 +45,7 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(view.is_persistent())
 
     async def test_typing_notice_has_one_box_with_text_and_two_button_rows(self):
-        user = SimpleNamespace(id=42, mention="<@42>")
+        user = SimpleNamespace(id=42, display_name="Apple Watch", mention="<@42>")
         payload = bot_ui.typing_intro_payload(user)
         self.assertEqual(set(payload), {"view", "allowed_mentions"})
         view = payload["view"]
@@ -54,17 +54,21 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(view.is_persistent())
         self.assertEqual(len(view.children), 1)
         container = view.children[0]
-        self.assertEqual(len(container.children), 3)
-        text, first, second = container.children
-        self.assertIn("**🐻 도리봇 · 빠른 실행**", text.content)
-        self.assertIn("<@42>님, 무엇을 도와드릴까요?", text.content)
-        self.assertIn("아래에서 원하는 기능을 선택해 주세요.", text.content)
+        self.assertEqual(len(container.children), 6)
+        text, divider, heading, first, spacer, second = container.children
+        self.assertEqual(text.content, "**👀 Apple Watch님, 채팅을 작성 중이셨네요!**\n\n필요하시면 도리봇이 도와드릴게요.")
+        self.assertEqual(heading.content, "**🐻 도리봇 · 빠른 실행**")
+        self.assertTrue(divider.visible)
+        self.assertEqual(divider.spacing, bot_ui.discord.SeparatorSpacing.small)
+        self.assertFalse(spacer.visible)
+        self.assertEqual(spacer.spacing, bot_ui.discord.SeparatorSpacing.large)
         self.assertEqual([len(first.children), len(second.children)], [2, 2])
         buttons = [*first.children, *second.children]
         self.assertEqual([button.custom_id for button in buttons], list(view.BUTTON_IDS))
         self.assertEqual([button.label for button in buttons], list(view.BUTTON_LABELS))
-        self.assertTrue(all(button.style == bot_ui.discord.ButtonStyle.secondary for button in buttons))
-        self.assertEqual(payload["allowed_mentions"].users, [user])
+        self.assertEqual(buttons[0].style, bot_ui.discord.ButtonStyle.primary)
+        self.assertTrue(all(button.style == bot_ui.discord.ButtonStyle.secondary for button in buttons[1:]))
+        self.assertFalse(payload["allowed_mentions"].users)
         self.assertFalse(payload["allowed_mentions"].everyone)
         self.assertFalse(payload["allowed_mentions"].roles)
         self.assertFalse(payload["allowed_mentions"].replied_user)
@@ -72,8 +76,25 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
             components = view.to_components()
             self.assertEqual(len(components), 1)
             self.assertEqual(components[0]["type"], 17)
-            self.assertEqual([item["type"] for item in components[0]["components"]], [10, 1, 1])
-            self.assertEqual([len(row["components"]) for row in components[0]["components"][1:]], [2, 2])
+            self.assertEqual([item["type"] for item in components[0]["components"]], [10, 14, 10, 1, 14, 1])
+            self.assertEqual([len(components[0]["components"][index]["components"]) for index in (3, 5)], [2, 2])
+            self.assertEqual(payload["allowed_mentions"].to_dict()["parse"], [])
+
+    async def test_typing_buttons_execute_each_original_callback(self):
+        question, image, growth, menu = (AsyncMock() for _ in range(4))
+        view = bot_ui.TypingIntroView(question_service=question, image_service=image,
+                                     growth_service=growth, menu_service=menu)
+        children = view.children[0].children
+        buttons = [*children[3].children, *children[5].children]
+        target = interaction()
+        await buttons[0].callback(target)
+        self.assertIs(target.response.send_modal.call_args.args[0].question_service, question)
+        await buttons[1].callback(target)
+        self.assertIs(target.response.send_modal.call_args.args[0].image_service, image)
+        await buttons[2].callback(target)
+        growth.assert_awaited_once_with(target)
+        await buttons[3].callback(target)
+        menu.assert_awaited_once_with(target)
 
     async def test_both_intro_layouts_keep_callbacks_to_the_same_services(self):
         question, image, growth, menu = (AsyncMock() for _ in range(4))
@@ -199,13 +220,35 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([button.custom_id for button in args.kwargs["view"].children],
                          ["admin:members", "admin:channel", "admin:rules", "admin:test", "admin:logs", "admin:settings"])
 
-    async def test_notice_builds_target_mention_from_validated_id(self):
-        user = SimpleNamespace(id=42, mention="@everyone <@123>")
-        view = bot_ui.TypingIntroView(user)
-        self.assertNotIn("@everyone", view.text)
-        self.assertNotIn("<@123>", view.text)
-        self.assertEqual(view.text.count("<@42>"), 1)
-        self.assertEqual(len(view.text.splitlines()), 3)
+    async def test_typing_greeting_uses_safe_display_names_without_mentions(self):
+        names = ("Apple Watch", "늘어버린 도리", "😡🐻👩\u200d💻", "name" * 100,
+                 "**name** _x_ `code` ||spoiler|| [label](https://example.com)",
+                 "@everyone @here <@123> <@&456>", "line\n\r\tbreak\x00\u202e")
+        for name in names:
+            with self.subTest(name=name):
+                user = SimpleNamespace(id=42, display_name=name, mention="@everyone <@123>")
+                payload = bot_ui.typing_intro_payload(user)
+                text = payload["view"].text
+                self.assertTrue(text.startswith("**👀 "))
+                self.assertIn("님, 채팅을 작성 중이셨네요!**", text)
+                self.assertEqual(len(text.splitlines()), 3)
+                self.assertNotRegex(text, r"<@[!&]?[0-9]+>")
+                self.assertNotIn("@everyone", text)
+                self.assertNotIn("@here", text)
+                self.assertNotIn("\x00", text)
+                self.assertNotIn("\u202e", text)
+                self.assertLess(len(text), 150)
+                self.assertFalse(payload["allowed_mentions"].users)
+        self.assertIn("늘어버린 도리", bot_ui.TypingIntroView(SimpleNamespace(display_name="늘어버린 도리")).text)
+        self.assertIn("👩\u200d💻", bot_ui.TypingIntroView(SimpleNamespace(display_name="👩\u200d💻")).text)
+        self.assertIn("\\*\\*name\\*\\*", bot_ui.TypingIntroView(SimpleNamespace(display_name="**name**")).text)
+        self.assertIn("x" * 40 + "…님", bot_ui.TypingIntroView(SimpleNamespace(display_name="x" * 100)).text)
+
+    async def test_typing_name_fallback_never_uses_the_mention_property(self):
+        for user in (None, SimpleNamespace(id=42, mention="@everyone"),
+                     SimpleNamespace(display_name="\x00\u202e"), SimpleNamespace(display_name=123)):
+            self.assertIn("👀 사용자님", bot_ui.TypingIntroView(user).text)
+        self.assertIn("👀 account님", bot_ui.TypingIntroView(SimpleNamespace(name="account")).text)
 
     async def test_configuration_diagnostics_never_contain_raw_values(self):
         os.environ["SPECIAL_ADMIN_USER_IDS"] = f"{OLD_ADMIN},{NEW_ADMIN}"
@@ -383,7 +426,12 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(module.DISCORD_AVAILABLE)
         payload = module.typing_intro_payload(SimpleNamespace(mention="<@42>", id=42))
         self.assertEqual(set(payload), {"view", "allowed_mentions"})
-        self.assertEqual(len(payload["view"].children[0].children), 3)
+        children = payload["view"].children[0].children
+        self.assertEqual(len(children), 6)
+        self.assertTrue(children[1].visible)
+        self.assertFalse(children[4].visible)
+        self.assertTrue(payload["view"].is_persistent())
+        self.assertFalse(payload["allowed_mentions"].users)
 
 
 if __name__ == "__main__":

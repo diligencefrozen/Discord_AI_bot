@@ -23,7 +23,7 @@ from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Set, Tuple
 from dataclasses import dataclass
-from moderation_delete import delete_message
+from deletion_audit import DeletionAuditService
 from bot_storage import PickleStore
 from bot_metrics import MetricsStore
 from ai_providers import (
@@ -53,7 +53,7 @@ from bot_ui import (
     admin_configuration_diagnostics,
     log_admin_access,
 )
-from admin_service import handle_admin_action
+from admin_service import ADMIN_SERVICE, handle_admin_action
 
 # Load local development settings before resolving state paths. Northflank
 # injects environment variables directly, while local `.env` users get the
@@ -869,10 +869,10 @@ def use_profanity_pass(user_id: int):
     # Explicitly consume a counted pass only after a moderation decision.
     return _consume_legacy_exemption(user_id, "profanity")
 
-async def safe_delete(message: discord.Message, *, reason: str = "moderation") -> bool:
-    """Delete a moderation target and log every failure without message text."""
-
-    return await delete_message(message, reason=reason)
+async def safe_delete(message: discord.Message, *, reason: str = "moderation",
+                      matched_rule: str = None, detail: str = None) -> bool:
+    """Keep the operator audit separate from content-free console telemetry."""
+    return await DELETION_AUDIT.delete(message, reason=reason, matched_rule=matched_rule, detail=detail)
 
 
 async def _moderate_message_content(message: discord.Message) -> bool:
@@ -919,7 +919,7 @@ async def _moderate_message_content(message: discord.Message) -> bool:
             reason = "link+profanity" if link_violation and profanity_violation else (
                 "profanity" if profanity_violation else "link"
             )
-            await safe_delete(message, reason=reason)
+            await safe_delete(message, reason=reason, matched_rule=root if profanity_violation else None)
             if link_violation:
                 await message.channel.send(
                     embed=discord.Embed(
@@ -2235,6 +2235,8 @@ LOG_ROUTES = {
 }
 
 CHANNEL_TO_LOG = {src: dst for dst, srcs in LOG_ROUTES.items() for src in srcs}
+DELETION_AUDIT = DeletionAuditService(CHANNEL_TO_LOG, bot.get_channel)
+ADMIN_SERVICE.delete_service = DELETION_AUDIT.delete
 
 # ────────────────────────────────────────────────────────────────────────────
 # ‘웃음’ 상호작용 기능
@@ -2298,27 +2300,27 @@ GAME_WARN_RE = re.compile(r'(?:^|[^가-힣])(게임|겜|game|친구)', re.I)
 # ────────────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_message_delete(message: discord.Message):
-    # 봇이 삭제한 메시지는 로그하지 않음
-    if message.author.bot:
-        return
-    
-    log_ch_id = CHANNEL_TO_LOG.get(message.channel.id)
-    if not log_ch_id:
-        return
-    log_ch = bot.get_channel(log_ch_id)
-    if not log_ch:
-        return
-    ts = datetime.datetime.now(seoul_tz).strftime("%Y-%m-%d %H:%M:%S")
-    embed = (
-        discord.Embed(
-            title="메시지 삭제 기록",
-            description=f"**User:** {message.author.mention}\n**Channel:** {message.channel.mention}",
-            color=0xFF0000,
-        )
-        .add_field(name="메시지 ID", value=str(message.id), inline=False)
-        .set_footer(text=f"{message.guild.name} | {ts}")
-    )
-    await log_ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    await DELETION_AUDIT.on_message_delete(message)
+
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    await DELETION_AUDIT.on_raw_message_delete(payload)
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    await DELETION_AUDIT.on_raw_bulk_message_delete(payload)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    DELETION_AUDIT.remember(after)
+
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    DELETION_AUDIT.on_raw_message_edit(payload)
 
 # ───────────────── Game promo cards ─────────────────
 GAME_CARDS: dict[str, dict] = {
@@ -2447,6 +2449,7 @@ async def on_message(message: discord.Message):
     if bot.user is not None and message.author.id == bot.user.id:
         return
 
+    DELETION_AUDIT.remember(message)
     _observe_typing_message(message)
 
     guild_id = message.guild.id if message.guild else 0
@@ -2611,7 +2614,7 @@ async def on_message(message: discord.Message):
                 
                 async def delayed_delete():
                     await asyncio.sleep(delay)
-                    await safe_delete(message, reason="spam")
+                    await safe_delete(message, reason="spam", detail=reason)
                 
                 asyncio.create_task(delayed_delete())
                 
@@ -4577,6 +4580,8 @@ async def _admin_action_service(interaction, action_id):
         f"슬래시 로컬 등록: {len(bot.tree.get_commands())}개\n"
         f"이번 프로세스 원격 게시 성공: {'예' if _slash_registration_state.synced else '미확인'}\n"
         "로컬 등록은 Discord 명령 선택기 표시를 보장하지 않습니다.\n"
+        f"삭제 감사 원문: {'켜짐 · 검증된 비공개 채널만' if DELETION_AUDIT.include_content else '꺼짐'}\n"
+        "삭제 스냅샷은 메모리에만 잠시 보관하며 파일은 다운로드하지 않습니다.\n"
         "관리 기록과 중복 실행 방지는 메모리이며 재시작 시 초기화됩니다."
     )
     if await handle_admin_action(interaction, action_id, status_text=status_text):

@@ -16,7 +16,7 @@ import re
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import moderation_rules
 
@@ -37,7 +37,8 @@ SERVICE_NAMES = {
     "_publish_question_answer", "_generate_text_response", "_generate_image_bytes",
     "_reserve_image_request", "ask", "strip_think", "_send_typing_reminder",
     "_deliver_typing_reminder", "_typing_scope_key", "_typing_notice_on_cooldown",
-    "_image_interaction_service", "on_message_delete",
+    "_image_interaction_service", "on_message_delete", "on_raw_message_delete",
+    "on_raw_bulk_message_delete", "on_message_edit", "on_raw_message_edit",
 }
 
 
@@ -66,6 +67,9 @@ def services():
         "_persist_typing_cooldowns": AsyncMock(),
         "_observe_typing_message": Mock(), "_typing_message_fallback": Mock(),
         "_plain_admin_message_hint": AsyncMock(return_value=False),
+        "DELETION_AUDIT": SimpleNamespace(remember=Mock(), delete=AsyncMock(return_value=True),
+            on_message_delete=AsyncMock(), on_raw_message_delete=AsyncMock(),
+            on_raw_bulk_message_delete=AsyncMock(), on_raw_message_edit=Mock()),
         "AI_IMAGE_FAILURE_MESSAGE": "무료 이미지 서버가 혼잡해요.",
     }
     bodies = []
@@ -367,20 +371,72 @@ class PublicQuestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(target.channel.send.call_args.kwargs["file"].filename, "generated.png")
         target.followup.send.assert_awaited_once_with("✅ 그림을 채널에 올렸어요.", ephemeral=True)
 
-    async def test_deleted_message_log_contains_metadata_without_original_text(self):
+    async def test_all_deletion_and_edit_events_use_one_audit_coordinator(self):
         ns = services()
-        ns["seoul_tz"] = datetime.timezone(datetime.timedelta(hours=9))
-        ns["CHANNEL_TO_LOG"] = {1: 10}
-        log_channel = SimpleNamespace(send=AsyncMock())
-        ns["bot"].get_channel = Mock(return_value=log_channel)
         target = message("private message body")
-        target.channel.mention = "<#1>"
-        target.guild.name = "test guild"
         await ns["on_message_delete"](target)
-        kwargs = log_channel.send.call_args.kwargs
-        self.assertNotIn("private message body", str(kwargs["embed"].to_dict()))
-        self.assertIn("123", str(kwargs["embed"].to_dict()))
-        self.assertEqual(kwargs["allowed_mentions"].to_dict()["parse"], [])
+        await ns["on_raw_message_delete"](target)
+        await ns["on_raw_bulk_message_delete"](target)
+        await ns["on_message_edit"](None, target)
+        await ns["on_raw_message_edit"](target)
+        audit = ns["DELETION_AUDIT"]
+        audit.on_message_delete.assert_awaited_once_with(target)
+        audit.on_raw_message_delete.assert_awaited_once_with(target)
+        audit.on_raw_bulk_message_delete.assert_awaited_once_with(target)
+        audit.remember.assert_called_once_with(target)
+        audit.on_raw_message_edit.assert_called_once_with(target)
+
+    async def test_moderation_keeps_original_separate_from_measured_rule(self):
+        ns = services()
+        original = "시321133발"
+        target = message(original)
+        measured_rule = moderation_rules.find_badroot(original)
+        self.assertIsNotNone(measured_rule)
+        self.assertFalse(await ns["_moderate_message_content"](target))
+        ns["safe_delete"].assert_awaited_once_with(target, reason="profanity", matched_rule=measured_rule)
+        self.assertEqual(target.content, original)
+
+
+@unittest.skipIf(discord is None, "requires actual discord.py")
+class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_moderation_to_private_card_preserves_original_and_deduplicates_events(self):
+        from deletion_audit import DeletionAuditService
+
+        ns = services()
+        target = message("시321133발")
+        target.delete = AsyncMock()
+        target.attachments, target.stickers, target.embeds = [], [], []
+        target.author.display_name = "테스트 사용자"
+        target.channel.name, target.guild.name = "general", "테스트 서버"
+        everyone = SimpleNamespace(id=1)
+        target.guild.default_role, target.guild.me = everyone, SimpleNamespace(id=99)
+        target.guild.owner_id, target.guild.roles = 77, [everyone]
+        log_channel = MagicMock(spec=discord.TextChannel)
+        log_channel.id, log_channel.guild, log_channel.overwrites = 10, target.guild, {}
+        log_channel.send = AsyncMock()
+        log_channel.permissions_for = lambda actor: SimpleNamespace(
+            view_channel=actor.id != everyone.id, send_messages=True, embed_links=True)
+        audit = DeletionAuditService({1: 10}, lambda _channel_id: log_channel,
+                                     include_content=True, configured_admin_ids=())
+        ns["DELETION_AUDIT"] = audit
+        safe_delete_node = next(node for node in SOURCE.body
+                                if isinstance(node, ast.AsyncFunctionDef) and node.name == "safe_delete")
+        module = ast.Module(body=[safe_delete_node], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), "main.py", "exec"), ns)
+        with self.assertLogs("deletion_audit", level="INFO") as captured:
+            self.assertFalse(await ns["_moderate_message_content"](target))
+            await ns["on_message_delete"](target)
+            await ns["on_raw_message_delete"](SimpleNamespace(
+                guild_id=1, channel_id=1, message_id=123, cached_message=target))
+        target.delete.assert_awaited_once()
+        log_channel.send.assert_awaited_once()
+        payload = log_channel.send.call_args.kwargs
+        rendered = str(payload["embed"].to_dict())
+        self.assertIn("시321133발", rendered)
+        self.assertIn(moderation_rules.find_badroot(target.content), rendered)
+        self.assertIn("123", rendered)
+        self.assertNotIn("시321133발", "\n".join(captured.output))
+        self.assertEqual(payload["allowed_mentions"].to_dict()["parse"], [])
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ def adapters():
         "XP_DATA_FILE": Path(__file__),
         "bot": SimpleNamespace(tree=SimpleNamespace(get_commands=lambda: [1] * 5)),
         "_slash_registration_state": SimpleNamespace(synced=False),
+        "DELETION_AUDIT": SimpleNamespace(include_content=True),
         "_admin_text_hint_cooldowns": {},
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "main.py", "exec"), namespace)
