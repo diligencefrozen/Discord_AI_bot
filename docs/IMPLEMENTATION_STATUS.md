@@ -1,4 +1,35 @@
-# V6 구현·검증 보고서
+# 구현·검증 보고서
+
+## 최신 변경: V8 레거시 기본 삭제 기록 복원 (2026-10-23)
+
+최종 기준은 `DORIBOT_CODEX_DELETE_LOG_LEGACY_RESTORE_V8_2026-10-23.md`입니다.
+이전 V6/V7의 비공개 소스 익명/미전송 정책 중 **LOG_ROUTES 명시 소스**에 관한 부분을 대체합니다.
+상세 구현·채널별 공개 결정·배포 절차는 [V8 보고서](DELETE_LOG_LEGACY_RESTORE_V8_2026-10-23.md)를 따릅니다.
+
+- 실제 비교 기준: 로컬 `develop` 및 GitHub `HEAD/main/develop`가 모두 `10942cb1a29b86828e61eed5957a31a93f74e4da`임을 `git ls-remote`로 확인했습니다.
+  Northflank 연결 도구/배포 이력 접근은 없어 현재 서비스 배포 커밋은 확인하지 못했습니다.
+- 실제 `private_source`/`build_restricted_deletion_embed` 경로를 확인했습니다. ZIP과 다른 최신 V7 코드를 유지하며 최소 범위를 수정합니다.
+- 재현: 명시 `moderator-only`의 실제 검열→삭제 카드 통합 테스트가 기존 코드에서 작성자 `Apple Watch` 누락으로 실패했습니다.
+- V8: 명시 소스는 작성자·원본 채널·메시지 ID·KST·확인된 사유 코드가 있는 기본 카드를 유지합니다.
+  실제 원문·탐지 문자열·파일명은 공개 범위 검증 또는 해당 명시 소스의 private-full opt-in에 따라 표시합니다.
+  미등록 비공개/권한 불명 소스는 익명 카드도 전송하지 않습니다. 수신지 네 개와 LOG_ROUTES는 유지합니다.
+- 신규 변수 `DELETION_PUBLIC_LOG_PRIVATE_FULL_SOURCE_IDS`는 기본 빈 값입니다.
+  명시 LOG_ROUTES 소스만 효력이 있고 `DELETION_PUBLIC_LOG_INCLUDE_CONTENT=0`이면 본문 공개가 차단됩니다.
+- `/관리` 상태에서 `sent_full`과 `sent_metadata_only`의 차이를 명확히 표시합니다. 기본 카드 성공을 원문 공개 성공으로 집계하지 않습니다.
+  본문이 미확보여도 공개가 허용된 다른 상세 항목은 유지하며, 재시도 중 독자 권한이 변경되면 공개 수준을 다시 판단합니다.
+- 반복 Markdown 링크에 섞인 뒤쪽 백틱이 이스케이프를 우회하는 표시 결함도 문자 단위 이스케이프로 보완했습니다.
+- 변경 파일: `deletion_audit.py`의 카드/정책/재시도/진단, `main.py` 운영 상태 문구,
+  삭제 감사 및 실제 메인 통합/시작 계약 테스트, README·환경변수 예시·운영/V8 보고서입니다.
+  AI·XP·타이핑·슬래시·파딱 인증·cleanup 비노출은 기존 회귀로 보존합니다.
+- 검증 기준 실행: **415개 통과** (19.307초). V8 최종 전체 실행은 **440개 통과, 실패 0, 스킵 0** (17.120초)입니다.
+  `python -m unittest discover -s tests -v`, `python -m compileall -q .`, `git diff --check`를 모두 통과했습니다.
+  신규 V8 공개 정책 테스트 22개, 실제 메인 통합 재현 3개를 추가했고 기존 정책 테스트는 명시/자동 소스를 구분해 다시 검증했습니다.
+  삭제 관련 146개, 실제 메인 서비스 25개, 생성자/네 목적지/실제 전체 import 계약 6개를 포함합니다.
+  네트워크를 차단한 별도 프로세스·임시 상태 경로에서 실제 main import와 봇 생성자를 확인했습니다.
+  실제 검증 환경은 Python **3.12.14 / discord.py 2.7.1**이며 필수 의존성 누락/skip은 없습니다. 대상 Python 3.13은 미검증입니다.
+- 실제 Northflank 변수·Discord 권한/채널·원격 명령을 변경하지 않았습니다. 로컬 커밋만 생성하며 실서버 완전 복구를 주장하지 않습니다.
+
+## 이전 V6 구현 기록 (아래는 당시 기준)
 
 갱신: 2026-10-23 (Asia/Seoul). 최종 기준은 사용자가 지정한
 `DORIBOT_CODEX_FINAL_PATCH_HANDOVER_V6_2026-10-22.md` 전체입니다.

@@ -351,16 +351,18 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("비활성화", embed_field(embed, "원문"))
         self.assert_counts(metadata=1)
 
-    async def test_t05_private_source_receipt_never_counts_as_full_or_exposes_original(self):
+    async def test_t05_explicit_private_source_retains_legacy_identity_but_hides_original(self):
         self.source.overwrites[self.source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
         target = make_message(self.source, "private-secret-body")
         target.author.display_name = "PRIVATE-AUTHOR-NAME"
         await self.service.on_message_delete(target)
         self.destination.send.assert_awaited_once()
         rendered = str(self.destination.send.call_args.kwargs["embed"].to_dict())
-        for secret in ("private-secret-body", "PRIVATE-AUTHOR-NAME", "channel-11"):
+        for legacy in ("PRIVATE-AUTHOR-NAME", "channel-11", "메시지 ID", "100", "KST"):
+            self.assertIn(legacy, rendered)
+        for secret in ("private-secret-body",):
             self.assertNotIn(secret, rendered)
-        status = self.assert_counts(restricted=1)
+        status = self.assert_counts(metadata=1)
         self.assertIsNone(status["last_full"])
         self.assertNotEqual(status["last_reason"], "sent_full")
 
@@ -567,10 +569,10 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.diagnostics(1)["public_deletion_status"], "confirmed")
         self.source.permissions_for.side_effect = RuntimeError("secret permission response")
         await self.service.on_message_delete(make_message(self.source, message_id=101))
-        status = self.assert_counts(full=1, restricted=1)
-        self.assertEqual(status["public_deletion_status"], "failed")
+        status = self.assert_counts(full=1, metadata=1)
+        self.assertEqual(status["public_deletion_status"], "check_required")
         self.assertEqual(status["last_reason"], "unknown_permissions")
-        self.assertIn("unknown_permissions", self.destination.send.call_args.kwargs["embed"].description)
+        self.assertIn("unknown_permissions", str(self.destination.send.call_args.kwargs["embed"].to_dict()))
         self.assertIsNotNone(status["last_full"])
 
     async def test_latest_send_failure_degrades_prior_full_health(self):
@@ -584,14 +586,14 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["public_deletion_status"], "failed")
         self.assertIsNotNone(status["last_full"])
 
-    async def test_verified_private_receipt_preserves_prior_public_health(self):
+    async def test_private_metadata_does_not_claim_current_full_content_health(self):
         await self.service.on_message_delete(make_message(self.source, message_id=100))
         self.source.overwrites[self.source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
         await self.service.on_message_delete(make_message(self.source, "private after public", message_id=101))
-        status = self.assert_counts(full=1, restricted=1)
+        status = self.assert_counts(full=1, metadata=1)
         self.assertEqual(status["last_reason"], "private_source")
-        self.assertIn("private_source", self.destination.send.call_args.kwargs["embed"].description)
-        self.assertEqual(status["public_deletion_status"], "confirmed")
+        self.assertIn("private_source", str(self.destination.send.call_args.kwargs["embed"].to_dict()))
+        self.assertEqual(status["public_deletion_status"], "check_required")
 
     async def test_failed_second_transport_probe_replaces_previous_success_state(self):
         self.assertEqual((await self.service.send_test(1))["reason"], "test_sent")
@@ -624,14 +626,15 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.service = self.new_service(retry_sleep=change_acl)
         self.destination.send.side_effect = [RateLimited(), None]
-        with self.assertLogs("deletion_audit", level="WARNING") as captured:
+        with self.assertLogs("deletion_audit", level="INFO") as captured:
             await self.service.on_message_delete(make_message(self.source, "must-not-retry-private-content"))
-        self.destination.send.assert_awaited_once()
-        status = self.assert_counts(failed=1)
-        self.assertEqual(status["last_reason"], "source_reader_scope_exceeded")
-        self.assertEqual(status["last_stage"], "retry_permissions")
+        self.assertEqual(self.destination.send.await_count, 2)
+        status = self.assert_counts(metadata=1)
+        self.assertEqual(status["last_reason"], "private_source")
+        self.assertNotIn("must-not-retry-private-content", str(self.destination.send.call_args.kwargs["embed"].to_dict()))
+        self.assertIn("작성자", self.destination.send.call_args.kwargs["embed"].description)
         self.assertNotIn("must-not-retry-private-content", "\n".join(captured.output))
-        self.assertNotIn((1, 100), self.service._delivered)
+        self.assertIn((1, 100), self.service._delivered)
 
     async def test_channel_permission_invalidation_refetches_before_next_disclosure(self):
         source, destination, guild = real_channel_pair()
@@ -650,7 +653,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send.await_count, 2)
         self.assertNotIn("private-after-acl-change", str(send.call_args.kwargs["embed"].to_dict()))
         self.assertEqual(service.diagnostics(1)["sent_full"], 1)
-        self.assertEqual(service.diagnostics(1)["sent_restricted"], 1)
+        self.assertEqual(service.diagnostics(1)["sent_metadata_only"], 1)
         self.assertEqual(sum(call.args[0] == source.id for call in fetcher.await_args_list), 2)
 
 

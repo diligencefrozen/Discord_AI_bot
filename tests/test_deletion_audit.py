@@ -301,7 +301,7 @@ class PublicReaderScopeTests(unittest.TestCase):
         source, destination, _ = reader_pair()
         self.assertIsNone(public_destination_reason(source, destination, 1))
 
-    def test_private_source_never_leaks_even_metadata_to_public_log(self):
+    def test_private_source_fails_full_disclosure_reader_proof(self):
         source, destination, _ = reader_pair()
         source.overwrites[source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
         self.assertEqual(public_destination_reason(source, destination, 1), "source_reader_scope_exceeded")
@@ -393,12 +393,16 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.service.destination_for(1, 123))
         self.assertIsNone(self.service.destination_for(1, 20))
 
-    async def test_unknown_raw_source_has_no_content_or_channel_metadata_publication(self):
+    async def test_explicit_unknown_raw_source_restores_known_ids_without_inventing_content(self):
         self.channels.pop(11)
         await self.service.on_raw_message_delete(raw())
-        self.destination.send.assert_not_awaited()
+        self.destination.send.assert_awaited_once()
+        rendered = str(self.destination.send.call_args.kwargs["embed"].to_dict())
+        for expected in ("100", "채널 ID 11", "작성자 확인 불가", "원문 확인 불가"):
+            self.assertIn(expected, rendered)
         self.assertEqual(self.service.diagnostics(1)["last_reason"], "source_not_found")
-        self.assertEqual(self.service.diagnostics(1)["failed"], 1)
+        self.assertEqual(self.service.diagnostics(1)["sent_metadata_only"], 1)
+        self.assertEqual(self.service.diagnostics(1)["failed"], 0)
 
     async def test_resolver_id_mismatch_cannot_send_to_another_same_guild_channel(self):
         self.destination.id = 999
@@ -413,20 +417,23 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
         self.destination.send.assert_not_awaited()
         self.assertEqual(self.service.diagnostics(1)["last_reason"], "source_id_mismatch")
 
-    async def test_private_cached_and_raw_deletions_publish_only_anonymous_receipts(self):
+    async def test_explicit_private_cached_and_raw_restore_base_fields_without_body(self):
         self.source.overwrites[self.source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
         await self.service.on_message_delete(message("private-sensitive-content"))
         await self.service.on_raw_message_delete(raw(101))
         self.assertEqual(self.destination.send.await_count, 2)
         for call in self.destination.send.call_args_list:
             embed = call.kwargs["embed"]
-            self.assertIn("열람 범위 제한", embed.title)
-            self.assertFalse(embed.fields)
-            for secret in ("private-sensitive-content", "channel-11", "ID 50", "채널 ID 11"):
+            self.assertIn("메시지 삭제 기록", embed.title)
+            self.assertNotIn("열람 범위 제한", embed.title)
+            for expected in ("채널 ID 11", "메시지 ID", "KST"):
+                self.assertIn(expected, str(embed.to_dict()))
+            for secret in ("private-sensitive-content",):
                 self.assertNotIn(secret, str(embed.to_dict()))
         status = self.service.diagnostics(1)
         self.assertEqual(status["last_reason"], "private_source")
-        self.assertEqual(status["sent_restricted"], 2)
+        self.assertEqual(status["sent_metadata_only"], 2)
+        self.assertEqual(status["sent_restricted"], 0)
         self.assertEqual(status["sent_full"], 0)
         self.assertIsNone(status["last_full"])
         self.assertNotIn("private-sensitive-content", str(status))

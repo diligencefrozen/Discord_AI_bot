@@ -51,7 +51,11 @@ def _text(value: Any, limit: int = 1000) -> str:
                           char in "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069") else char for char in text)
     text = re.sub(r"\b([a-z][a-z0-9+.-]{0,31}):(?=//)", lambda match: match.group(1) + ":\u200b", text, flags=re.I)
     text = text.replace("@", "@\u200b").replace("<", "<\u200b").replace(">", ">\u200b")
-    text = discord.utils.escape_markdown(text)
+    # escape_markdown's greedy masked-link branch can swallow later Markdown
+    # inside one match, even with ignore_links=False. Escape tokens literally
+    # so repeated links cannot leave trailing fences or spoilers unescaped.
+    text = re.sub(r"([\\`*_~|\[\]#>])", r"\\\1", text)
+    text = re.sub(r"(?m)^(\s*)([-+])", r"\1\\\2", text)
     return text if len(text) <= limit and len(original) <= limit else text[: max(0, limit - 12)] + "… (표시 생략)"
 
 
@@ -94,8 +98,9 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
     channel = _text(snapshot.channel_name or "채널 이름 확인 불가", 120)
     reason_code = _code(snapshot.reason.code)
     description = (
-        f"**작성자** {author} · ID {author_id}\n"
-        f"**위치** #{channel} · 채널 ID {snapshot.channel_id}\n"
+        f"**👤 User · 작성자** {author} · ID {author_id}\n"
+        f"**📍 Channel · 위치** #{channel} · 채널 ID {snapshot.channel_id}\n"
+        f"**🆔 메시지 ID** {snapshot.message_id}\n"
         f"**삭제 확인 시각** {deleted_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST · 봇 수신 기준\n"
         f"**삭제 유형** {'봇 직접 삭제 · ' if snapshot.delete_origin == 'bot' else ''}{REASON_LABELS[reason_code]}"
     )
@@ -109,7 +114,7 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
         description += "\n**검열 경로** 새 메시지"
     if snapshot.edited_at is not None:
         description += f"\n**수정 시각** {snapshot.edited_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST"
-    title = "🚨 메시지 삭제 기록 · 자동 검열" if snapshot.delete_origin == "bot" and reason_code in {
+    title = "🗑️ 메시지 삭제 기록 · 자동 검열" if snapshot.delete_origin == "bot" and reason_code in {
         "profanity", "link", "link+profanity", "moderation", "blocked_media"} else "🗑️ 메시지 삭제 기록"
     embed = discord.Embed(title=title, description=description[:4096], color=0xED4245)
     if not include_content:
@@ -178,6 +183,35 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
         removed = True
     if removed:
         embed.add_field(name="표시 생략", value="Discord의 6,000자 한도로 일부 메타데이터 표시를 생략했습니다.", inline=False)
+    return embed
+
+
+def build_metadata_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime | None = None,
+                                  reason_code: str = "private_source") -> discord.Embed:
+    """Restore explicitly routed legacy identity without republishing bodies.
+
+    The operator's LOG_ROUTES selection authorizes these base fields only.
+    Detected roots, free-form details, media names and URLs remain excluded.
+    """
+    allowed_reasons = {"private_source", "unknown_permissions", "source_not_found", "content_disabled",
+                       "snapshot_not_found", "snapshot_stale"}
+    reason_code = reason_code if reason_code in allowed_reasons else "unknown_permissions"
+    embed = build_deletion_embed(snapshot, deleted_at=deleted_at, include_content=False)
+    embed.title = "🗑️ 메시지 삭제 기록"
+    if reason_code == "content_disabled":
+        content_state = "원문 기록이 비활성화되어 있습니다."
+    elif reason_code in {"snapshot_not_found", "snapshot_stale"}:
+        content_state = "원문 확인 불가(캐시/스냅샷 없음 또는 최신 수정 원문 미수신)"
+    else:
+        content_state = "원본 채널 공개 정책에 따라 생략 · 원문 비공개"
+        if not snapshot.content_available:
+            content_state += "\n원문 확인 불가(캐시/스냅샷 없음)"
+    embed.set_field_at(0, name="📝 삭제된 원문", value=content_state, inline=False)
+    embed.add_field(name="🔒 기록 상태", value=f"기본 기록만 표시 · {reason_code}", inline=False)
+    counts = " · ".join(f"{label} {count if count is not None else '확인 불가'}개"
+                        for label, count in (("첨부파일", snapshot.attachment_count),
+                                             ("스티커", snapshot.sticker_count), ("임베드", snapshot.embed_count)))
+    embed.add_field(name="📎 첨부파일 · 상태", value=counts + "\n상세 파일명·미디어 내용은 공개하지 않습니다.", inline=False)
     return embed
 
 
@@ -520,8 +554,10 @@ class _DeleteAttempt:
 
 
 class _DeliveryPolicyChanged(Exception):
-    def __init__(self, reason_code: str):
+    def __init__(self, reason_code: str, stage: str = "policy", *, skipped: bool = False):
         self.reason_code = reason_code
+        self.stage = stage
+        self.skipped = skipped
         super().__init__(reason_code)
 
 
@@ -544,6 +580,11 @@ class DeletionAuditService:
         self.enabled = os.getenv("DELETION_PUBLIC_LOG_ENABLED", "1").strip() == "1" if enabled is None else enabled is True
         self.all_guild_channels = os.getenv("DELETION_LOG_ALL_GUILD_CHANNELS", "1").strip() == "1" if all_guild_channels is None else all_guild_channels is True
         self.extra_sources, self.extra_sources_valid = _configured_ids(os.getenv("DELETION_LOG_EXTRA_SOURCE_CHANNEL_IDS", ""))
+        private_ids, self.private_full_sources_valid = _configured_ids(
+            os.getenv("DELETION_PUBLIC_LOG_PRIVATE_FULL_SOURCE_IDS", ""))
+        # An extra/all-guild source is NOT the operator's legacy LOG_ROUTES
+        # consent. Destination self-routes cannot opt themselves into auditing.
+        self.private_full_sources = private_ids.intersection(self.routes).difference(self.routes.values())
         self.guild_resolver = guild_resolver
         # The gateway channel cache can be incomplete even for configured
         # destination IDs. A bounded REST fallback avoids silent lost logs.
@@ -774,7 +815,38 @@ class DeletionAuditService:
             return False
         previous = self._bot_members.get(guild_id)
         member = previous[1] if previous is not None and self.clock() - previous[0] < 30 else None
-        return evaluate_public_destination(channel, destination, guild_id, bot_member=member).allowed
+        member = member if member is not None else getattr(destination.guild, "me", None)
+        if self._record_destination_reason(destination, guild_id, destination_id, member) is not None:
+            return False
+        if getattr(getattr(channel, "guild", None), "id", None) != guild_id:
+            return False
+        return channel_id in self.routes or evaluate_public_destination(channel, destination, guild_id, bot_member=member).allowed
+
+    @staticmethod
+    def _record_destination_reason(destination: Any, guild_id: int, destination_id: int,
+                                   bot_member: Any) -> str | None:
+        """Validate transport independently of the source disclosure policy."""
+        if destination is None:
+            return "destination_missing"
+        if getattr(destination, "id", None) != destination_id:
+            return "destination_id_mismatch"
+        if not isinstance(destination, discord.TextChannel):
+            return "destination_not_text_channel"
+        if getattr(getattr(destination, "guild", None), "id", None) != guild_id:
+            return "destination_guild_mismatch"
+        if bot_member is None:
+            return "bot_member_unavailable"
+        member_guild_id = getattr(getattr(bot_member, "guild", None), "id", None)
+        if isinstance(member_guild_id, int) and member_guild_id != guild_id:
+            return "bot_member_guild_mismatch"
+        try:
+            permissions = destination.permissions_for(bot_member)
+            for name in ("view_channel", "send_messages", "embed_links"):
+                if getattr(permissions, name, None) is not True:
+                    return "destination_bot_" + name
+        except Exception:
+            return "destination_permissions_unavailable"
+        return None
 
     async def refresh_diagnostics(self, guild_or_id: Any) -> dict[str, Any]:
         guild_id = getattr(guild_or_id, "id", guild_or_id)
@@ -836,6 +908,9 @@ class DeletionAuditService:
                 "bot_embed_links": getattr(permissions, "embed_links", False) is True,
                 "enabled": self.enabled, "include_content": self.include_content,
                 "all_guild_channels": self.all_guild_channels, "extra_sources_valid": self.extra_sources_valid,
+                "private_full_sources_valid": self.private_full_sources_valid,
+                "private_full_source_count": sum(getattr(getattr(self._known_channel(source_id), "guild", None), "id", None) == guild_id
+                                                 for source_id in self.private_full_sources),
                 "configured_source_count": sum(getattr(getattr(self._resolve_cached(source_id), "guild", None), "id", None) == guild_id
                                                for source_id in self.routes),
                 "extra_source_count": sum(getattr(getattr(self._resolve_cached(source_id), "guild", None), "id", None) == guild_id
@@ -1174,23 +1249,81 @@ class DeletionAuditService:
             return min(float(2 ** attempt), self.max_retry_after)
         return None
 
-    async def _send_with_retry(self, channel: Any, embed: discord.Embed, snapshot: MessageAuditSnapshot) -> None:
+    async def _prepare_publication(self, snapshot: MessageAuditSnapshot, *, deleted_at: datetime,
+                                   destination_id: int) -> tuple[Any, discord.Embed, str, str]:
+        """Resolve transport, then apply separate legacy/full disclosure consent.
+
+        Called again after every retry delay, since ACLs can change while an
+        outbound request is rate-limited. A formerly full card can downgrade.
+        """
+        if destination_id not in self.routes.values():
+            raise _DeliveryPolicyChanged("destination_not_configured", "routing")
+        cached_destination = self._resolve_cached(destination_id)
+        if cached_destination is not None and getattr(cached_destination, "id", None) != destination_id:
+            raise _DeliveryPolicyChanged("destination_id_mismatch", "destination_resolve")
+        channel = await self._resolve_channel(destination_id)
+        if channel is None:
+            error = self._channel_errors.get(destination_id)
+            reason = ("destination_forbidden" if error == "delivery_forbidden" else
+                      "destination_id_mismatch" if error == "channel_id_mismatch" else "destination_missing")
+            raise _DeliveryPolicyChanged(reason, "destination_resolve")
+        member = await self._bot_member(getattr(channel, "guild", None))
+        failure = self._record_destination_reason(channel, snapshot.guild_id, destination_id, member)
+        if failure is not None:
+            raise _DeliveryPolicyChanged(failure, "destination_bot_permissions")
+        if snapshot.channel_id in self.routes.values() or snapshot.channel_id == destination_id:
+            raise _DeliveryPolicyChanged("destination_recursion", "routing", skipped=True)
+        cached_source = self._resolve_cached(snapshot.channel_id)
+        if cached_source is not None and getattr(cached_source, "id", None) != snapshot.channel_id:
+            raise _DeliveryPolicyChanged("source_id_mismatch", "source_resolve")
+        source = await self._resolve_channel(snapshot.channel_id)
+        if source is None and self._channel_errors.get(snapshot.channel_id) == "channel_id_mismatch":
+            raise _DeliveryPolicyChanged("source_id_mismatch", "source_resolve")
+        if source is not None and getattr(getattr(source, "guild", None), "id", None) != snapshot.guild_id:
+            raise _DeliveryPolicyChanged("source_guild_mismatch", "source_resolve")
+        if source is not None and not isinstance(source, discord.TextChannel):
+            raise _DeliveryPolicyChanged("source_not_text_channel", "source_resolve")
+        decision = evaluate_public_destination(source, channel, snapshot.guild_id, bot_member=member)
+        stats = self._stat(snapshot.guild_id)
+        stats["last_decision"] = decision.status
+        stats["last_permission_reason"], stats["last_permission_stage"] = decision.reason_code, decision.stage
+        explicit = snapshot.channel_id in self.routes
+        private_opt_in = explicit and snapshot.channel_id in self.private_full_sources
+        if not explicit and not decision.allowed:
+            # Automatic discovery is not consent to publish private activity,
+            # even if the old V7 card did not identify the channel or author.
+            reason = "private_unrouted_skipped" if decision.status == "PRIVATE_VERIFIED" else "unverified_unrouted_skipped"
+            raise _DeliveryPolicyChanged(reason, decision.stage, skipped=True)
+        full_allowed = decision.allowed or (private_opt_in and decision.status in {"PRIVATE_VERIFIED", "UNKNOWN_PERMISSIONS"})
+        if not self.include_content:
+            reason = "content_disabled"
+        elif not full_allowed:
+            reason = ("private_source" if decision.status == "PRIVATE_VERIFIED" else
+                      "source_not_found" if source is None else "unknown_permissions")
+        elif not snapshot.content_available:
+            reason = "snapshot_stale" if "raw_edit" in snapshot.truncated_fields else "snapshot_not_found"
+        else:
+            reason = "private_full_opt_in" if not decision.allowed else "public_verified"
+        outcome = "sent_full" if full_allowed and self.include_content and snapshot.content_available else "sent_metadata_only"
+        # Disclosure consent and body availability are independent: a public
+        # (or opted-in) snapshot may still have known media/rule metadata even
+        # when Discord never supplied its body. Keep that useful detail while
+        # truthfully classifying the delivery as sent_metadata_only.
+        if full_allowed and self.include_content:
+            embed = build_deletion_embed(snapshot, deleted_at=deleted_at, include_content=True)
+        else:
+            embed = build_metadata_deletion_embed(snapshot, deleted_at=deleted_at, reason_code=reason)
+        return channel, embed, outcome, reason
+
+    async def _send_with_retry(self, channel: Any, embed: discord.Embed, snapshot: MessageAuditSnapshot, *,
+                               deleted_at: datetime, destination_id: int, outcome: str, reason: str) -> tuple[str, str]:
         for attempt in range(self.retry_attempts + 1):
             try:
                 if attempt:
-                    # Retry-After may span an ACL update. Recheck readership
-                    # before resending a card containing any source metadata.
-                    current = await self._resolve_channel(channel.id)
-                    source = await self._resolve_channel(snapshot.channel_id)
-                    member = await self._bot_member(getattr(current, "guild", None))
-                    decision = evaluate_public_destination(source, current, snapshot.guild_id, bot_member=member)
-                    if not decision.allowed and embed.fields:
-                        raise _DeliveryPolicyChanged(decision.reason_code)
-                    if getattr(getattr(current, "guild", None), "id", None) != snapshot.guild_id:
-                        raise _DeliveryPolicyChanged("destination_guild_mismatch")
-                    channel = current
+                    channel, embed, outcome, reason = await self._prepare_publication(
+                        snapshot, deleted_at=deleted_at, destination_id=destination_id)
                 await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-                return
+                return outcome, reason
             except Exception as error:
                 if getattr(error, "status", None) == 429:
                     self._record(snapshot.guild_id, "rate_limited")
@@ -1252,53 +1385,12 @@ class DeletionAuditService:
                         return fail("destination_ambiguous")
                 if destination_id is None:
                     return fail("destination_missing")
-                stage = "destination_resolve"
-                # Never trust a channel returned for the wrong ID or guild.
-                cached_destination = self._resolve_cached(destination_id)
-                if cached_destination is not None and getattr(cached_destination, "id", None) != destination_id:
-                    return fail("destination_id_mismatch")
-                else:
-                    channel = await self._resolve_channel(destination_id)
-                if channel is None:
-                    error = self._channel_errors.get(destination_id)
-                    return fail("destination_forbidden" if error == "delivery_forbidden" else
-                                "destination_id_mismatch" if error == "channel_id_mismatch" else "destination_missing")
-                if getattr(getattr(channel, "guild", None), "id", None) != snapshot.guild_id:
-                    return fail("destination_guild_mismatch")
-                stage = "source_resolve"
-                cached_source = self._resolve_cached(snapshot.channel_id)
-                if cached_source is not None and getattr(cached_source, "id", None) != snapshot.channel_id:
-                    return fail("source_id_mismatch")
-                else:
-                    source = await self._resolve_channel(snapshot.channel_id)
-                if source is None:
-                    return fail("source_not_found")
-                if getattr(getattr(source, "guild", None), "id", None) != snapshot.guild_id:
-                    return fail("source_guild_mismatch")
-                member = await self._bot_member(getattr(channel, "guild", None))
-                decision = evaluate_public_destination(source, channel, snapshot.guild_id, bot_member=member)
-                stage = decision.stage
-                self._stat(snapshot.guild_id)["last_decision"] = decision.status
-                self._stat(snapshot.guild_id)["last_permission_reason"] = decision.reason_code
-                self._stat(snapshot.guild_id)["last_permission_stage"] = decision.stage
-                if not decision.allowed and decision.status not in {"PRIVATE_VERIFIED", "UNKNOWN_PERMISSIONS"}:
-                    return fail(decision.reason_code, error_type=decision.exception_type)
-                if not decision.allowed:
-                    reason = "private_source" if decision.status == "PRIVATE_VERIFIED" else "unknown_permissions"
-                    self._event(*key, snapshot.channel_id, result="restricted", reason=decision.reason_code,
-                                stage=decision.stage, destination_id=destination_id, error_type=decision.exception_type)
-                    outcome = "sent_restricted"
-                else:
-                    reason = ("content_disabled" if not self.include_content else "snapshot_stale" if "raw_edit" in snapshot.truncated_fields
-                              and not snapshot.content_available else "snapshot_not_found" if not snapshot.content_available else "public_verified")
-                    outcome = "sent_full" if snapshot.content_available and self.include_content else "sent_metadata_only"
                 stage = "embed"
-                if outcome == "sent_restricted":
-                    embed = build_restricted_deletion_embed(deleted_at=deleted_at, reason_code=reason)
-                else:
-                    embed = build_deletion_embed(snapshot, deleted_at=deleted_at, include_content=self.include_content)
+                channel, embed, outcome, reason = await self._prepare_publication(
+                    snapshot, deleted_at=deleted_at, destination_id=destination_id)
                 stage = "send"
-                await self._send_with_retry(channel, embed, snapshot)
+                outcome, reason = await self._send_with_retry(channel, embed, snapshot, deleted_at=deleted_at,
+                                                               destination_id=destination_id, outcome=outcome, reason=reason)
                 self._delivered[key] = self.clock()
                 self._delivered.move_to_end(key)
                 while len(self._delivered) > self.delivery_limit:
@@ -1309,7 +1401,11 @@ class DeletionAuditService:
         except Exception as error:
             # No repr/str/traceback: Discord exceptions may contain message data.
             if isinstance(error, _DeliveryPolicyChanged):
-                stage = "retry_permissions"
+                stage = error.stage
+                if error.skipped:
+                    self._event(*key, snapshot.channel_id, result="skipped", reason=error.reason_code,
+                                stage=stage, destination_id=destination_id)
+                    return False
                 return fail(error.reason_code, error_type=type(error).__name__)
             return fail("embed_failed" if stage == "embed" else self._delivery_error(error), error_type=type(error).__name__)
         finally:
@@ -1317,4 +1413,5 @@ class DeletionAuditService:
 
 
 __all__ = ["DeletionAuditService", "PublicDestinationDecision", "evaluate_public_destination",
-           "build_deletion_embed", "build_restricted_deletion_embed", "private_destination_reason", "public_destination_reason"]
+           "build_deletion_embed", "build_metadata_deletion_embed", "build_restricted_deletion_embed",
+           "private_destination_reason", "public_destination_reason"]

@@ -455,6 +455,66 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("시321133발", "\n".join(captured.output))
         self.assertEqual(payload["allowed_mentions"].to_dict()["parse"], [])
 
+    async def test_v8_explicit_private_moderation_restores_legacy_metadata_without_body(self):
+        ns, target, log_channel, audit = self.audit_context()
+        target.channel.name, target.author.display_name = "moderator-only", "Apple Watch"
+        target.channel.overwrites = {
+            discord.Object(id=1, type=discord.Role): discord.PermissionOverwrite(view_channel=False)}
+        target.attachments = [SimpleNamespace(id=444, filename="PRIVATE-FILENAME.png", content_type="image/png",
+                                             size=128, width=32, height=32, is_spoiler=lambda: False)]
+        with self.assertLogs("deletion_audit", level="INFO") as captured:
+            self.assertFalse(await ns["_moderate_message_content"](target))
+            await asyncio.gather(ns["on_message_delete"](target), ns["on_raw_message_delete"](SimpleNamespace(
+                guild_id=1, channel_id=1, message_id=123, cached_message=target)))
+        target.delete.assert_awaited_once()
+        log_channel.send.assert_awaited_once()
+        card = log_channel.send.call_args.kwargs["embed"]
+        rendered = str(card.to_dict())
+        for legacy in ("Apple Watch", "42", "moderator-only", "123", "KST"):
+            self.assertIn(legacy, rendered)
+        self.assertIn("금칙어", rendered)
+        for secret in (target.content, "PRIVATE-FILENAME", moderation_rules.find_badroot(target.content)):
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn(secret, "\n".join(captured.output))
+        status = audit.diagnostics(target.guild)
+        self.assertEqual(status["sent_full"], 0)
+        self.assertEqual(status["sent_metadata_only"], 1)
+        self.assertEqual(log_channel.send.call_args.kwargs["allowed_mentions"].to_dict()["parse"], [])
+
+    async def test_v8_log_bot_message_returns_before_moderation_xp_or_audit(self):
+        ns = services()
+        ns["bot"].user = SimpleNamespace(id=99)
+        target = message("시321133발", channel_id=10)
+        target.author = SimpleNamespace(id=99, bot=True)
+        ns["add_xp"] = Mock(side_effect=AssertionError("audit replayed XP"))
+        await ns["on_message"](target)
+        ns["safe_delete"].assert_not_awaited()
+        ns["DELETION_AUDIT"].remember.assert_not_called()
+        ns["add_xp"].assert_not_called()
+        ns["bot"].process_commands.assert_not_awaited()
+
+    async def test_v8_explicit_private_full_opt_in_keeps_real_rule_and_original_separate(self):
+        with patch.dict("os.environ", {"DELETION_PUBLIC_LOG_PRIVATE_FULL_SOURCE_IDS": "1"}):
+            ns, target, log_channel, audit = self.audit_context()
+        target.channel.name, target.author.display_name = "moderator-only", "Apple Watch"
+        target.channel.overwrites = {
+            discord.Object(id=1, type=discord.Role): discord.PermissionOverwrite(view_channel=False)}
+        with self.assertLogs("deletion_audit", level="INFO") as captured:
+            self.assertFalse(await ns["_moderate_message_content"](target))
+            await ns["on_raw_message_delete"](SimpleNamespace(
+                guild_id=1, channel_id=1, message_id=123, cached_message=target))
+        target.delete.assert_awaited_once()
+        log_channel.send.assert_awaited_once()
+        card = log_channel.send.call_args.kwargs["embed"]
+        self.assertIn("Apple Watch", card.description)
+        self.assertIn("moderator-only", card.description)
+        original = next(field.value for field in card.fields if "원문" in field.name)
+        detected = next(field.value for field in card.fields if "탐지" in field.name)
+        self.assertIn("시321133발", original)
+        self.assertIn(moderation_rules.find_badroot(target.content), detected)
+        self.assertEqual(audit.diagnostics(target.guild)["sent_full"], 1)
+        self.assertNotIn(target.content, "\n".join(captured.output))
+
     async def test_real_raw_and_cached_edit_to_public_card_never_replays_xp_ai_or_typing(self):
         from edit_moderation import EditModerationService
 

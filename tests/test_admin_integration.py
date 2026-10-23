@@ -32,6 +32,7 @@ def adapters():
             "destination_ids": (1064823080100306995,), "destination_count": 1,
             "destination_resolution": "rest", "enabled": True, "include_content": True,
             "all_guild_channels": True, "sent_full": 8, "sent_metadata_only": 2,
+            "private_full_sources_valid": True, "private_full_source_count": 1,
             "sent_restricted": 3, "failed": 1, "skipped": 4, "bot_view_channel": True,
             "last_reason": "private_source", "test_result": "test_sent",
             "last_permission_reason": "source_member_scope_exceeded", "last_permission_stage": "member_overwrites",
@@ -82,15 +83,17 @@ class AdminAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("재시작 시 초기화", text)
             self.assertIn("기록 가능/제외 채널: 3/2", text)
             self.assertIn("상세(sent_full) 8", text)
-            self.assertIn("원문 미확보(sent_metadata_only) 2", text)
-            self.assertIn("제한(sent_restricted) 3", text)
+            self.assertIn("기본/원문 생략(sent_metadata_only) 2", text)
+            self.assertIn("구형 제한(sent_restricted) 3", text)
             self.assertIn("실패(failed) 1", text)
             self.assertIn("제외/누락(skipped) 4", text)
             self.assertIn("2026-10-22 09:00:00 KST", text)
             self.assertIn("1064823080100306995", text)
             self.assertIn("목적지 조회: REST 복구", text)
             self.assertIn("ENABLED=1 · INCLUDE_CONTENT=1 · ALL_GUILD_CHANNELS=1", text)
-            self.assertIn("공개 원본의 제한 카드는 상세 기록 실패", text)
+            self.assertIn("비공개 본문 동의: 설정 유효 · 이 서버 1개", text)
+            self.assertIn("기본 기록은 작성자·채널·메시지 ID를 보존", text)
+            self.assertIn("별도 allowlist 동의", text)
             self.assertIn("권한 판정 근거: source_member_scope_exceeded · 단계 member_overwrites", text)
             self.assertNotIn("전송 성공/실패", text)
 
