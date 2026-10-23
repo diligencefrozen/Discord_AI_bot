@@ -1,5 +1,8 @@
 # Northflank 운영 절차 — V6
 
+공용 삭제 기록은 [V7 긴급 복구·네 서버 검증 절차](PUBLIC_DELETE_HOTFIX_V7_2026-10-23.md)를 우선 적용합니다.
+V7은 실물 discord.py 2.7.1 공개 권한 오판을 재현·검증하며, 운영 Northflank/Discord 결과는 별도 UNKNOWN으로 기록합니다.
+
 갱신: 2026-10-22 (Asia/Seoul). 최종 기준은 `DORIBOT_CODEX_FINAL_PATCH_HANDOVER_V6_2026-10-22.md`입니다.
 이 문서는 운영자가 적용할 절차이며, 이 작업에서 Northflank 설정 변경·배포 또는 실제 Discord 검증을 수행한 것은 아닙니다.
 로컬 테스트, 원격 명령 게시, 실계정 검증, 운영 배포를 각각 기록하세요. 최종 테스트 수는 구현 상태 보고서에서 확인합니다.

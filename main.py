@@ -18,6 +18,7 @@ from typing import Optional, List, Union, Dict
 from concurrent.futures import ThreadPoolExecutor
 import urllib.parse, textwrap
 import math
+import inspect
 from bs4 import BeautifulSoup  
 from collections import defaultdict, deque, Counter
 from pathlib import Path
@@ -2265,12 +2266,38 @@ LOG_ROUTES = {
 }
 
 CHANNEL_TO_LOG = {src: dst for dst, srcs in LOG_ROUTES.items() for src in srcs}
-DELETION_AUDIT = DeletionAuditService(
-    CHANNEL_TO_LOG,
-    bot.get_channel,
-    guild_resolver=bot.get_guild,
-    channel_fetcher=bot.fetch_channel
-)
+
+
+async def _fetch_deletion_bot_member(guild):
+    """Recover only this bot's member when the gateway member cache is empty."""
+    member = getattr(guild, "me", None)
+    if member is not None:
+        return member
+    bot_id = getattr(getattr(bot, "user", None), "id", None)
+    if bot_id is None:
+        return None
+    return await guild.fetch_member(bot_id)
+
+
+def _create_deletion_audit(service_type, client, routes):
+    """Validate the deployed pair before constructing the deletion service.
+
+    Signature inspection does not start the gateway, load state, or retry with
+    missing safety/resolver arguments when an old module was deployed alone.
+    """
+    options = {"guild_resolver": client.get_guild, "channel_fetcher": client.fetch_channel,
+               "bot_member_fetcher": _fetch_deletion_bot_member}
+    try:
+        inspect.signature(service_type).bind(routes, client.get_channel, **options)
+    except (TypeError, ValueError):
+        logging.critical("event=deletion_audit_startup result=failed reason=constructor_incompatible stage=signature_bind")
+        raise RuntimeError("deletion_audit_constructor_incompatible: deploy main.py and deletion_audit.py together") from None
+    service = service_type(routes, client.get_channel, **options)
+    logging.info("event=deletion_audit_startup result=ready reason=constructor_compatible")
+    return service
+
+
+DELETION_AUDIT = _create_deletion_audit(DeletionAuditService, bot, CHANNEL_TO_LOG)
 ADMIN_SERVICE.delete_service = DELETION_AUDIT.delete
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -2363,6 +2390,16 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     DELETION_AUDIT.on_raw_message_edit(payload)
     await EDIT_MODERATION.on_raw_edit(payload)
+
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    DELETION_AUDIT.invalidate_channel(after.id)
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    DELETION_AUDIT.invalidate_channel(channel.id)
 
 # ───────────────── Game promo cards ─────────────────
 GAME_CARDS: dict[str, dict] = {
@@ -4620,13 +4657,26 @@ async def _admin_action_service(interaction, action_id):
     if action_id == "admin:deletion-test":
         await _interaction_defer(interaction)
         result = await DELETION_AUDIT.send_test(interaction)
-        await _interaction_send(interaction, f"공용 삭제 로그 전송 테스트: {result.get('result', 'failed')} · {result.get('reason', 'unknown')}")
+        await _interaction_send(interaction,
+            f"공용 삭제 로그 전송 테스트: {result.get('result', 'failed')} · {result.get('reason', 'unknown')}\n"
+            "인공 카드의 목적지 송신 검사입니다. 실제 공개 메시지의 삭제·검열 상세 기록은 별도 확인해야 합니다.")
         return
+    if action_id != "admin:settings":
+        if await handle_admin_action(interaction, action_id):
+            return
+        await _interaction_send(interaction, "관리 작업을 선택해 주세요.")
+        return
+    await _interaction_defer(interaction)
     state_root = XP_DATA_FILE.parent
-    deletion_status = DELETION_AUDIT.diagnostics(interaction.guild)
-    last_log_success = deletion_status.get("last_success")
-    last_log_success_text = (last_log_success.isoformat(timespec="seconds")
-                             if isinstance(last_log_success, datetime.datetime) else "없음")
+    deletion_status = await DELETION_AUDIT.refresh_diagnostics(interaction.guild)
+    last_full = deletion_status.get("last_full")
+    last_full_text = (last_full.astimezone(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S KST")
+                      if isinstance(last_full, datetime.datetime) and last_full.tzinfo is not None else "없음")
+    destination_ids = ", ".join(str(value) for value in deletion_status.get("destination_ids", ())) or "미확인"
+    destination_resolution = {"cache": "캐시 성공", "rest": "REST 복구", "missing": "실패", "failed": "실패"}.get(
+        deletion_status.get("destination_resolution"), deletion_status.get("destination_resolution", "검사 필요"))
+    public_deletion_status = {"confirmed": "확인됨 · 실제 상세 전송 이력", "failed": "실패", "check_required": "검사 필요"}.get(
+        deletion_status.get("public_deletion_status"), "검사 필요")
     status_text = (
         f"⚙️ 운영 상태\n활성 금칙어: {len(active_bad_roots())}개\n"
         f"저장 경로 설정: {'DATA_DIR/STATE_DIR' if os.getenv('DATA_DIR') or os.getenv('STATE_DIR') else '작업 디렉터리'}\n"
@@ -4635,12 +4685,20 @@ async def _admin_action_service(interaction, action_id):
         f"슬래시 로컬 등록: {len(bot.tree.get_commands())}개\n"
         f"이번 프로세스 원격 게시 성공: {'예' if _slash_registration_state.synced else '미확인'}\n"
         "로컬 등록은 Discord 명령 선택기 표시를 보장하지 않습니다.\n"
-        f"공용 삭제 로그 원문: {'켜짐 · 원본 열람 범위 검사' if DELETION_AUDIT.include_content else '꺼짐'}\n"
+        "🧪 도리봇 · 공용 삭제 기록 상태\n"
+        f"서버: {interaction.guild.id} / 기록 목적지: {destination_ids}\n"
+        f"목적지 조회: {destination_resolution}\n"
+        f"배포 플래그: ENABLED={int(deletion_status.get('enabled', False))} · INCLUDE_CONTENT={int(deletion_status.get('include_content', False))} · ALL_GUILD_CHANNELS={int(deletion_status.get('all_guild_channels', False))}\n"
         f"공용 로그 진단: {deletion_status.get('reason', 'unknown')}\n"
         f"봇 로그 권한: 보기 {deletion_status.get('bot_view_channel', False)} · 보내기 {deletion_status.get('bot_send_messages', False)} · 임베드 {deletion_status.get('bot_embed_links', False)}\n"
         f"기록 가능/제외 채널: {deletion_status.get('eligible_source_count', 0)}/{deletion_status.get('excluded_source_count', 0)} · 수신지 {deletion_status.get('destination_count', 0)}개\n"
-        f"전송 성공/실패: {deletion_status.get('sent', 0)}/{deletion_status.get('failures', 0)} · 최근 사유 {deletion_status.get('last_reason') or '없음'}\n"
-        f"최근 전송 확인(UTC): {last_log_success_text}\n"
+        f"일반 공개 채널 상세 감사: {public_deletion_status}\n"
+        f"최근 실제 삭제: 상세(sent_full) {deletion_status.get('sent_full', 0)} · 원문 미확보(sent_metadata_only) {deletion_status.get('sent_metadata_only', 0)} · 제한(sent_restricted) {deletion_status.get('sent_restricted', 0)} · 실패(failed) {deletion_status.get('failed', 0)} · 제외/누락(skipped) {deletion_status.get('skipped', 0)} · 드롭 {deletion_status.get('dropped', 0)}\n"
+        f"최근 원인 코드: {deletion_status.get('last_reason') or '없음'} · 판정 {deletion_status.get('last_decision') or '없음'} · 단계 {deletion_status.get('last_stage') or '없음'}\n"
+        f"권한 판정 근거: {deletion_status.get('last_permission_reason') or '없음'} · 단계 {deletion_status.get('last_permission_stage') or '없음'}\n"
+        f"마지막 상세 전송: {last_full_text}\n"
+        f"전송 테스트: {deletion_status.get('test_result', 'not_run')}\n"
+        "※ 전송 테스트 통과와 실제 삭제 처리 통과는 다릅니다. 공개 원본의 제한 카드는 상세 기록 실패입니다.\n"
         "삭제 스냅샷은 메모리에만 잠시 보관하며 파일은 다운로드하지 않습니다.\n"
         f"{_slash_visibility_audit.status_text()}\n"
         f"{EDIT_MODERATION.status_text(interaction.guild.id)}\n"

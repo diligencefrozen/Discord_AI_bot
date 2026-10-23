@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import inspect
 import logging
+import math
 import os
 import re
 import unicodedata
@@ -30,7 +31,7 @@ REASON_LABELS = {
     "profanity": "자동 검열 · 금칙어", "link": "자동 검열 · 허용되지 않은 링크",
     "link+profanity": "자동 검열 · 링크 및 금칙어", "blocked_media": "자동 제한 · 차단된 미디어",
     "spam": "스팸 방지 · 도배", "admin_cleanup": "관리자 패널 · 메시지 정리",
-    "moderation": "봇 검열", "external": "외부 삭제 · 실행자 확인 불가",
+    "moderation": "봇 검열", "external": "일반 삭제 · 삭제자 확인 불가",
     "unknown": "확인 불가 · 봇 검열 여부 미확인",
 }
 
@@ -104,9 +105,13 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
         description += "\n**검열 경로** 수정 후 검열 · 삭제 직전 확인된 버전"
     elif snapshot.trigger == "history_scan":
         description += "\n**검열 경로** 정기 재점검 · 현재 확인된 버전의 위반 탐지"
+    elif snapshot.delete_origin == "bot":
+        description += "\n**검열 경로** 새 메시지"
     if snapshot.edited_at is not None:
         description += f"\n**수정 시각** {snapshot.edited_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST"
-    embed = discord.Embed(title="🗑️ 메시지 삭제 기록", description=description[:4096], color=0xED4245)
+    title = "🚨 메시지 삭제 기록 · 자동 검열" if snapshot.delete_origin == "bot" and reason_code in {
+        "profanity", "link", "link+profanity", "moderation", "blocked_media"} else "🗑️ 메시지 삭제 기록"
+    embed = discord.Embed(title=title, description=description[:4096], color=0xED4245)
     if not include_content:
         original = "원문 기록이 비활성화되어 있습니다."
     elif not snapshot.content_available:
@@ -176,7 +181,8 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
     return embed
 
 
-def build_restricted_deletion_embed(*, deleted_at: datetime | None = None) -> discord.Embed:
+def build_restricted_deletion_embed(*, deleted_at: datetime | None = None,
+                                    reason_code: str = "private_source") -> discord.Embed:
     """Non-identifying receipt when a source has a narrower readership.
 
     This card intentionally contains NO source/channel/user/message identifiers,
@@ -186,13 +192,16 @@ def build_restricted_deletion_embed(*, deleted_at: datetime | None = None) -> di
     deleted_at = deleted_at or datetime.now(timezone.utc)
     if deleted_at.tzinfo is None:
         deleted_at = deleted_at.replace(tzinfo=timezone.utc)
+    reason_code = "unknown_permissions" if reason_code == "unknown_permissions" else "private_source"
+    explanation = ("원본 채널의 권한 정보를 확인하지 못해" if reason_code == "unknown_permissions" else
+                   "원본 채널의 열람 범위가 공용 기록 채널보다 좁아")
     return discord.Embed(
         title="🗑️ 메시지 삭제 감지 · 열람 범위 제한",
         description=(
             f"**확인 시각** {deleted_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST\n"
             "이 서버에서 메시지 삭제가 감지되었습니다.\n"
-            "원본 채널의 열람 권한을 공용 기록 채널에 그대로 적용할 수 없어 "
-            "작성자·채널·원문·첨부 정보는 공개하지 않습니다."
+            f"{explanation} 작성자·채널·원문·첨부 정보는 공개하지 않습니다.\n"
+            f"**제한 사유** {reason_code}"
         ),
         colour=0xED4245,
     )
@@ -248,22 +257,73 @@ def private_destination_reason(channel: Any, guild_id: int, admin_ids: Iterable[
     return None
 
 
+@dataclass(frozen=True)
+class PublicDestinationDecision:
+    """Safe permission evidence; never retains an exception message or content."""
+
+    status: str
+    reason_code: str
+    stage: str
+    exception_type: str | None = None
+
+    @property
+    def allowed(self) -> bool:
+        return self.status == "PUBLIC_VERIFIED"
+
+    @property
+    def public_verified(self) -> bool:
+        return self.allowed
+
+
+class _PermissionEvidenceError(ValueError):
+    def __init__(self, reason_code: str):
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
+def _overwrite_kind(target: Any) -> str:
+    if isinstance(target, discord.Role):
+        return "role"
+    if isinstance(target, (discord.Member, discord.User)):
+        return "member"
+    if isinstance(target, discord.Object):
+        if target.type is discord.Role:
+            return "role"
+        # GuildChannel.overwrites is defined in discord.abc, where User is the
+        # abc.User protocol, NOT the exported concrete discord.User class.
+        # Comparing only with discord.User rejects actual uncached members.
+        if target.type in (discord.abc.User, discord.User, discord.Member):
+            return "member"
+    raise _PermissionEvidenceError("unknown_permission_overwrite")
+
+
 def _view_override(channel: Any, target_id: int, *, role: bool) -> bool | None:
     result = None
     for target, overwrite in channel.overwrites.items():
         if getattr(target, "id", None) != target_id:
             continue
-        is_role = isinstance(target, discord.Role) or (isinstance(target, discord.Object) and target.type is discord.Role) or target_id == channel.guild.default_role.id
+        is_role = _overwrite_kind(target) == "role"
         if is_role != role:
             continue
         result = getattr(overwrite, "view_channel", None)
-        if result not in (True, False, None):
-            raise ValueError("invalid_permission_overwrite")
+        if result is not True and result is not False and result is not None:
+            raise _PermissionEvidenceError("invalid_permission_overwrite")
     return result
 
 
-def _role_profiles(source: Any, destination: Any, guild: Any) -> tuple[tuple[bool, bool, bool, bool, bool, bool], ...]:
-    """Compress roles by the six bits relevant to View Channel containment."""
+def _unknown_role_ids(source: Any, destination: Any, guild: Any) -> set[int]:
+    known_roles = {role.id for role in guild.roles}
+    return {target.id for channel in (source, destination) for target in channel.overwrites
+            if _overwrite_kind(target) == "role" and target.id not in known_roles}
+
+
+def _role_profiles(source: Any, destination: Any, guild: Any, *, include_unknown: bool = True) -> tuple[tuple[bool, bool, bool, bool, bool, bool], ...]:
+    """Compress known roles, conservatively expanding uncached role grants.
+
+    Uncached role overwrites are real role targets, not malformed member
+    overwrites. Their base View Channel bit may be either value. Administrator
+    cannot produce a containment failure because it sees both channels.
+    """
     profiles = set()
     for role in guild.roles:
         if role.id == guild.default_role.id:
@@ -273,28 +333,35 @@ def _role_profiles(source: Any, destination: Any, guild: Any) -> tuple[tuple[boo
         view = getattr(role.permissions, "view_channel", None)
         administrator = getattr(role.permissions, "administrator", None)
         if not isinstance(view, bool) or not isinstance(administrator, bool):
-            raise ValueError("role_permissions_unavailable")
+            raise _PermissionEvidenceError("role_permissions_unavailable")
         profiles.add((administrator, view, source_value is True, source_value is False,
                       destination_value is True, destination_value is False))
+    if include_unknown:
+        for role_id in _unknown_role_ids(source, destination, guild):
+            source_value = _view_override(source, role_id, role=True)
+            destination_value = _view_override(destination, role_id, role=True)
+            for view in (False, True):
+                profiles.add((False, view, source_value is True, source_value is False,
+                              destination_value is True, destination_value is False))
     return tuple(profiles)
 
 
 def _member_overwrites(channel: Any) -> dict[int, Any]:
     result = {}
-    known_roles = {role.id for role in channel.guild.roles}
     for target, overwrite in channel.overwrites.items():
         target_id = getattr(target, "id", None)
-        if target_id in known_roles:
+        kind = _overwrite_kind(target)
+        if kind == "role":
             continue
-        if isinstance(target, discord.Member) or (isinstance(target, discord.Object) and target.type is discord.User):
+        if isinstance(target_id, int) and target_id > 0:
             result[target_id] = target
         else:
-            # A missing role/member type could conceal a permitted reader.
-            raise ValueError("unknown_permission_overwrite")
+            raise _PermissionEvidenceError("invalid_permission_target")
     return result
 
 
-def public_destination_reason(source: Any, destination: Any, guild_id: int) -> str | None:
+def evaluate_public_destination(source: Any, destination: Any, guild_id: int, *,
+                                bot_member: Any = None) -> PublicDestinationDecision:
     """Prove every destination reader may read the source, or fail closed.
 
     Role grants combine by union and role overwrite Allow dominates Deny. Any
@@ -303,37 +370,62 @@ def public_destination_reason(source: Any, destination: Any, guild_id: int) -> s
     membership when available and all possible role profiles otherwise. This
     also accepts member-role channels where @everyone is denied at both ends.
     """
+    def decision(status, reason_code, stage, exception_type=None):
+        return PublicDestinationDecision(status, reason_code, stage, exception_type)
+
+    if destination is None:
+        return decision("DESTINATION_MISSING", "destination_missing", "destination_type")
+    if source is None:
+        return decision("SOURCE_MISSING", "source_not_found", "source_type")
     if not isinstance(destination, discord.TextChannel):
-        return "destination_not_text_channel"
+        return decision("UNSUPPORTED_CHANNEL_TYPE", "destination_not_text_channel", "destination_type")
     if not isinstance(source, discord.TextChannel):
-        return "source_not_text_channel"
+        return decision("UNSUPPORTED_CHANNEL_TYPE", "source_not_text_channel", "source_type")
     if source.id == destination.id:
-        return "destination_recursion"
+        return decision("DESTINATION_FORBIDDEN", "destination_recursion", "routing")
     guild = getattr(source, "guild", None)
-    if (guild is None or getattr(guild, "id", None) != guild_id or
-            getattr(getattr(destination, "guild", None), "id", None) != guild_id):
-        return "destination_guild_mismatch"
+    if guild is None or getattr(guild, "id", None) != guild_id:
+        return decision("SOURCE_GUILD_MISMATCH", "source_guild_mismatch", "guild_validation")
+    if getattr(getattr(destination, "guild", None), "id", None) != guild_id:
+        return decision("DESTINATION_GUILD_MISMATCH", "destination_guild_mismatch", "guild_validation")
+    stage = "bot_member"
     try:
-        bot_member = guild.me
+        bot_member = bot_member if bot_member is not None else guild.me
         if bot_member is None:
-            return "bot_member_unavailable"
+            return decision("UNKNOWN_PERMISSIONS", "bot_member_unavailable", stage)
+        member_guild = getattr(bot_member, "guild", None)
+        member_guild_id = getattr(member_guild, "id", None)
+        if isinstance(member_guild_id, int) and member_guild_id != guild_id:
+            return decision("UNKNOWN_PERMISSIONS", "bot_member_guild_mismatch", stage)
+        stage = "destination_bot_permissions"
         bot_permissions = destination.permissions_for(bot_member)
         for name in ("view_channel", "send_messages", "embed_links"):
             if getattr(bot_permissions, name, None) is not True:
-                return "destination_bot_" + name
+                return decision("DESTINATION_FORBIDDEN", "destination_bot_" + name, stage)
+        stage = "source_bot_permissions"
         if source.permissions_for(bot_member).view_channel is not True:
-            return "source_bot_view_channel"
+            return decision("UNKNOWN_PERMISSIONS", "source_bot_view_channel", stage)
+        stage = "everyone_permissions"
         everyone = guild.default_role
+        if everyone is None:
+            return decision("UNKNOWN_PERMISSIONS", "everyone_role_unavailable", stage)
         everyone_view = getattr(everyone.permissions, "view_channel", None)
         everyone_admin = getattr(everyone.permissions, "administrator", None)
         if not isinstance(everyone_view, bool) or not isinstance(everyone_admin, bool):
-            return "source_permissions_unavailable"
+            return decision("UNKNOWN_PERMISSIONS", "everyone_permissions_unavailable", stage)
+        stage = "role_profiles"
         profiles = _role_profiles(source, destination, guild)
+        known_profiles = _role_profiles(source, destination, guild, include_unknown=False)
+        missing_roles = _unknown_role_ids(source, destination, guild)
+        stage = "member_overwrites"
         source_members, destination_members = _member_overwrites(source), _member_overwrites(destination)
         # Administrator ignores all channel overwrites in both channels.
-        combinations = [()]
-        combinations.extend((profile,) for profile in profiles)
-        combinations.extend((first, second) for index, first in enumerate(profiles) for second in profiles[index + 1:])
+        def combinations_for(values):
+            yield ()
+            yield from ((profile,) for profile in values)
+            yield from ((first, second) for index, first in enumerate(values) for second in values[index + 1:])
+
+        stage = "everyone_overwrites"
         source_everyone = _view_override(source, everyone.id, role=True)
         destination_everyone = _view_override(destination, everyone.id, role=True)
 
@@ -351,12 +443,24 @@ def public_destination_reason(source: Any, destination: Any, guild_id: int) -> s
                 base = True
             return base if member_override is None else member_override
 
-        cases = {(everyone_admin or any(item[0] for item in combination), visible(combination),
-                  visible(combination, destination_side=True)) for combination in combinations}
+        def cases_for(values):
+            return {(everyone_admin or any(item[0] for item in combination), visible(combination),
+                     visible(combination, destination_side=True)) for combination in combinations_for(values)}
+
+        stage = "role_containment"
+        cases = cases_for(profiles)
+        known_cases = cases_for(known_profiles)
         for _, source_view, destination_view in cases:
             if destination_view and not source_view:
-                return "source_reader_scope_exceeded"
+                if missing_roles and not any(destination_view and not source_view for _, source_view, destination_view in known_cases):
+                    return decision("UNKNOWN_PERMISSIONS", "role_cache_incomplete", stage)
+                return decision("PRIVATE_VERIFIED", "source_reader_scope_exceeded", stage)
+        stage = "member_containment"
         for member_id in source_members.keys() | destination_members.keys():
+            if member_id in (getattr(guild, "owner_id", None), getattr(bot_member, "id", None)):
+                # Guild owners bypass overwrites. The bot was checked against
+                # both channels above, including when supplied by a REST fetch.
+                continue
             member = source_members.get(member_id) or destination_members.get(member_id)
             resolver = getattr(guild, "get_member", None)
             actual = resolver(member_id) if callable(resolver) else None
@@ -366,9 +470,9 @@ def public_destination_reason(source: Any, destination: Any, guild_id: int) -> s
                 destination_view = destination.permissions_for(actual).view_channel
                 source_view = source.permissions_for(actual).view_channel
                 if not isinstance(destination_view, bool) or not isinstance(source_view, bool):
-                    return "source_permissions_unavailable"
+                    return decision("UNKNOWN_PERMISSIONS", "member_permissions_unavailable", stage)
                 if destination_view and not source_view:
-                    return "source_member_scope_exceeded"
+                    return decision("PRIVATE_VERIFIED", "source_member_scope_exceeded", stage)
             else:
                 source_override = _view_override(source, member_id, role=False)
                 destination_override = _view_override(destination, member_id, role=False)
@@ -376,10 +480,25 @@ def public_destination_reason(source: Any, destination: Any, guild_id: int) -> s
                     source_view = source_view if administrator or source_override is None else source_override
                     destination_view = destination_view if administrator or destination_override is None else destination_override
                     if destination_view and not source_view:
-                        return "source_member_scope_exceeded"
-    except Exception:
+                        return decision("UNKNOWN_PERMISSIONS", "source_member_roles_unavailable", stage)
+    except Exception as error:
+        reason_code = error.reason_code if isinstance(error, _PermissionEvidenceError) else "permission_evaluation_failed"
+        return decision("UNKNOWN_PERMISSIONS", reason_code, stage, type(error).__name__)
+    return decision("PUBLIC_VERIFIED", "reader_containment_verified", "complete")
+
+
+def public_destination_reason(source: Any, destination: Any, guild_id: int) -> str | None:
+    """Compatibility wrapper; new delivery/diagnostics consume the decision."""
+    result = evaluate_public_destination(source, destination, guild_id)
+    if result.allowed:
+        return None
+    if result.reason_code == "source_member_roles_unavailable":
+        return "source_member_scope_exceeded"
+    if result.reason_code == "source_guild_mismatch":
+        return "destination_guild_mismatch"
+    if result.status == "UNKNOWN_PERMISSIONS" and result.reason_code not in {"bot_member_unavailable", "source_bot_view_channel"}:
         return "source_permissions_unavailable"
-    return None
+    return result.reason_code
 
 
 def _configured_ids(raw: str) -> tuple[frozenset[int], bool]:
@@ -400,6 +519,12 @@ class _DeleteAttempt:
     gateway_observed_at: datetime | None = None
 
 
+class _DeliveryPolicyChanged(Exception):
+    def __init__(self, reason_code: str):
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
 class DeletionAuditService:
     def __init__(self, routes: Mapping[int, int], channel_resolver: Callable[[int], Any], *,
                  include_content: bool | None = None, configured_admin_ids: Iterable[int] | None = None,
@@ -407,7 +532,10 @@ class DeletionAuditService:
                  delivery_limit: int = 4096, delivery_ttl: float = 600, concurrency: int = 4, pending_limit: int = 64,
                  wall_clock: Callable[[], datetime] | None = None, guild_resolver: Callable[[int], Any] | None = None,
                  enabled: bool | None = None, all_guild_channels: bool | None = None,
-                 channel_fetcher: Callable[[int], Any] | None = None):
+                 channel_fetcher: Callable[[int], Any] | None = None,
+                 bot_member_fetcher: Callable[[Any], Any] | None = None,
+                 retry_attempts: int = 2, max_retry_after: float = 30.0,
+                 retry_sleep: Callable[[float], Any] = asyncio.sleep):
         self.routes = dict(routes)
         self.channel_resolver = channel_resolver
         self.cache = cache if cache is not None else MessageAuditCache()
@@ -420,7 +548,15 @@ class DeletionAuditService:
         # The gateway channel cache can be incomplete even for configured
         # destination IDs. A bounded REST fallback avoids silent lost logs.
         self.channel_fetcher = channel_fetcher
+        self.bot_member_fetcher = bot_member_fetcher
+        self.retry_attempts = max(0, min(3, retry_attempts))
+        self.max_retry_after = max(0.0, min(60.0, max_retry_after))
+        self.retry_sleep = retry_sleep
         self._fetched_channels: OrderedDict[int, tuple[float, Any]] = OrderedDict()
+        self._channel_errors: OrderedDict[int, str] = OrderedDict()
+        self._bot_members: OrderedDict[int, tuple[float, Any]] = OrderedDict()
+        self._resolve_lock = asyncio.Lock()
+        self._member_lock = asyncio.Lock()
         self.admin_ids = None if configured_admin_ids is None else frozenset(configured_admin_ids)
         self.clock, self.delivery_limit, self.delivery_ttl = clock, max(1, delivery_limit), max(1, delivery_ttl)
         self.wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
@@ -429,12 +565,21 @@ class DeletionAuditService:
         self._inflight: set[tuple[int, int]] = set()
         self.pending_limit = max(1, pending_limit)
         self._attempts: dict[tuple[int, int], _DeleteAttempt] = {}
+        # Overflow correlation stores only IDs/timestamps, not extra bodies.
+        self._deleting: dict[tuple[int, int], datetime | None] = {}
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
         self._stats: dict[int, dict[str, Any]] = {}
 
     def _stat(self, guild_id: int) -> dict[str, Any]:
-        return self._stats.setdefault(guild_id, {"sent": 0, "failures": 0, "last_success": None,
-                                                  "last_reason": None, "reasons": Counter()})
+        return self._stats.setdefault(guild_id, {
+            "sent": 0, "failures": 0, "sent_full": 0, "sent_metadata_only": 0,
+            "sent_restricted": 0, "failed": 0, "skipped": 0, "dropped": 0,
+            "last_success": None, "last_full": None, "last_test": None,
+            "test_result": "not_tested", "last_reason": None, "last_stage": None,
+            "last_decision": None, "reasons": Counter(),
+            "public_deletion_status": "check_required", "latest_public_outcome": None,
+            "last_permission_reason": None, "last_permission_stage": None,
+        })
 
     def _record(self, guild_id: int, reason: str, *, failure: bool = False) -> None:
         stats = self._stat(guild_id)
@@ -442,6 +587,44 @@ class DeletionAuditService:
         stats["reasons"][reason] += 1
         if failure:
             stats["failures"] += 1
+            stats["failed"] += 1
+
+    def _event(self, guild_id: int, message_id: int, channel_id: int, *, result: str,
+               reason: str, stage: str, destination_id: int | None = None,
+               error_type: str | None = None) -> None:
+        """Only fixed codes, numeric identifiers and exception types enter logs."""
+        self._record(guild_id, reason, failure=result == "failed")
+        stats = self._stat(guild_id)
+        stats["last_stage"] = stage
+        if result in {"sent_full", "sent_metadata_only", "sent_restricted", "skipped"}:
+            stats[result] += 1
+        if result == "sent_full":
+            stats["sent"] += 1  # Legacy success means FULL audit only.
+            stats["last_full"] = stats["last_success"] = self._observation_time()
+        if result == "failed" or (result == "sent_restricted" and reason == "unknown_permissions") or reason == "burst_limit":
+            stats["public_deletion_status"] = "failed"
+            stats["latest_public_outcome"] = result
+        elif result in {"sent_full", "sent_metadata_only"}:
+            stats["public_deletion_status"] = "confirmed" if result == "sent_full" else "check_required"
+            stats["latest_public_outcome"] = result
+        log = LOGGER.warning if result == "failed" else LOGGER.info
+        log("event=deletion_audit result=%s reason=%s stage=%s guild_id=%s message_id=%s "
+            "source_channel_id=%s destination_channel_id=%s exception_type=%s",
+            result, reason, stage, guild_id, message_id, channel_id, destination_id, error_type or "none")
+
+    def _known_channel(self, channel_id: int) -> Any:
+        channel = self._resolve_cached(channel_id)
+        if channel is not None:
+            return channel
+        cached = self._fetched_channels.get(channel_id)
+        return cached[1] if cached is not None and self.clock() - cached[0] < 30 else None
+
+    def invalidate_channel(self, channel_id: int) -> None:
+        """Invalidate bounded REST evidence, including synced category children."""
+        # At most 64 entries. Clearing them also covers copied category
+        # overwrites, channel moves and destinations whose readership changed.
+        self._fetched_channels.clear()
+        self._channel_errors.clear()
 
     def _resolve_cached(self, channel_id: int) -> Any:
         try:
@@ -451,35 +634,72 @@ class DeletionAuditService:
                     channel.close()
                 return None
             return channel
-        except Exception:
+        except Exception as error:
+            LOGGER.warning("event=deletion_audit_channel_resolve result=failed reason=cache_resolver_failed "
+                           "stage=cache_resolve channel_id=%s exception_type=%s", channel_id, type(error).__name__)
             return None
 
     async def _resolve_channel(self, channel_id: int) -> Any:
-        channel = self._resolve_cached(channel_id)
-        if channel is not None:
-            return channel
-        previous = self._fetched_channels.get(channel_id)
-        if previous is not None and self.clock() - previous[0] < 30:
-            return previous[1]
-        if self.channel_fetcher is None:
-            return None
-        try:
-            fetched = self.channel_fetcher(channel_id)
-            if inspect.isawaitable(fetched):
-                fetched = await fetched
-            if fetched is not None and getattr(fetched, "id", None) != channel_id:
-                fetched = None
-        except Exception as exc:
-            LOGGER.warning("event=deletion_audit_channel_resolve result=failed reason=%s channel_id=%s",
-                           self._delivery_error(exc), channel_id)
+        # One REST lookup at a time, with a second cache check: a RAW burst
+        # must not fetch the same missing channel once per message.
+        async with self._resolve_lock:
+            channel = self._known_channel(channel_id)
+            if channel is not None:
+                return channel
+            previous = self._fetched_channels.get(channel_id)
+            if previous is not None and self.clock() - previous[0] < 30:
+                return previous[1]
+            if self.channel_fetcher is None:
+                return None
             fetched = None
-        # Cache success and failure for a short interval to avoid a REST
-        # request per message when a channel is inaccessible or missing.
-        self._fetched_channels[channel_id] = (self.clock(), fetched)
-        self._fetched_channels.move_to_end(channel_id)
-        while len(self._fetched_channels) > 64:
-            self._fetched_channels.popitem(last=False)
-        return fetched
+            try:
+                fetched = self.channel_fetcher(channel_id)
+                if inspect.isawaitable(fetched):
+                    fetched = await fetched
+                if fetched is not None and getattr(fetched, "id", None) != channel_id:
+                    self._channel_errors[channel_id] = "channel_id_mismatch"
+                    fetched = None
+                else:
+                    self._channel_errors.pop(channel_id, None)
+            except Exception as exc:
+                self._channel_errors[channel_id] = self._delivery_error(exc)
+                LOGGER.warning("event=deletion_audit_channel_resolve result=failed reason=%s stage=channel_fetch "
+                               "channel_id=%s exception_type=%s", self._delivery_error(exc), channel_id, type(exc).__name__)
+            # Cache positive/negative results briefly; never persist content.
+            self._fetched_channels[channel_id] = (self.clock(), fetched)
+            self._fetched_channels.move_to_end(channel_id)
+            while len(self._fetched_channels) > 64:
+                expired_id, _ = self._fetched_channels.popitem(last=False)
+                self._channel_errors.pop(expired_id, None)
+            return fetched
+
+    async def _bot_member(self, guild: Any) -> Any:
+        if guild is None:
+            return None
+        member = getattr(guild, "me", None)
+        if member is not None:
+            return member
+        async with self._member_lock:
+            previous = self._bot_members.get(guild.id)
+            if previous is not None and self.clock() - previous[0] < 30:
+                return previous[1]
+            member = None
+            if self.bot_member_fetcher is not None:
+                try:
+                    member = self.bot_member_fetcher(guild)
+                    if inspect.isawaitable(member):
+                        member = await member
+                    if getattr(getattr(member, "guild", guild), "id", None) != guild.id:
+                        member = None
+                except Exception as exc:
+                    LOGGER.warning("event=deletion_audit_member_resolve result=failed reason=bot_member_fetch_failed "
+                                   "stage=bot_member_fetch guild_id=%s exception_type=%s", guild.id, type(exc).__name__)
+                    self._record(guild.id, "bot_member_fetch_failed")
+            self._bot_members[guild.id] = (self.clock(), member)
+            self._bot_members.move_to_end(guild.id)
+            while len(self._bot_members) > 16:
+                self._bot_members.popitem(last=False)
+            return member
 
     async def probe_configured_destinations(self) -> dict[int, str]:
         """Startup diagnostics for the EXISTING hard-coded record channels.
@@ -496,7 +716,7 @@ class DeletionAuditService:
             else:
                 try:
                     guild = channel.guild
-                    bot_member = guild.me
+                    bot_member = await self._bot_member(guild)
                     perms = channel.permissions_for(bot_member) if bot_member is not None else None
                     missing = next((name for name in ("view_channel", "send_messages", "embed_links")
                                     if getattr(perms, name, None) is not True), None)
@@ -510,8 +730,6 @@ class DeletionAuditService:
 
     async def _async_destination_ids(self, guild_id: int) -> set[int]:
         ids = self._destination_ids(guild_id)
-        if ids:
-            return ids
         for destination_id in set(self.routes.values()):
             destination = await self._resolve_channel(destination_id)
             if (getattr(destination, "id", None) == destination_id and
@@ -551,10 +769,20 @@ class DeletionAuditService:
         destination_id = self.destination_for(guild_id, channel_id)
         if destination_id is None:
             return False
-        destination = self._resolve_cached(destination_id)
+        destination = self._known_channel(destination_id)
         if getattr(destination, "id", None) != destination_id:
             return False
-        return public_destination_reason(channel, destination, guild_id) is None
+        previous = self._bot_members.get(guild_id)
+        member = previous[1] if previous is not None and self.clock() - previous[0] < 30 else None
+        return evaluate_public_destination(channel, destination, guild_id, bot_member=member).allowed
+
+    async def refresh_diagnostics(self, guild_or_id: Any) -> dict[str, Any]:
+        guild_id = getattr(guild_or_id, "id", guild_or_id)
+        ids = await self._async_destination_ids(guild_id)
+        for destination_id in ids:
+            destination = await self._resolve_channel(destination_id)
+            await self._bot_member(getattr(destination, "guild", None))
+        return self.diagnostics(guild_or_id)
 
     def diagnostics(self, guild_or_id: Any) -> dict[str, Any]:
         """Return aggregate metadata only, suitable for delegated administrators."""
@@ -569,11 +797,16 @@ class DeletionAuditService:
                         getattr(candidate, "id", None) != destination_id):
                     reason = "destination_id_mismatch"
                     break
-        destination = self._resolve_cached(next(iter(destinations))) if len(destinations) == 1 else None
+        destination_id = next(iter(destinations)) if len(destinations) == 1 else None
+        destination = self._known_channel(destination_id) if destination_id is not None else None
         permissions = None
         if destination is not None:
             try:
-                permissions = destination.permissions_for(destination.guild.me)
+                member = destination.guild.me
+                previous = self._bot_members.get(guild_id)
+                if member is None and previous is not None and self.clock() - previous[0] < 30:
+                    member = previous[1]
+                permissions = destination.permissions_for(member) if member is not None else None
                 for name in ("view_channel", "send_messages", "embed_links"):
                     if getattr(permissions, name, None) is not True:
                         reason = "destination_bot_" + name
@@ -595,6 +828,9 @@ class DeletionAuditService:
         stats = self._stat(guild_id)
         return {"result": "ready" if reason == "ready" else "failed", "reason": reason,
                 "destination_identified": len(destinations) == 1, "destination_count": len(destinations),
+                "destination_ids": tuple(sorted(destinations)),
+                "destination_resolution": ("cache" if destination_id is not None and self._resolve_cached(destination_id) is not None
+                                           else "rest" if destination is not None else "failed"),
                 "bot_view_channel": getattr(permissions, "view_channel", False) is True,
                 "bot_send_messages": getattr(permissions, "send_messages", False) is True,
                 "bot_embed_links": getattr(permissions, "embed_links", False) is True,
@@ -606,6 +842,13 @@ class DeletionAuditService:
                                            for source_id in self.extra_sources),
                 "eligible_source_count": tracked, "excluded_source_count": max(0, len(channels) - tracked),
                 "sent": stats["sent"], "failures": stats["failures"],
+                **{name: stats[name] for name in ("sent_full", "sent_metadata_only", "sent_restricted", "failed", "skipped", "dropped")},
+                "last_full": stats["last_full"], "last_full_success": stats["last_full"],
+                "last_test": stats["last_test"], "test_result": stats["test_result"],
+                "last_stage": stats["last_stage"], "last_decision": stats["last_decision"],
+                "last_permission_reason": stats["last_permission_reason"], "last_permission_stage": stats["last_permission_stage"],
+                "public_deletion_status": stats["public_deletion_status"],
+                "latest_public_outcome": stats["latest_public_outcome"],
                 "last_success": stats["last_success"], "last_reason": stats["last_reason"],
                 "reason_counts": dict(stats["reasons"])}
 
@@ -615,38 +858,52 @@ class DeletionAuditService:
             guild_or_id = guild_or_id.guild
         status = self.diagnostics(guild_or_id)
         guild_id = getattr(guild_or_id, "id", guild_or_id)
+
+        def result(reason: str, *, sent: bool = False) -> dict[str, Any]:
+            stats = self._stat(guild_id)
+            stats["test_result"] = reason
+            stats["last_test"] = self._observation_time()
+            return {**self.diagnostics(guild_or_id), "result": "ready" if sent else "failed",
+                    "reason": reason, "deletion_pipeline_verified": False}
+
         if not self.enabled:
-            return status
+            return result("disabled")
         destination_ids = await self._async_destination_ids(guild_id)
         if len(destination_ids) != 1:
-            return {**status, "result": "failed", "reason": "destination_ambiguous" if destination_ids else "destination_missing"}
+            reason = "destination_ambiguous" if destination_ids else status["reason"]
+            if reason == "ready":
+                reason = "destination_missing"
+            return result(reason)
         destination_id = next(iter(destination_ids))
         destination = await self._resolve_channel(destination_id)
         if getattr(destination, "id", None) != destination_id:
-            return {**status, "result": "failed", "reason": "destination_id_mismatch"}
+            return result("destination_id_mismatch")
         if getattr(getattr(destination, "guild", None), "id", None) != guild_id:
-            return {**status, "result": "failed", "reason": "destination_guild_mismatch"}
+            return result("destination_guild_mismatch")
         try:
-            bot_member = destination.guild.me
+            bot_member = await self._bot_member(destination.guild)
+            if bot_member is None:
+                return result("bot_member_unavailable")
             perms = destination.permissions_for(bot_member)
             for required in ("view_channel", "send_messages", "embed_links"):
                 if getattr(perms, required, None) is not True:
-                    return {**status, "result": "failed", "reason": "destination_bot_" + required}
+                    return result("destination_bot_" + required)
         except Exception:
-            return {**status, "result": "failed", "reason": "destination_permissions_unavailable"}
+            return result("destination_permissions_unavailable")
         embed = discord.Embed(title="🧪 삭제 로그 전송 테스트", description=(
             "기존 공용 기록 채널 전송 확인입니다.\n실제 사용자 원문·파일은 포함하지 않습니다.\n"
+            "실제 삭제 파이프라인은 별도 일반 삭제·자동 검열로 확인해야 합니다.\n"
             f"확인 시각: {self._observation_time().astimezone(KST):%Y-%m-%d %H:%M:%S} KST"), colour=0xED4245)
         try:
             await destination.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-            self._stat(guild_id)["last_success"] = self._observation_time()
             self._record(guild_id, "test_sent")
-            return {**status, "result": "ready", "reason": "test_sent"}
+            return result("test_sent", sent=True)
         except Exception as error:
             reason = self._delivery_error(error)
-            self._record(guild_id, reason, failure=True)
+            self._stat(guild_id)["test_result"] = reason
+            self._record(guild_id, reason)
             LOGGER.warning("event=deletion_audit_test result=failed reason=%s guild_id=%s", reason, guild_id)
-            return {**status, "result": "failed", "reason": reason}
+            return result(reason)
 
     @staticmethod
     def _delivery_error(error: Exception) -> str:
@@ -668,23 +925,36 @@ class DeletionAuditService:
     def _routed(self, guild_id: int, channel_id: int) -> bool:
         if not self.enabled or not guild_id or not channel_id or channel_id in self.routes.values():
             return False
-        if self.destination_for(guild_id, channel_id) is not None:
+        if channel_id in self.routes:
             return True
-        # Explicit sources can proceed even if the destination is missing
-        # from the gateway cache. New channels still require a known source
-        # channel, preventing noisy queries in unrelated/unknown guilds.
+        # Explicit and all-guild sources proceed to bounded async resolution
+        # even when source/destination gateway caches have not been populated.
         if channel_id in self.extra_sources:
             return True
         if self.all_guild_channels:
-            source = self._resolve_cached(channel_id)
-            return (getattr(source, "id", None) == channel_id and
-                    getattr(getattr(source, "guild", None), "id", None) == guild_id)
+            # Admission is separate from async resolution and privacy proof.
+            # RAW events and on_message snapshots must survive cold caches.
+            return True
         return False
+
+    def _admit(self, guild_id: int, channel_id: int, message_id: int, *, bot: bool = False,
+               deletion: bool = False) -> bool:
+        if bot or not self._routed(guild_id, channel_id):
+            reason = ("ignored_log_channel" if channel_id in self.routes.values() else
+                      "ignored_bot_message" if bot else "disabled" if not self.enabled else "not_routed")
+            if deletion:
+                self._event(guild_id, message_id, channel_id, result="skipped", reason=reason, stage="admission")
+            else:
+                # Ignored new messages must not replace the most recent actual
+                # deletion reason or inflate the deletion outcome counters.
+                self._stat(guild_id)["reasons"][reason] += 1
+            return False
+        return True
 
     def remember(self, message: Any) -> MessageAuditSnapshot | None:
         guild_id = getattr(getattr(message, "guild", None), "id", 0)
         channel_id = getattr(getattr(message, "channel", None), "id", 0)
-        if not self._routed(guild_id, channel_id) or getattr(getattr(message, "author", None), "bot", False):
+        if not self._admit(guild_id, channel_id, getattr(message, "id", 0), bot=getattr(getattr(message, "author", None), "bot", False)):
             return None
         try:
             previous = self.cache.get(guild_id, getattr(message, "id", 0))
@@ -707,8 +977,9 @@ class DeletionAuditService:
                 attempt.snapshot = snapshot
                 self.cache.remember(snapshot)
             return snapshot
-        except Exception:
-            LOGGER.warning("event=deletion_audit_snapshot result=failed guild_id=%s message_id=%s", guild_id, getattr(message, "id", 0))
+        except Exception as error:
+            self._event(guild_id, getattr(message, "id", 0), channel_id, result="failed",
+                        reason="snapshot_capture_failed", stage="snapshot", error_type=type(error).__name__)
             return None
 
     def on_raw_message_edit(self, payload: Any) -> None:
@@ -767,7 +1038,7 @@ class DeletionAuditService:
         if key in self._deleted:
             self._record(key[0], "duplicate_delete")
             return False
-        if key in self._attempts:
+        if key in self._deleting:
             LOGGER.info("event=deletion_audit result=skipped reason=delete_pending guild_id=%s message_id=%s", *key)
             return False
         snapshot = self.remember(message)
@@ -787,19 +1058,44 @@ class DeletionAuditService:
         elif snapshot is not None:
             # Enforcement still proceeds when audit capacity is full, but no
             # unconfirmed bot attribution may leak into a later gateway event.
+            self._event(*key, snapshot.channel_id, result="skipped", reason="attempt_capacity", stage="delete")
+        correlated = snapshot is not None and len(self._deleting) < self.delivery_limit
+        if correlated:
+            self._deleting[key] = None
+        elif snapshot is not None:
+            self._stat(key[0])["dropped"] += 1
+            self._event(*key, snapshot.channel_id, result="failed", reason="delete_correlation_limit", stage="delete")
             self.cache.remember(original)
+            self._attempts.pop(key, None)
+            attempt = None
             snapshot = None
-            LOGGER.warning("event=deletion_audit result=skipped reason=burst_limit guild_id=%s message_id=%s", *key)
         # Snapshot and reason exist before the HTTP await, since a gateway
         # deletion can arrive before Discord's HTTP response is processed.
         try:
             deleted = await delete_message(message, reason=_code(reason), logger=LOGGER)
             observed_at = self._observation_time()
         except BaseException:
+            self._deleting.pop(key, None)
             if attempt is not None:
                 self._attempts.pop(key, None)
                 self.cache.remember(attempt.original)
+            elif original is not None:
+                current = self.cache.get(*key) or original
+                self.cache.remember(replace(current, reason=original.reason, delete_origin=original.delete_origin))
             raise
+        overflow_observed_at = self._deleting.pop(key, None)
+        if attempt is None and snapshot is not None:
+            # A lightweight overflow reservation suppresses premature gateway
+            # publication. Keep any newer cached edit/tombstone, then restore
+            # attribution only after the delete API confirms success.
+            current = self.cache.get(*key) or snapshot
+            if deleted:
+                snapshot = replace(current, reason=snapshot.reason, delete_origin="bot", trigger=snapshot.trigger)
+            else:
+                current = replace(current, reason=original.reason, delete_origin=original.delete_origin)
+                self.cache.remember(current)
+                if overflow_observed_at is not None:
+                    await self._confirmed(current, observed_at=overflow_observed_at)
         if attempt is not None:
             self._attempts.pop(key, None)
             snapshot = attempt.snapshot
@@ -813,14 +1109,14 @@ class DeletionAuditService:
                 self._deleted.popitem(last=False)
         if deleted and snapshot is not None:
             self.cache.remember(snapshot)
-            await self._publish(snapshot, deleted_at=(attempt.gateway_observed_at if attempt is not None else None) or observed_at)
+            await self._publish(snapshot, deleted_at=(attempt.gateway_observed_at if attempt is not None else overflow_observed_at) or observed_at)
         return deleted
 
     async def on_message_delete(self, message: Any, *, _observed_at: datetime | None = None) -> None:
         observed_at = _observed_at or self._observation_time()
         guild_id = getattr(getattr(message, "guild", None), "id", 0)
         channel_id = getattr(getattr(message, "channel", None), "id", 0)
-        if not self._routed(guild_id, channel_id) or getattr(getattr(message, "author", None), "bot", False):
+        if not self._admit(guild_id, channel_id, getattr(message, "id", 0), bot=getattr(getattr(message, "author", None), "bot", False), deletion=True):
             return
         snapshot = self.cache.get(guild_id, getattr(message, "id", 0)) or self.remember(message)
         if snapshot is not None:
@@ -834,10 +1130,11 @@ class DeletionAuditService:
             return
         guild_id, channel_id = getattr(payload, "guild_id", 0), getattr(payload, "channel_id", 0)
         message_id = getattr(payload, "message_id", 0)
-        if not self._routed(guild_id, channel_id) or not message_id:
+        if not message_id or not self._admit(guild_id, channel_id, message_id, deletion=True):
             return
         snapshot = self.cache.get(guild_id, message_id)
         if snapshot is None:
+            self._event(guild_id, message_id, channel_id, result="observed", reason="snapshot_not_found", stage="snapshot")
             snapshot = capture_message_snapshot(SimpleNamespace(
                 id=message_id, guild=SimpleNamespace(id=guild_id, name=""),
                 channel=SimpleNamespace(id=channel_id, name=""),
@@ -852,9 +1149,58 @@ class DeletionAuditService:
             if attempt.gateway_observed_at is None:
                 attempt.gateway_observed_at = observed_at
             return
+        key = (snapshot.guild_id, snapshot.message_id)
+        if key in self._deleting:
+            if self._deleting[key] is None:
+                self._deleting[key] = observed_at
+            return
         if not snapshot.reason.code and snapshot.content_available:
             snapshot = replace(snapshot, reason=replace(snapshot.reason, code="external"), delete_origin="external")
         await self._publish(snapshot, deleted_at=observed_at)
+
+    def _retry_delay(self, error: Exception, attempt: int) -> float | None:
+        status = getattr(error, "status", None)
+        if status == 429:
+            delay = getattr(error, "retry_after", None)
+            if delay is None:
+                headers = getattr(getattr(error, "response", None), "headers", {}) or {}
+                delay = headers.get("Retry-After")
+            try:
+                delay = float(delay)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return delay if math.isfinite(delay) and 0 <= delay <= self.max_retry_after else None
+        if status in (500, 502, 503, 504) or isinstance(error, (TimeoutError, asyncio.TimeoutError, OSError)):
+            return min(float(2 ** attempt), self.max_retry_after)
+        return None
+
+    async def _send_with_retry(self, channel: Any, embed: discord.Embed, snapshot: MessageAuditSnapshot) -> None:
+        for attempt in range(self.retry_attempts + 1):
+            try:
+                if attempt:
+                    # Retry-After may span an ACL update. Recheck readership
+                    # before resending a card containing any source metadata.
+                    current = await self._resolve_channel(channel.id)
+                    source = await self._resolve_channel(snapshot.channel_id)
+                    member = await self._bot_member(getattr(current, "guild", None))
+                    decision = evaluate_public_destination(source, current, snapshot.guild_id, bot_member=member)
+                    if not decision.allowed and embed.fields:
+                        raise _DeliveryPolicyChanged(decision.reason_code)
+                    if getattr(getattr(current, "guild", None), "id", None) != snapshot.guild_id:
+                        raise _DeliveryPolicyChanged("destination_guild_mismatch")
+                    channel = current
+                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                return
+            except Exception as error:
+                if getattr(error, "status", None) == 429:
+                    self._record(snapshot.guild_id, "rate_limited")
+                delay = self._retry_delay(error, attempt)
+                if attempt >= self.retry_attempts or delay is None:
+                    raise
+                self._event(snapshot.guild_id, snapshot.message_id, snapshot.channel_id, result="retrying",
+                            reason="retry_scheduled", stage="send", destination_id=channel.id,
+                            error_type=type(error).__name__)
+                await self.retry_sleep(delay)
 
     async def on_raw_bulk_message_delete(self, payload: Any) -> None:
         observed_at = self._observation_time()
@@ -881,13 +1227,20 @@ class DeletionAuditService:
             if now - delivered_at >= self.delivery_ttl:
                 self._delivered.pop(existing, None)
         if key in self._delivered or key in self._inflight:
-            self._record(snapshot.guild_id, "duplicate")
+            self._event(*key, snapshot.channel_id, result="skipped", reason="duplicate", stage="deduplicate")
             return False
         if len(self._inflight) >= self.pending_limit:
-            LOGGER.warning("event=deletion_audit result=skipped reason=burst_limit guild_id=%s message_id=%s", *key)
-            self._record(snapshot.guild_id, "burst_limit", failure=True)
+            self._stat(snapshot.guild_id)["dropped"] += 1
+            self._event(*key, snapshot.channel_id, result="skipped", reason="burst_limit", stage="queue")
             return False
         self._inflight.add(key)
+        destination_id, stage = None, "route"
+
+        def fail(reason: str, *, error_type: str | None = None) -> bool:
+            self._event(*key, snapshot.channel_id, result="failed", reason=reason, stage=stage,
+                        destination_id=destination_id, error_type=error_type)
+            return False
+
         try:
             async with self._semaphore:
                 destination_id = self.destination_for(snapshot.guild_id, snapshot.channel_id)
@@ -896,69 +1249,72 @@ class DeletionAuditService:
                     if len(candidates) == 1:
                         destination_id = next(iter(candidates))
                     elif len(candidates) > 1:
-                        self._record(snapshot.guild_id, "destination_ambiguous", failure=True)
-                        return False
+                        return fail("destination_ambiguous")
                 if destination_id is None:
-                    self._record(snapshot.guild_id, "destination_missing", failure=True)
-                    return False
+                    return fail("destination_missing")
+                stage = "destination_resolve"
                 # Never trust a channel returned for the wrong ID or guild.
                 cached_destination = self._resolve_cached(destination_id)
                 if cached_destination is not None and getattr(cached_destination, "id", None) != destination_id:
-                    reason = "destination_id_mismatch"
-                    channel = cached_destination
+                    return fail("destination_id_mismatch")
                 else:
                     channel = await self._resolve_channel(destination_id)
-                    reason = None
+                if channel is None:
+                    error = self._channel_errors.get(destination_id)
+                    return fail("destination_forbidden" if error == "delivery_forbidden" else
+                                "destination_id_mismatch" if error == "channel_id_mismatch" else "destination_missing")
+                if getattr(getattr(channel, "guild", None), "id", None) != snapshot.guild_id:
+                    return fail("destination_guild_mismatch")
+                stage = "source_resolve"
                 cached_source = self._resolve_cached(snapshot.channel_id)
                 if cached_source is not None and getattr(cached_source, "id", None) != snapshot.channel_id:
-                    source, reason = cached_source, "source_id_mismatch"
+                    return fail("source_id_mismatch")
                 else:
                     source = await self._resolve_channel(snapshot.channel_id)
-                if reason is None:
-                    reason = public_destination_reason(source, channel, snapshot.guild_id)
-                if (source is not None and getattr(getattr(source, "guild", None), "id", None) != snapshot.guild_id):
-                    reason = "source_guild_mismatch"
-                if channel is None:
-                    reason = "destination_unavailable"
-                elif getattr(getattr(channel, "guild", None), "id", None) != snapshot.guild_id:
-                    reason = "destination_guild_mismatch"
-                # A missing or inaccessible destination remains a hard
-                # failure. Source scope mismatches, however, get an entirely
-                # anonymous receipt instead of disappearing silently.
-                restricted = reason in {
-                    "source_reader_scope_exceeded", "source_member_scope_exceeded",
-                    "source_permissions_unavailable", "source_not_text_channel",
-                }
-                if reason and not restricted:
-                    LOGGER.warning("event=deletion_audit result=skipped reason=%s guild_id=%s message_id=%s", reason, *key)
-                    self._record(snapshot.guild_id, reason, failure=True)
-                    return False
-                if restricted:
-                    self._record(snapshot.guild_id, "restricted_" + reason)
-                    embed = build_restricted_deletion_embed(deleted_at=deleted_at)
+                if source is None:
+                    return fail("source_not_found")
+                if getattr(getattr(source, "guild", None), "id", None) != snapshot.guild_id:
+                    return fail("source_guild_mismatch")
+                member = await self._bot_member(getattr(channel, "guild", None))
+                decision = evaluate_public_destination(source, channel, snapshot.guild_id, bot_member=member)
+                stage = decision.stage
+                self._stat(snapshot.guild_id)["last_decision"] = decision.status
+                self._stat(snapshot.guild_id)["last_permission_reason"] = decision.reason_code
+                self._stat(snapshot.guild_id)["last_permission_stage"] = decision.stage
+                if not decision.allowed and decision.status not in {"PRIVATE_VERIFIED", "UNKNOWN_PERMISSIONS"}:
+                    return fail(decision.reason_code, error_type=decision.exception_type)
+                if not decision.allowed:
+                    reason = "private_source" if decision.status == "PRIVATE_VERIFIED" else "unknown_permissions"
+                    self._event(*key, snapshot.channel_id, result="restricted", reason=decision.reason_code,
+                                stage=decision.stage, destination_id=destination_id, error_type=decision.exception_type)
+                    outcome = "sent_restricted"
                 else:
-                    if not snapshot.content_available:
-                        self._record(snapshot.guild_id, "snapshot_unavailable")
+                    reason = ("content_disabled" if not self.include_content else "snapshot_stale" if "raw_edit" in snapshot.truncated_fields
+                              and not snapshot.content_available else "snapshot_not_found" if not snapshot.content_available else "public_verified")
+                    outcome = "sent_full" if snapshot.content_available and self.include_content else "sent_metadata_only"
+                stage = "embed"
+                if outcome == "sent_restricted":
+                    embed = build_restricted_deletion_embed(deleted_at=deleted_at, reason_code=reason)
+                else:
                     embed = build_deletion_embed(snapshot, deleted_at=deleted_at, include_content=self.include_content)
-                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                stage = "send"
+                await self._send_with_retry(channel, embed, snapshot)
                 self._delivered[key] = self.clock()
                 self._delivered.move_to_end(key)
                 while len(self._delivered) > self.delivery_limit:
                     self._delivered.popitem(last=False)
-                stats = self._stat(snapshot.guild_id)
-                stats["sent"] += 1
-                stats["last_success"] = self._observation_time()
-                self._record(snapshot.guild_id, "sent")
-                LOGGER.info("event=deletion_audit result=sent reason=%s guild_id=%s message_id=%s", _code(snapshot.reason.code), *key)
+                self._event(*key, snapshot.channel_id, result=outcome, reason=reason,
+                            stage="complete", destination_id=destination_id)
                 return True
         except Exception as error:
             # No repr/str/traceback: Discord exceptions may contain message data.
-            reason = self._delivery_error(error)
-            self._record(snapshot.guild_id, reason, failure=True)
-            LOGGER.warning("event=deletion_audit result=failed reason=%s guild_id=%s message_id=%s", reason, *key)
-            return False
+            if isinstance(error, _DeliveryPolicyChanged):
+                stage = "retry_permissions"
+                return fail(error.reason_code, error_type=type(error).__name__)
+            return fail("embed_failed" if stage == "embed" else self._delivery_error(error), error_type=type(error).__name__)
         finally:
             self._inflight.discard(key)
 
 
-__all__ = ["DeletionAuditService", "build_deletion_embed", "private_destination_reason", "public_destination_reason"]
+__all__ = ["DeletionAuditService", "PublicDestinationDecision", "evaluate_public_destination",
+           "build_deletion_embed", "build_restricted_deletion_embed", "private_destination_reason", "public_destination_reason"]

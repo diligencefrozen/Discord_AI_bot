@@ -397,7 +397,8 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
         self.channels.pop(11)
         await self.service.on_raw_message_delete(raw())
         self.destination.send.assert_not_awaited()
-        self.assertEqual(self.service.diagnostics(1)["last_reason"], "source_not_text_channel")
+        self.assertEqual(self.service.diagnostics(1)["last_reason"], "source_not_found")
+        self.assertEqual(self.service.diagnostics(1)["failed"], 1)
 
     async def test_resolver_id_mismatch_cannot_send_to_another_same_guild_channel(self):
         self.destination.id = 999
@@ -412,13 +413,22 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
         self.destination.send.assert_not_awaited()
         self.assertEqual(self.service.diagnostics(1)["last_reason"], "source_id_mismatch")
 
-    async def test_private_cached_and_raw_deletions_publish_nothing(self):
+    async def test_private_cached_and_raw_deletions_publish_only_anonymous_receipts(self):
         self.source.overwrites[self.source.guild.default_role] = discord.PermissionOverwrite(view_channel=False)
         await self.service.on_message_delete(message("private-sensitive-content"))
         await self.service.on_raw_message_delete(raw(101))
-        self.destination.send.assert_not_awaited()
+        self.assertEqual(self.destination.send.await_count, 2)
+        for call in self.destination.send.call_args_list:
+            embed = call.kwargs["embed"]
+            self.assertIn("열람 범위 제한", embed.title)
+            self.assertFalse(embed.fields)
+            for secret in ("private-sensitive-content", "channel-11", "ID 50", "채널 ID 11"):
+                self.assertNotIn(secret, str(embed.to_dict()))
         status = self.service.diagnostics(1)
-        self.assertEqual(status["last_reason"], "source_reader_scope_exceeded")
+        self.assertEqual(status["last_reason"], "private_source")
+        self.assertEqual(status["sent_restricted"], 2)
+        self.assertEqual(status["sent_full"], 0)
+        self.assertIsNone(status["last_full"])
         self.assertNotIn("private-sensitive-content", str(status))
         self.assertNotIn("channel-11", str(status))
 
@@ -429,7 +439,11 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
         embed = self.destination.send.call_args.kwargs["embed"]
         self.assertIn("테스트", embed.title)
         self.assertEqual(self.destination.send.call_args.kwargs["allowed_mentions"].to_dict()["parse"], [])
-        self.assertIsNotNone(self.service.diagnostics(1)["last_success"])
+        status = self.service.diagnostics(1)
+        self.assertIsNotNone(status["last_test"])
+        self.assertIsNone(status["last_success"])
+        self.assertEqual(status["sent_full"], 0)
+        self.assertFalse(result["deletion_pipeline_verified"])
 
     async def test_test_card_missing_permissions_fails_without_send(self):
         self.destination.permissions_for.side_effect = None
@@ -620,7 +634,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.on_raw_message_delete(raw())
         embed = self.channel.send.call_args.kwargs["embed"]
         self.assertNotIn("봇 직접 삭제", embed.description)
-        self.assertIn("외부 삭제", embed.description)
+        self.assertIn("일반 삭제", embed.description)
         self.assertNotIn("탐지 금칙어", field(embed, "탐지 사유"))
 
     async def test_gateway_before_failed_http_is_confirmed_external_and_never_false_bot_success(self):
@@ -656,13 +670,14 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.on_raw_message_delete(raw())
         await self.service.on_raw_message_delete(raw(101))
         first, second = (call.kwargs["embed"] for call in self.channel.send.call_args_list)
-        self.assertIn("외부 삭제", first.description)
-        self.assertIn("실행자 확인 불가", first.description)
+        self.assertIn("일반 삭제", first.description)
+        self.assertIn("삭제자 확인 불가", first.description)
         self.assertEqual(field(first, "원문"), "시321133발")
         self.assertIn("원문 확인 불가", field(second, "원문"))
         self.assertIn("추정하지 않습니다", field(second, "탐지 사유"))
 
     async def test_bots_dm_unrouted_and_log_channel_recursion_are_ignored(self):
+        self.service.all_guild_channels = False
         targets = [message() for _ in range(4)]
         targets[0].author.bot = True
         targets[1].guild = None
@@ -764,7 +779,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.service.delete(second, reason="profanity"))
         second.delete.assert_awaited_once()
         self.assertEqual(len(self.service._attempts), 1)
-        self.assertNotEqual(self.service.cache.get(1, 101).delete_origin, "bot")
+        self.assertEqual(self.service.cache.get(1, 101).delete_origin, "bot")
+        self.assertEqual(field(self.channel.send.call_args.kwargs["embed"], "원문"), second.content)
+        self.assertIn("봇 직접 삭제", self.channel.send.call_args.kwargs["embed"].description)
         release.set()
         self.assertTrue(await pending)
 

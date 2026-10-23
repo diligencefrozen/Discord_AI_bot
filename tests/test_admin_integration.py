@@ -27,10 +27,16 @@ def adapters():
         "XP_DATA_FILE": Path(__file__),
         "bot": SimpleNamespace(tree=SimpleNamespace(get_commands=lambda: [1] * 5)),
         "_slash_registration_state": SimpleNamespace(synced=False),
-        "DELETION_AUDIT": SimpleNamespace(include_content=True, diagnostics=lambda _guild: {
+        "DELETION_AUDIT": SimpleNamespace(include_content=True, refresh_diagnostics=AsyncMock(return_value={
             "reason": "ready", "eligible_source_count": 3, "excluded_source_count": 2,
-            "sent": 8, "failures": 1, "bot_view_channel": True,
-            "last_success": datetime.datetime(2026, 10, 22, tzinfo=datetime.timezone.utc)},
+            "destination_ids": (1064823080100306995,), "destination_count": 1,
+            "destination_resolution": "rest", "enabled": True, "include_content": True,
+            "all_guild_channels": True, "sent_full": 8, "sent_metadata_only": 2,
+            "sent_restricted": 3, "failed": 1, "skipped": 4, "bot_view_channel": True,
+            "last_reason": "private_source", "test_result": "test_sent",
+            "last_permission_reason": "source_member_scope_exceeded", "last_permission_stage": "member_overwrites",
+            "public_deletion_status": "confirmed",
+            "last_full": datetime.datetime(2026, 10, 22, tzinfo=datetime.timezone.utc)}),
             send_test=AsyncMock(return_value={"result": "ready", "reason": "sent"})),
         "EDIT_MODERATION": SimpleNamespace(status_text=lambda _guild: "검열 상태: 72시간 / 96시간"),
         "_slash_visibility_audit": SimpleNamespace(status_text=lambda: "전역 게시 진단"),
@@ -69,14 +75,30 @@ class AdminAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_both_ids_and_owner_route_to_real_tools(self):
         for user_id in (855749166764654653, 491239880005910538, 77):
             ns = adapters()
-            await ns["_admin_action_service"](target(user_id), "admin:members")
+            await ns["_admin_action_service"](target(user_id), "admin:settings")
             ns["handle_admin_action"].assert_awaited_once()
             text = ns["handle_admin_action"].call_args.kwargs["status_text"]
             self.assertIn("원격 게시 성공: 미확인", text)
             self.assertIn("재시작 시 초기화", text)
             self.assertIn("기록 가능/제외 채널: 3/2", text)
-            self.assertIn("전송 성공/실패: 8/1", text)
-            self.assertIn("2026-10-22T00:00:00+00:00", text)
+            self.assertIn("상세(sent_full) 8", text)
+            self.assertIn("원문 미확보(sent_metadata_only) 2", text)
+            self.assertIn("제한(sent_restricted) 3", text)
+            self.assertIn("실패(failed) 1", text)
+            self.assertIn("제외/누락(skipped) 4", text)
+            self.assertIn("2026-10-22 09:00:00 KST", text)
+            self.assertIn("1064823080100306995", text)
+            self.assertIn("목적지 조회: REST 복구", text)
+            self.assertIn("ENABLED=1 · INCLUDE_CONTENT=1 · ALL_GUILD_CHANNELS=1", text)
+            self.assertIn("공개 원본의 제한 카드는 상세 기록 실패", text)
+            self.assertIn("권한 판정 근거: source_member_scope_exceeded · 단계 member_overwrites", text)
+            self.assertNotIn("전송 성공/실패", text)
+
+    async def test_member_tools_do_not_wait_for_deletion_rest_diagnostics(self):
+        ns = adapters()
+        await ns["_admin_action_service"](target(), "admin:members")
+        ns["handle_admin_action"].assert_awaited_once_with(target(), "admin:members")
+        ns["DELETION_AUDIT"].refresh_diagnostics.assert_not_awaited()
 
     async def test_rules_and_test_routes_remain_available(self):
         ns = adapters()
@@ -94,6 +116,8 @@ class AdminAdapterTests(unittest.IsolatedAsyncioTestCase):
         await ns["_admin_action_service"](target(), "admin:deletion-test")
         ns["_interaction_defer"].assert_awaited_once()
         ns["DELETION_AUDIT"].send_test.assert_awaited_once()
+        self.assertIn("실제 공개 메시지의 삭제·검열 상세 기록은 별도 확인", ns["_interaction_send"].call_args.args[1])
+        ns["DELETION_AUDIT"].refresh_diagnostics.assert_not_awaited()
         ns["handle_admin_action"].assert_not_awaited()
         for action in ("admin:edit-status", "admin:deletion-test"):
             denied = adapters()
