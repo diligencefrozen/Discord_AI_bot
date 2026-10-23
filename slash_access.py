@@ -100,8 +100,14 @@ def slash_access_report(actor: Any, guild: Any, channel: Any) -> str:
     ]
     if not scope_valid:
         lines.append("현재 서버 회원/채널 정보를 확인하지 못했습니다. 해당 서버 채널에서 다시 실행해 주세요.")
-    if actor_view is False or actor_commands is False:
+    if actor_view is False:
         lines.append("서버 운영진에게 서버 설정 → 역할 / 채널 권한 → 애플리케이션 명령어 사용을 확인해 달라고 요청해 주세요.")
+    if actor_commands is False:
+        lines.extend([
+            "운영진은 채널 편집 → 권한 → 고급 권한과 동기화된 카테고리에서 본인의 역할·회원별 애플리케이션 명령어 사용 거부를 확인하고 해제해야 합니다.",
+            "서버 역할의 기본 허용이나 앱·명령별 허용만으로 채널의 거부는 해제되지 않습니다.",
+            "서버 소유자·Administrator는 채널 거부를 우회하므로 해당 계정에서 보인다고 일반 회원도 보이는 것은 아닙니다.",
+        ])
     if bot_view is False or bot_send is False:
         lines.append("서버 운영진이 이 채널의 봇 보기·전송 권한도 확인해야 합니다.")
     lines.extend([
