@@ -40,6 +40,10 @@ V6에서 `SLASH_SYNC_ON_STARTUP` 미설정/`auto`는 원격 명령을 조회하�
 연동의 개별 권한은 봇 토큰이나 전역 sync로 초기화할 수 없습니다. [Discord 명령 권한 문서](https://docs.discord.com/developers/interactions/application-commands#permissions).
 `SPECIAL_ADMIN_GUILD_IDS`에는 진단에 표시되는 **서버 ID**만 사용하며 채널 ID를 넣지 않습니다.
 
+아사모의 실제 명령별 설정은 일반 네 명령에 `@everyone 허용`, `/관리`에 `@everyone 거부`와 두 파딱 ID 개별 허용을 저장했습니다.
+기존 소유자/파딱 실행 인증은 유지하며, 이 설정을 다른 서버에 자동 적용하지 않습니다.
+저장 확인과 실제 일반 계정의 실행 성공은 구분합니다. [실서버 조정·검증 기록](docs/SLASH_COMMAND_ACCESS_OPERATIONS_2026-10-23.md)을 확인하세요.
+
 `!` 명령은 유지됩니다. `/시작`, `/질문`, `/그림`, `/내정보`, `/관리`와
 타이핑 알림의 4개 버튼도 지원합니다. 타이핑 안내문과 2×2 버튼은 Components V2의
 하나의 컨테이너에 표시됩니다. 감지 지연 기본값은 **1.3초**입니다.
