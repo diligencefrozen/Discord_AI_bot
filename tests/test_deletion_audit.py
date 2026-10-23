@@ -67,7 +67,7 @@ def raw(message_id=100, **kwargs):
 
 
 def field(embed, name):
-    name = {"탐지 사유": "탐지 정보"}.get(name, name)
+    name = {"탐지 사유": "삭제 사유", "탐지 정보": "삭제 사유"}.get(name, name)
     return next(item.value for item in embed.fields if name in item.name)
 
 
@@ -121,18 +121,18 @@ def reader_role(source, role_id, *, view=False, administrator=False):
 
 
 class EmbedTests(unittest.TestCase):
-    def test_original_obfuscation_is_separate_from_matched_root_and_kst_header(self):
+    def test_original_obfuscation_is_separate_from_matched_root_and_compact_metadata(self):
         snapshot = capture_message_snapshot(message(), reason_code="profanity", detected_root="시발", delete_origin="bot")
         embed = build_deletion_embed(snapshot, deleted_at=datetime(2026, 10, 22, 10, 23, 45, tzinfo=timezone.utc))
         self.assertEqual(field(embed, "원문"), "시321133발")
         self.assertIn("시발", field(embed, "탐지 사유"))
         self.assertNotIn("시321133발", field(embed, "탐지 사유"))
-        self.assertIn("2026-10-22 19:23:45 KST", embed.description)
+        self.assertIn("2026-10-22 19:23:45 KST", embed.footer.text)
         self.assertIn("작성자", embed.description)
-        self.assertIn("ID 50", embed.description)
-        self.assertIn("채널 ID 11", embed.description)
-        self.assertIn("봇 직접 삭제", embed.description)
-        self.assertIn("자동 검열 · 금칙어", embed.description)
+        self.assertIn("ID 50", embed.footer.text)
+        self.assertIn("채널 ID 11", embed.footer.text)
+        self.assertIn("봇 직접 삭제", field(embed, "삭제 사유"))
+        self.assertIn("자동 검열 · 금칙어", field(embed, "삭제 사유"))
         self.assertIn("100", embed.footer.text)
         self.assertEqual(embed.colour.value, 0xED4245)
 
@@ -162,9 +162,9 @@ class EmbedTests(unittest.TestCase):
         self.assertIn("움직이는", field(embed, "이모지"))
         self.assertIn("인사", field(embed, "스티커"))
         self.assertIn("ID 7", field(embed, "스티커"))
-        self.assertIn("gif", field(embed, "첨부파일"))
-        self.assertIn("video", field(embed, "첨부파일"))
-        self.assertIn("document", field(embed, "첨부파일"))
+        self.assertIn("움직이는 이미지", field(embed, "첨부파일"))
+        self.assertIn("동영상", field(embed, "첨부파일"))
+        self.assertIn("문서", field(embed, "첨부파일"))
         self.assertIn("링크 제목", field(embed, "임베드"))
 
     def test_user_markup_mentions_urls_and_code_fences_cannot_control_card(self):
@@ -376,7 +376,9 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.source, self.destination, self.members = reader_pair()
         self.channels = {11: self.source, 20: self.destination}
-        self.service = DeletionAuditService({11: 20}, self.channels.get)
+        # Keep the selective V8 mode covered while registered-source disclosure
+        # is independently verified in test_registered_deletion_content.py.
+        self.service = DeletionAuditService({11: 20}, self.channels.get, registered_source_content=False)
 
     async def test_all_sources_reuses_existing_destination_and_excludes_unknown_and_foreign(self):
         source = Mock(spec=discord.TextChannel)
@@ -505,9 +507,9 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
                                                      trigger=trigger, edited_at=edited_at))
             embed = self.destination.send.call_args.kwargs["embed"]
             self.assertEqual(field(embed, "원문"), "시321133발")
-            self.assertIn("링크 및 금칙어", embed.description)
-            self.assertIn("수정 후 검열" if trigger == "message_edit" else "정기 재점검", embed.description)
-            self.assertIn("2026-10-22 21:00:00 KST", embed.description)
+            self.assertIn("링크 및 금칙어", field(embed, "삭제 사유"))
+            self.assertIn("수정 후 검열" if trigger == "message_edit" else "정기 재점검", field(embed, "검열 정보"))
+            self.assertIn("2026-10-22 21:00:00 KST", field(embed, "검열 정보"))
             self.assertIn("시발", field(embed, "탐지 정보"))
 
     async def test_http_success_does_not_repeat_delete_after_completed_event(self):
@@ -546,7 +548,7 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.service.delete(target, reason="profanity", trigger="message_edit", matched_rule="시발"))
         embed = self.destination.send.call_args.kwargs["embed"]
         self.assertEqual(field(embed, "원문"), "시발")
-        self.assertIn("2026-10-22 21:00:00 KST", embed.description)
+        self.assertIn("2026-10-22 21:00:00 KST", field(embed, "검열 정보"))
         self.assertNotIn(stale.content, str(embed.to_dict()))
         target.delete.assert_awaited_once()
         self.destination.send.assert_awaited_once()
@@ -640,8 +642,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.service.delete(target, reason="profanity", matched_rule="시발"))
         await self.service.on_raw_message_delete(raw())
         embed = self.channel.send.call_args.kwargs["embed"]
-        self.assertNotIn("봇 직접 삭제", embed.description)
-        self.assertIn("일반 삭제", embed.description)
+        self.assertNotIn("봇 직접 삭제", field(embed, "삭제 사유"))
+        self.assertIn("일반 삭제", field(embed, "삭제 사유"))
         self.assertNotIn("탐지 금칙어", field(embed, "탐지 사유"))
 
     async def test_gateway_before_failed_http_is_confirmed_external_and_never_false_bot_success(self):
@@ -658,7 +660,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.service.delete(target, reason="profanity", matched_rule="시발"))
         self.channel.send.assert_awaited_once()
         embed = self.channel.send.call_args.kwargs["embed"]
-        self.assertNotIn("봇 직접 삭제", embed.description)
+        self.assertNotIn("봇 직접 삭제", field(embed, "삭제 사유"))
         self.assertNotIn("탐지 금칙어", field(embed, "탐지 사유"))
         self.assertFalse(self.service._attempts)
 
@@ -677,8 +679,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.on_raw_message_delete(raw())
         await self.service.on_raw_message_delete(raw(101))
         first, second = (call.kwargs["embed"] for call in self.channel.send.call_args_list)
-        self.assertIn("일반 삭제", first.description)
-        self.assertIn("삭제자 확인 불가", first.description)
+        self.assertIn("일반 삭제", field(first, "삭제 사유"))
+        self.assertIn("삭제자 확인 불가", field(first, "삭제 사유"))
         self.assertEqual(field(first, "원문"), "시321133발")
         self.assertIn("원문 확인 불가", field(second, "원문"))
         self.assertIn("추정하지 않습니다", field(second, "탐지 사유"))
@@ -788,7 +790,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.service._attempts), 1)
         self.assertEqual(self.service.cache.get(1, 101).delete_origin, "bot")
         self.assertEqual(field(self.channel.send.call_args.kwargs["embed"], "원문"), second.content)
-        self.assertIn("봇 직접 삭제", self.channel.send.call_args.kwargs["embed"].description)
+        self.assertIn("봇 직접 삭제", field(self.channel.send.call_args.kwargs["embed"], "삭제 사유"))
         release.set()
         self.assertTrue(await pending)
 
@@ -856,11 +858,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         current[0] = datetime(2026, 10, 22, 10, 5, 0, tzinfo=timezone.utc)
         self.service._semaphore.release()
         await pending
-        description = self.channel.send.call_args.kwargs["embed"].description
-        self.assertIn("삭제 확인 시각", description)
-        self.assertIn("2026-10-22 19:00:00 KST", description)
-        self.assertNotIn("19:05:00", description)
-        self.assertIn("봇 수신 기준", description)
+        footer = self.channel.send.call_args.kwargs["embed"].footer.text
+        self.assertIn("삭제 확인", footer)
+        self.assertIn("2026-10-22 19:00:00 KST", footer)
+        self.assertNotIn("19:05:00", footer)
+        self.assertIn("봇 수신 기준", footer)
 
     async def test_http_confirmation_time_is_retained_while_delivery_is_queued(self):
         current = [datetime(2026, 10, 22, 10, 1, 0, tzinfo=timezone.utc)]
@@ -873,9 +875,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         current[0] = datetime(2026, 10, 22, 10, 6, 0, tzinfo=timezone.utc)
         self.service._semaphore.release()
         self.assertTrue(await pending)
-        description = self.channel.send.call_args.kwargs["embed"].description
-        self.assertIn("2026-10-22 19:01:00 KST", description)
-        self.assertNotIn("19:06:00", description)
+        footer = self.channel.send.call_args.kwargs["embed"].footer.text
+        self.assertIn("2026-10-22 19:01:00 KST", footer)
+        self.assertNotIn("19:06:00", footer)
 
     async def test_gateway_before_failed_http_retains_first_independent_observation_time(self):
         class Forbidden(Exception):
@@ -893,10 +895,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         target.delete.side_effect = delete
         self.assertFalse(await self.service.delete(target, reason="profanity"))
-        description = self.channel.send.call_args.kwargs["embed"].description
-        self.assertIn("2026-10-22 19:00:00 KST", description)
-        self.assertNotIn("19:02:00", description)
-        self.assertNotIn("봇 직접 삭제", description)
+        embed = self.channel.send.call_args.kwargs["embed"]
+        self.assertIn("2026-10-22 19:00:00 KST", embed.footer.text)
+        self.assertNotIn("19:02:00", embed.footer.text)
+        self.assertNotIn("봇 직접 삭제", field(embed, "삭제 사유"))
 
     async def test_config_default_enabled_malformed_disabled_and_zero_disabled(self):
         for raw_value, expected in ((None, True), ("1", True), ("0", False), ("yes", False), ("", False)):

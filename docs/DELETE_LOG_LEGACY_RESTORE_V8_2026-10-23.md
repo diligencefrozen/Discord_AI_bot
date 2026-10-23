@@ -1,5 +1,9 @@
 # 삭제 기록 V8 — 기존 기본 정보 복원 / 2026-10-23 KST
 
+> **현재 정책은 변경되었습니다.** 운영자가 2026-10-23에 기존 `LOG_ROUTES`의 모든 원본 채널에 대해 삭제 원문의 공용 공개를 승인했습니다.
+> [최신 원문 공개·간결한 카드 정책](DELETION_LOG_COMPACT_POLICY_2026-10-23.md)을 적용하세요.
+> 아래 본문 기본 생략·개별 승인 설명은 V8 당시 이력이며, 새 `DELETION_PUBLIC_LOG_REGISTERED_SOURCE_CONTENT=0`을 설정했을 때의 복귀 정책입니다.
+
 ## 적용 기준과 검증 경계
 
 최종 기준은 운영자가 제공한 `DORIBOT_CODEX_DELETE_LOG_LEGACY_RESTORE_V8_2026-10-23.md`입니다.

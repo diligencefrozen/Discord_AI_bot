@@ -69,6 +69,7 @@ class MainDeletionContractTests(unittest.IsolatedAsyncioTestCase):
                 assert main.DELETION_AUDIT.bot_member_fetcher is main._fetch_deletion_bot_member
                 assert main.ADMIN_SERVICE.delete_service.__self__ is main.DELETION_AUDIT
                 assert main.DELETION_AUDIT.private_full_sources == frozenset()
+                assert main.DELETION_AUDIT.registered_source_content is True
                 assert main.XP_DATA_FILE.resolve().parent == state
                 assert main.ACHIEVEMENTS_FILE.resolve().parent == state
                 assert main.TYPE_REMINDER_COOLDOWN_FILE.resolve().parent == state
@@ -98,6 +99,7 @@ class MainDeletionContractTests(unittest.IsolatedAsyncioTestCase):
                 "GEMINI_API_KEY": "", "DELETION_PUBLIC_LOG_ENABLED": "1",
                 "DELETION_PUBLIC_LOG_INCLUDE_CONTENT": "1", "DELETION_LOG_ALL_GUILD_CHANNELS": "1",
                 "DELETION_PUBLIC_LOG_PRIVATE_FULL_SOURCE_IDS": "",
+                "DELETION_PUBLIC_LOG_REGISTERED_SOURCE_CONTENT": "1",
             })
             result = subprocess.run([sys.executable, "-c", script, str(state)], cwd=temporary,
                                     env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)

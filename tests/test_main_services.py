@@ -456,7 +456,8 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["allowed_mentions"].to_dict()["parse"], [])
 
     async def test_v8_explicit_private_moderation_restores_legacy_metadata_without_body(self):
-        ns, target, log_channel, audit = self.audit_context()
+        with patch.dict("os.environ", {"DELETION_PUBLIC_LOG_REGISTERED_SOURCE_CONTENT": "0"}):
+            ns, target, log_channel, audit = self.audit_context()
         target.channel.name, target.author.display_name = "moderator-only", "Apple Watch"
         target.channel.overwrites = {
             discord.Object(id=1, type=discord.Role): discord.PermissionOverwrite(view_channel=False)}
@@ -509,7 +510,7 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Apple Watch", card.description)
         self.assertIn("moderator-only", card.description)
         original = next(field.value for field in card.fields if "원문" in field.name)
-        detected = next(field.value for field in card.fields if "탐지" in field.name)
+        detected = next(field.value for field in card.fields if "삭제 사유" in field.name)
         self.assertIn("시321133발", original)
         self.assertIn(moderation_rules.find_badroot(target.content), detected)
         self.assertEqual(audit.diagnostics(target.guild)["sent_full"], 1)

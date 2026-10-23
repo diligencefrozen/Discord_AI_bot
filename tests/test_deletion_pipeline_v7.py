@@ -79,6 +79,8 @@ def raw(source, message_id=100, **overrides):
 
 
 def embed_field(embed, needle):
+    if needle in ("탐지", "탐지 정보", "탐지 사유"):
+        needle = "삭제 사유"
     return next(item.value for item in embed.fields if needle in item.name)
 
 
@@ -89,7 +91,9 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.service = self.new_service()
 
     def new_service(self, **kwargs):
-        defaults = dict(enabled=True, include_content=True, all_guild_channels=True)
+        # Preserve the selective reader-scope regressions when operators choose
+        # to opt out of the newly approved registered-source publication.
+        defaults = dict(enabled=True, include_content=True, all_guild_channels=True, registered_source_content=False)
         defaults.update(kwargs)
         return DeletionAuditService({self.source.id: self.destination.id}, self.channels.get, **defaults)
 
@@ -108,9 +112,9 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         embed = kwargs["embed"]
         self.assertEqual(embed_field(embed, "원문"), "공개 원문 😀")
         self.assertIn("작성자", embed.description)
-        self.assertIn("50", embed.description)
-        self.assertIn(str(self.source.id), embed.description)
-        self.assertIn("KST", embed.description)
+        self.assertIn("작성자 ID 50", embed.footer.text)
+        self.assertIn(f"채널 ID {self.source.id}", embed.footer.text)
+        self.assertIn("KST", embed.footer.text)
         self.assertNotIn("열람 범위 제한", embed.title)
         self.assertEqual(kwargs["allowed_mentions"].to_dict()["parse"], [])
         status = self.assert_counts(full=1)
@@ -202,8 +206,8 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         embed = self.destination.send.call_args.kwargs["embed"]
         self.assertEqual(embed_field(embed, "원문"), "시321133발")
         self.assertIn("시발", embed_field(embed, "탐지"))
-        self.assertIn("봇 직접 삭제", embed.description)
-        self.assertIn("금칙어", embed.description)
+        self.assertIn("봇 직접 삭제", embed_field(embed, "삭제 사유"))
+        self.assertIn("금칙어", embed_field(embed, "삭제 사유"))
         self.assert_counts(full=1)
 
     async def test_t07_raw_edit_then_confirmed_edit_deletes_latest_body(self):
@@ -219,7 +223,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
                                                  trigger="message_edit", edited_at=edited_at))
         embed = self.destination.send.call_args.kwargs["embed"]
         self.assertEqual(embed_field(embed, "원문"), "시발")
-        self.assertIn("수정 후 검열", embed.description)
+        self.assertIn("수정 후 검열", embed_field(embed, "검열 정보"))
         self.assertIn("시발", embed_field(embed, "탐지"))
         self.assert_counts(full=1)
 
@@ -227,7 +231,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.service.delete(make_message(self.source, "시321133발"),
                                                  reason="profanity", matched_rule="시발", trigger="history_scan"))
         embed = self.destination.send.call_args.kwargs["embed"]
-        self.assertIn("정기 재점검", embed.description)
+        self.assertIn("정기 재점검", embed_field(embed, "검열 정보"))
         self.assertEqual(embed_field(embed, "원문"), "시321133발")
         self.assert_counts(full=1)
 
@@ -382,7 +386,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         await self.service.on_raw_message_delete(raw(self.source))
         self.assertEqual(self.destination.send.await_count, 2)
         self.assertEqual(embed_field(self.destination.send.call_args.kwargs["embed"], "원문"), "시321133발")
-        self.assertIn("봇 직접 삭제", self.destination.send.call_args.kwargs["embed"].description)
+        self.assertIn("봇 직접 삭제", embed_field(self.destination.send.call_args.kwargs["embed"], "삭제 사유"))
         self.assert_counts(full=1, failed=1)
 
     async def test_t12_rate_limit_retry_obeys_retry_after_before_full_send(self):
@@ -483,7 +487,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.destination.send.assert_awaited_once()
             embed = self.destination.send.call_args.kwargs["embed"]
             self.assertEqual(embed_field(embed, "원문"), "시321133발")
-            self.assertIn("봇 직접 삭제", embed.description)
+            self.assertIn("봇 직접 삭제", embed_field(embed, "삭제 사유"))
             self.assertIn("시발", embed_field(embed, "탐지"))
         finally:
             release.set()
@@ -572,7 +576,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         status = self.assert_counts(full=1, metadata=1)
         self.assertEqual(status["public_deletion_status"], "check_required")
         self.assertEqual(status["last_reason"], "unknown_permissions")
-        self.assertIn("unknown_permissions", str(self.destination.send.call_args.kwargs["embed"].to_dict()))
+        self.assertIn("공개 정책", embed_field(self.destination.send.call_args.kwargs["embed"], "원문"))
         self.assertIsNotNone(status["last_full"])
 
     async def test_latest_send_failure_degrades_prior_full_health(self):
@@ -592,7 +596,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         await self.service.on_message_delete(make_message(self.source, "private after public", message_id=101))
         status = self.assert_counts(full=1, metadata=1)
         self.assertEqual(status["last_reason"], "private_source")
-        self.assertIn("private_source", str(self.destination.send.call_args.kwargs["embed"].to_dict()))
+        self.assertIn("공개 정책", embed_field(self.destination.send.call_args.kwargs["embed"], "원문"))
         self.assertEqual(status["public_deletion_status"], "check_required")
 
     async def test_failed_second_transport_probe_replaces_previous_success_state(self):
@@ -643,7 +647,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         available = {source.id: source, destination.id: destination}
         fetcher = AsyncMock(side_effect=lambda channel_id: available.get(channel_id))
         service = DeletionAuditService({source.id: destination.id}, lambda _: None,
-                                       channel_fetcher=fetcher, enabled=True, include_content=True)
+                                       channel_fetcher=fetcher, enabled=True, include_content=True, registered_source_content=False)
         with patch.object(discord.TextChannel, "send", new_callable=AsyncMock) as send:
             await service.on_message_delete(make_message(source, "public before ACL update", message_id=100))
             self.assertEqual(service.diagnostics(1)["sent_full"], 1)

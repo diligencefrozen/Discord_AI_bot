@@ -1,4 +1,4 @@
-"""V8 restores explicit legacy identity; body consent is a separate axis.
+"""Selective-mode V8 regressions; the registered default is tested separately.
 
 All sends are mocked. These tests do not attest to a deployed Discord channel.
 """
@@ -30,7 +30,7 @@ class LegacyDeletionV8Tests(unittest.IsolatedAsyncioTestCase):
         self.service = self.new_service()
 
     def new_service(self, *, private_ids="", routes=None, **options):
-        defaults = dict(enabled=True, include_content=True, all_guild_channels=True)
+        defaults = dict(enabled=True, include_content=True, all_guild_channels=True, registered_source_content=False)
         defaults.update(options)
         with patch.dict("os.environ", {"DELETION_PUBLIC_LOG_PRIVATE_FULL_SOURCE_IDS": private_ids}):
             return DeletionAuditService(routes if routes is not None else {11: 20}, self.channels.get, **defaults)
@@ -50,7 +50,7 @@ class LegacyDeletionV8Tests(unittest.IsolatedAsyncioTestCase):
 
     def assert_base(self, message_id=100, *, known_author=True):
         card = self.destination.send.call_args.kwargs["embed"]
-        for value in ("User", "Channel", str(message_id), "메시지 ID", "채널 ID 11", "KST"):
+        for value in (str(message_id), "메시지 ID", "채널 ID 11", "KST"):
             self.assertIn(value, str(card.to_dict()))
         self.assertNotIn("열람 범위 제한", card.title)
         self.assertIn("Apple Watch" if known_author else "작성자 확인 불가", str(card.to_dict()))
@@ -71,7 +71,8 @@ class LegacyDeletionV8Tests(unittest.IsolatedAsyncioTestCase):
         self.assert_base()
         self.assertIn("moderator-only", self.rendered())
         self.assertIn("금칙어", self.rendered())
-        self.assertIn("private_source", self.rendered())
+        self.assertEqual(self.service.diagnostics(1)["last_reason"], "private_source")
+        self.assertIn("공개 정책", self.rendered())
         self.assertIn("첨부파일 1개", self.rendered())
         for secret in (target.content, find_badroot(target.content), "PRIVATE-FILE.png", "SECRET-DETAIL"):
             self.assertNotIn(secret, self.rendered())
@@ -214,7 +215,8 @@ class LegacyDeletionV8Tests(unittest.IsolatedAsyncioTestCase):
         self.source.overwrites[object()] = discord.PermissionOverwrite(view_channel=False)
         await self.service.on_message_delete(self.target())
         self.assert_base()
-        self.assertIn("unknown_permissions", self.rendered())
+        self.assertEqual(self.service.diagnostics(1)["last_reason"], "unknown_permissions")
+        self.assertIn("공개 정책", self.rendered())
         self.assertNotIn("PRIVATE-FILE", self.rendered())
         self.destination.send.reset_mock()
         automatic = self.new_service(routes={12: 20})

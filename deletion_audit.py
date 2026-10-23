@@ -68,10 +68,9 @@ def _collection(blocks: list[str], total: int | None, available: bool, *, note: 
         if len("\n".join([*shown, block])) > 850 - len(note):
             break
         shown.append(block)
-    result = "\n".join(shown) or "없음"
-    result += f"\n{len(shown)}개 표시 / 전체 {total if total is not None else '미상'}개"
+    result = "\n".join(shown) or "메타데이터 확보 불가"
     if (total is not None and total > len(shown)) or len(blocks) > len(shown):
-        result += " · 나머지 표시 생략"
+        result += f"\n{len(shown)}개 표시 / 전체 {total if total is not None else '미상'}개 · 나머지 표시 생략"
     if note:
         result += "\n" + note
     return result[:1024]
@@ -89,7 +88,7 @@ def _size(value: int | None) -> str:
 
 def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime | None = None,
                          include_content: bool = True) -> discord.Embed:
-    """Build one bounded red card matching the operator deletion-audit layout."""
+    """Prioritize the original body, keeping IDs and delivery time in one footer."""
     deleted_at = deleted_at or datetime.now(timezone.utc)
     if deleted_at.tzinfo is None:
         deleted_at = deleted_at.replace(tzinfo=timezone.utc)
@@ -97,26 +96,7 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
     author_id = str(snapshot.author_id) if snapshot.author_id else "확인 불가"
     channel = _text(snapshot.channel_name or "채널 이름 확인 불가", 120)
     reason_code = _code(snapshot.reason.code)
-    description = (
-        f"**👤 User · 작성자** {author} · ID {author_id}\n"
-        f"**📍 Channel · 위치** #{channel} · 채널 ID {snapshot.channel_id}\n"
-        f"**🆔 메시지 ID** {snapshot.message_id}\n"
-        f"**삭제 확인 시각** {deleted_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST · 봇 수신 기준\n"
-        f"**삭제 유형** {'봇 직접 삭제 · ' if snapshot.delete_origin == 'bot' else ''}{REASON_LABELS[reason_code]}"
-    )
-    if snapshot.created_at is not None:
-        description += f"\n**작성 시각** {snapshot.created_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST"
-    if snapshot.trigger == "message_edit":
-        description += "\n**검열 경로** 수정 후 검열 · 삭제 직전 확인된 버전"
-    elif snapshot.trigger == "history_scan":
-        description += "\n**검열 경로** 정기 재점검 · 현재 확인된 버전의 위반 탐지"
-    elif snapshot.delete_origin == "bot":
-        description += "\n**검열 경로** 새 메시지"
-    if snapshot.edited_at is not None:
-        description += f"\n**수정 시각** {snapshot.edited_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST"
-    title = "🗑️ 메시지 삭제 기록 · 자동 검열" if snapshot.delete_origin == "bot" and reason_code in {
-        "profanity", "link", "link+profanity", "moderation", "blocked_media"} else "🗑️ 메시지 삭제 기록"
-    embed = discord.Embed(title=title, description=description[:4096], color=0xED4245)
+    embed = discord.Embed(title="🗑️ 메시지 삭제 기록", description=f"**{author}** · #{channel}", color=0xED4245)
     if not include_content:
         original = "원문 기록이 비활성화되어 있습니다."
     elif not snapshot.content_available:
@@ -129,15 +109,29 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
         original = "본문 없음 · 첨부파일/스티커/임베드만 있는 메시지"
     else:
         original = "본문 없음 · 빈 메시지"
-    embed.add_field(name="📝 삭제된 원문", value=original[:1024], inline=False)
+    embed.add_field(name="삭제된 원문", value=original[:1024], inline=False)
     detection = REASON_LABELS[reason_code]
+    if snapshot.delete_origin == "bot":
+        detection = "봇 직접 삭제 · " + detection
     if include_content and snapshot.reason.detected_root:
         detection += "\n탐지 금칙어: " + _text(snapshot.reason.detected_root, 160)
     if include_content and snapshot.reason.detail:
         detection += "\n세부 사유: " + _text(snapshot.reason.detail, 600)
     if reason_code in {"unknown", "external"}:
         detection += "\n삭제한 사용자/운영진은 추정하지 않습니다."
-    embed.add_field(name="🔎 탐지 정보", value=detection[:1024], inline=False)
+    embed.add_field(name="삭제 사유", value=detection[:1024], inline=False)
+
+    context = []
+    if snapshot.trigger == "message_edit":
+        context.append("수정 후 검열 · 삭제 직전 확인된 버전")
+    elif snapshot.trigger == "history_scan":
+        context.append("정기 재점검 · 현재 확인된 버전의 위반 탐지")
+    if context and snapshot.created_at is not None:
+        context.append(f"작성 {snapshot.created_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST")
+    if snapshot.edited_at is not None:
+        context.append(f"수정 {snapshot.edited_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST")
+    if context:
+        embed.add_field(name="검열 정보", value="\n".join(context), inline=False)
 
     if include_content:
         emoji_lines = []
@@ -148,33 +142,38 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
                 emoji_lines.append(_text(item.text, 80))
         if len(snapshot.emojis) > 12:
             emoji_lines.append(f"외 {len(snapshot.emojis) - 12}개 표시 생략")
-        emoji_text = "\n".join(emoji_lines)[:850] or "없음/확보된 정보 없음"
-        emoji_text += "\n원문 유지 · 이모지 분석은 일부 형식만 지원"
-        embed.add_field(name="🙂 이모지", value=emoji_text, inline=False)
+        if emoji_lines:
+            embed.add_field(name="이모지", value="\n".join(emoji_lines)[:850], inline=False)
         stickers = [f"{_text(item.name, 100)} · ID {item.id} · {_text(item.format, 40)}" for item in snapshot.stickers[:4]]
-        embed.add_field(name="🎟️ 스티커", value=_collection(stickers, snapshot.sticker_count, snapshot.stickers_available), inline=False)
+        if stickers or snapshot.sticker_count:
+            embed.add_field(name=f"스티커 · {snapshot.sticker_count if snapshot.sticker_count is not None else '미상'}개",
+                            value=_collection(stickers, snapshot.sticker_count, snapshot.stickers_available), inline=False)
         attachment_lines = []
         for item in snapshot.attachments[:4]:
             dimensions = f" · {item.width}×{item.height}" if item.width and item.height else ""
             kind = {"image": "이미지", "gif": "움직이는 이미지", "video": "동영상", "audio": "오디오", "document": "문서", "archive": "압축파일"}.get(item.kind, "기타")
             attachment_lines.append(
-                f"• {_text(item.filename or '이름 미상', 90)} · ID {item.id or '미상'}\n"
-                f"  {_text(item.content_type or 'MIME 미상', 60)} · {_size(item.size)} · {kind} ({_text(item.kind, 25)})"
-                f"{dimensions} · 스포일러 {'예' if item.spoiler else '아니오'}"
+                f"{_text(item.filename or '이름 미상', 90)} · {kind}\n"
+                f"{_text(item.content_type or 'MIME 미상', 60)} · {_size(item.size)}"
+                f"{dimensions} · ID {item.id or '미상'}" + (" · 스포일러 예" if item.spoiler else "")
             )
         count = snapshot.attachment_count
         image_count = sum(item.kind in {"image", "gif"} for item in snapshot.attachments)
         counts = f"이미지 {image_count} · 기타 {len(snapshot.attachments) - image_count}"
         if count is not None and count > len(snapshot.attachments):
             counts = "확보한 메타데이터 기준: " + counts
-        note = counts + "\n파일 바이트/미리보기는 보관하지 않습니다."
-        embed.add_field(name=f"📎 첨부파일 · {count if count is not None else '미상'}개", value=_collection(
-            attachment_lines, count, snapshot.attachments_available, note=note), inline=False)
+        if attachment_lines or count:
+            embed.add_field(name=f"첨부파일 · {count if count is not None else '미상'}개", value=_collection(
+                attachment_lines, count, snapshot.attachments_available, note=counts), inline=False)
         embeds = [f"{_text(item.kind, 40)} · {_text(item.title or '제목 없음', 130)}" for item in snapshot.embeds[:4]]
-        embed.add_field(name="🧩 임베드", value=_collection(embeds, snapshot.embed_count, snapshot.embeds_available), inline=False)
+        if embeds or snapshot.embed_count:
+            embed.add_field(name=f"임베드 · {snapshot.embed_count if snapshot.embed_count is not None else '미상'}개",
+                            value=_collection(embeds, snapshot.embed_count, snapshot.embeds_available), inline=False)
         if snapshot.truncated_fields:
             embed.add_field(name="확보 범위", value="일부 데이터는 안전한 메모리/표시 상한으로 생략되었습니다.", inline=False)
-    embed.set_footer(text=f"메시지 ID {snapshot.message_id} · 서버 {_text(snapshot.guild_name or '이름 확인 불가', 120)} · ID {snapshot.guild_id}")
+    embed.set_footer(text=(f"삭제 확인 {deleted_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST · 봇 수신 기준\n"
+                           f"메시지 ID {snapshot.message_id} · 작성자 ID {author_id} · 채널 ID {snapshot.channel_id}\n"
+                           f"서버 {_text(snapshot.guild_name or '이름 확인 불가', 120)} · ID {snapshot.guild_id}"))
     # Field caps above normally stay below 6000; trim metadata from the end if
     # every untrusted metadata item happens to hit its maximum simultaneously.
     removed = False
@@ -206,12 +205,12 @@ def build_metadata_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at:
         content_state = "원본 채널 공개 정책에 따라 생략 · 원문 비공개"
         if not snapshot.content_available:
             content_state += "\n원문 확인 불가(캐시/스냅샷 없음)"
-    embed.set_field_at(0, name="📝 삭제된 원문", value=content_state, inline=False)
-    embed.add_field(name="🔒 기록 상태", value=f"기본 기록만 표시 · {reason_code}", inline=False)
-    counts = " · ".join(f"{label} {count if count is not None else '확인 불가'}개"
+    embed.set_field_at(0, name="삭제된 원문", value=content_state, inline=False)
+    counts = " · ".join(f"{label} {count}개"
                         for label, count in (("첨부파일", snapshot.attachment_count),
-                                             ("스티커", snapshot.sticker_count), ("임베드", snapshot.embed_count)))
-    embed.add_field(name="📎 첨부파일 · 상태", value=counts + "\n상세 파일명·미디어 내용은 공개하지 않습니다.", inline=False)
+                                             ("스티커", snapshot.sticker_count), ("임베드", snapshot.embed_count)) if count)
+    if counts:
+        embed.add_field(name="첨부 정보", value=counts + " · 상세 내용 비공개", inline=False)
     return embed
 
 
@@ -570,6 +569,7 @@ class DeletionAuditService:
                  enabled: bool | None = None, all_guild_channels: bool | None = None,
                  channel_fetcher: Callable[[int], Any] | None = None,
                  bot_member_fetcher: Callable[[Any], Any] | None = None,
+                 registered_source_content: bool | None = None,
                  retry_attempts: int = 2, max_retry_after: float = 30.0,
                  retry_sleep: Callable[[float], Any] = asyncio.sleep):
         self.routes = dict(routes)
@@ -577,6 +577,11 @@ class DeletionAuditService:
         self.cache = cache if cache is not None else MessageAuditCache()
         raw = os.getenv("DELETION_PUBLIC_LOG_INCLUDE_CONTENT", "1").strip()
         self.include_content = raw == "1" if include_content is None else include_content is True
+        registered_raw = os.getenv("DELETION_PUBLIC_LOG_REGISTERED_SOURCE_CONTENT", "1").strip()
+        self.registered_source_content = (registered_raw == "1" if registered_source_content is None
+                                          else registered_source_content is True)
+        self.registered_source_content_valid = (registered_raw in {"0", "1"} if registered_source_content is None
+                                                else isinstance(registered_source_content, bool))
         self.enabled = os.getenv("DELETION_PUBLIC_LOG_ENABLED", "1").strip() == "1" if enabled is None else enabled is True
         self.all_guild_channels = os.getenv("DELETION_LOG_ALL_GUILD_CHANNELS", "1").strip() == "1" if all_guild_channels is None else all_guild_channels is True
         self.extra_sources, self.extra_sources_valid = _configured_ids(os.getenv("DELETION_LOG_EXTRA_SOURCE_CHANNEL_IDS", ""))
@@ -907,6 +912,8 @@ class DeletionAuditService:
                 "bot_send_messages": getattr(permissions, "send_messages", False) is True,
                 "bot_embed_links": getattr(permissions, "embed_links", False) is True,
                 "enabled": self.enabled, "include_content": self.include_content,
+                "registered_source_content": self.registered_source_content,
+                "registered_source_content_valid": self.registered_source_content_valid,
                 "all_guild_channels": self.all_guild_channels, "extra_sources_valid": self.extra_sources_valid,
                 "private_full_sources_valid": self.private_full_sources_valid,
                 "private_full_source_count": sum(getattr(getattr(self._known_channel(source_id), "guild", None), "id", None) == guild_id
@@ -1288,13 +1295,20 @@ class DeletionAuditService:
         stats["last_decision"] = decision.status
         stats["last_permission_reason"], stats["last_permission_stage"] = decision.reason_code, decision.stage
         explicit = snapshot.channel_id in self.routes
+        registered_policy = explicit and self.registered_source_content
         private_opt_in = explicit and snapshot.channel_id in self.private_full_sources
         if not explicit and not decision.allowed:
             # Automatic discovery is not consent to publish private activity,
             # even if the old V7 card did not identify the channel or author.
             reason = "private_unrouted_skipped" if decision.status == "PRIVATE_VERIFIED" else "unverified_unrouted_skipped"
             raise _DeliveryPolicyChanged(reason, decision.stage, skipped=True)
-        full_allowed = decision.allowed or (private_opt_in and decision.status in {"PRIVATE_VERIFIED", "UNKNOWN_PERMISSIONS"})
+        # The operator approved public originals for every explicitly mapped
+        # source. Trusted snapshots can outlive a missing source channel cache;
+        # transport/identity failures above still cannot be bypassed. Automatic
+        # sources continue to require the reader-containment proof.
+        full_allowed = (decision.allowed
+                        or (registered_policy and decision.status in {"PRIVATE_VERIFIED", "UNKNOWN_PERMISSIONS", "SOURCE_MISSING"})
+                        or (private_opt_in and decision.status in {"PRIVATE_VERIFIED", "UNKNOWN_PERMISSIONS"}))
         if not self.include_content:
             reason = "content_disabled"
         elif not full_allowed:
@@ -1303,7 +1317,8 @@ class DeletionAuditService:
         elif not snapshot.content_available:
             reason = "snapshot_stale" if "raw_edit" in snapshot.truncated_fields else "snapshot_not_found"
         else:
-            reason = "private_full_opt_in" if not decision.allowed else "public_verified"
+            reason = ("registered_source_policy" if registered_policy and not decision.allowed else
+                      "private_full_opt_in" if not decision.allowed else "public_verified")
         outcome = "sent_full" if full_allowed and self.include_content and snapshot.content_available else "sent_metadata_only"
         # Disclosure consent and body availability are independent: a public
         # (or opted-in) snapshot may still have known media/rule metadata even
