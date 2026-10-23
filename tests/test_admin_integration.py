@@ -145,6 +145,19 @@ class PlainAdminHintTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.channel.send.call_args.kwargs["allowed_mentions"].to_dict()["parse"], [])
         self.assertFalse(await ns["_plain_admin_message_hint"](self.message("/관리 이야기")))
 
+    async def test_all_five_literal_commands_offer_diagnostics_without_execution(self):
+        for name in ("시작", "질문", "그림", "내정보", "관리"):
+            ns, target_message = adapters(), self.message(f"/{name}")
+            self.assertTrue(await ns["_plain_admin_message_hint"](target_message))
+            text = target_message.channel.send.call_args.args[0]
+            self.assertIn(f"`/{name}`", text)
+            self.assertIn("!명령진단", text)
+            ns["handle_admin_action"].assert_not_awaited()
+        for text in ("/foreign", "/질문 질문내용", "/관리 이야기"):
+            ns, target_message = adapters(), self.message(text)
+            self.assertFalse(await ns["_plain_admin_message_hint"](target_message))
+            target_message.channel.send.assert_not_awaited()
+
     async def test_failure_can_retry_and_members_are_independent(self):
         ns, message = adapters(), self.message()
         message.channel.send.side_effect = [PermissionError("private data"), None]

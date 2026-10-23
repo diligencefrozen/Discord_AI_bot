@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from deletion_audit import DeletionAuditService
 from edit_moderation import EditModerationService, evaluate_policy
 from slash_visibility import SlashVisibilityAudit, slash_sync_mode
+from slash_access import slash_access_report
 from bot_storage import PickleStore
 from bot_metrics import MetricsStore
 from ai_providers import (
@@ -4427,14 +4428,40 @@ _slash_visibility_audit = SlashVisibilityAudit()
 _runtime_tasks_started = False
 _intro_view_registered = False
 _admin_text_hint_cooldowns = {}
+_slash_diagnostic_cooldowns = {}
+
+
+@bot.command(name="명령진단", aliases=["slashcheck"], help="!명령진단 — 현재 채널의 내 슬래시 권한을 확인합니다.")
+async def slash_access_diagnostic(ctx):
+    """A bounded self-check remains reachable when Discord hides slash commands."""
+    if getattr(ctx.author, "bot", False):
+        return
+    key = (getattr(ctx.guild, "id", None), ctx.author.id)
+    now = time.monotonic()
+    previous = _slash_diagnostic_cooldowns.get(key)
+    if previous is not None and now - previous < 60:
+        return
+    if len(_slash_diagnostic_cooldowns) >= 2048:
+        _slash_diagnostic_cooldowns.pop(next(iter(_slash_diagnostic_cooldowns)))
+    _slash_diagnostic_cooldowns[key] = now
+    try:
+        await ctx.reply(
+            slash_access_report(ctx.author, ctx.guild, ctx.channel),
+            allowed_mentions=discord.AllowedMentions.none(), mention_author=False, delete_after=90,
+        )
+    except Exception:
+        if _slash_diagnostic_cooldowns.get(key) == now:
+            _slash_diagnostic_cooldowns.pop(key, None)
+        logging.warning("event=slash_self_diagnostic result=send_failed guild_id=%s", getattr(ctx.guild, "id", None))
 
 
 async def _plain_admin_message_hint(message):
-    """Explain literal /관리 once per member/day without opening admin tools."""
+    """Explain literal known slash text once per member/day, without execution."""
     if (getattr(message, "guild", None) is None
             or getattr(message.author, "bot", False)
-            or message.content.strip() != "/관리"):
+            or message.content.strip() not in {"/시작", "/질문", "/그림", "/내정보", "/관리"}):
         return False
+    name = message.content.strip()[1:]
     key = (message.guild.id, message.author.id)
     now = time.monotonic()
     previous = _admin_text_hint_cooldowns.get(key)
@@ -4445,8 +4472,8 @@ async def _plain_admin_message_hint(message):
     _admin_text_hint_cooldowns[key] = now
     try:
         await message.channel.send(
-            "`/관리`가 일반 메시지로 전송됐어요. `/` 입력 후 도리봇의 **관리** 명령을 선택해 주세요. "
-            "목록에 없다면 서버 운영자가 앱 설치 범위·명령 권한·게시 상태를 확인해야 합니다.",
+            f"`/{name}`가 일반 메시지로 전송됐어요. `/` 입력 후 도리봇의 **{name}** 명령을 선택해 주세요. "
+            "목록에 없다면 `!명령진단`으로 현재 채널 권한을 확인하세요. 서버 운영자는 앱 연동·명령 권한·게시 상태도 확인해야 합니다.",
             allowed_mentions=discord.AllowedMentions.none(), delete_after=30,
         )
     except Exception:

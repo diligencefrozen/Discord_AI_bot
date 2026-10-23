@@ -750,15 +750,23 @@ def register_slash_commands(
         if DISCORD_AVAILABLE and hasattr(app_commands, "Command"):
             existing = existing_commands[name]
             if existing is not None:
-                registered.append(existing)
-                continue
-            if name == "관리" and hasattr(app_commands, "guild_only"):
-                callback = app_commands.guild_only()(callback)
-            command = app_commands.Command(
-                name=name, description=description, callback=callback,
-                extras={_COMMAND_ADAPTER_MARKER: True},
+                command = existing
+            else:
+                command = app_commands.Command(
+                    name=name, description=description, callback=callback,
+                    extras={_COMMAND_ADAPTER_MARKER: True},
+                )
+                pending.append(command)
+            # Discord command visibility is separate from server-side admin
+            # authentication. Zero permissions would hide these from ordinary
+            # members, including configured padaks without Administrator.
+            command.default_permissions = None
+            command.allowed_installs = app_commands.AppInstallationType(guild=True, user=False)
+            command.allowed_contexts = app_commands.AppCommandContext(
+                guild=True, dm_channel=name != "관리", private_channel=False,
             )
-            pending.append(command)
+            command.guild_only = name == "관리"
+            command.nsfw = False
         else:
             command = callback
             setattr(command, "name", name)

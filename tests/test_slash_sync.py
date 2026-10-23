@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -161,6 +163,85 @@ class ActualSlashCommandTreeTests(unittest.IsolatedAsyncioTestCase):
         client = bot_ui.discord.Client(intents=bot_ui.discord.Intents.none())
         self.addAsyncCleanup(client.close)
         return bot_ui.app_commands.CommandTree(client)
+
+    def interaction(self, actor=42):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=actor, guild_permissions=bot_ui.discord.Permissions.none()),
+            guild=SimpleNamespace(id=1, owner_id=10),
+            response=SimpleNamespace(is_done=lambda: False, send_message=AsyncMock(), send_modal=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def assert_public_registration(self, tree):
+        for command in tree.get_commands():
+            with self.subTest(command=command.name):
+                payload = command.to_dict(tree)
+                self.assertIsNone(command.default_permissions)
+                self.assertIsNone(payload["default_member_permissions"])
+                self.assertEqual(payload["integration_types"], [0])
+                self.assertEqual(payload["contexts"], [0] if command.name == "관리" else [0, 1])
+                self.assertEqual(payload["dm_permission"], command.name != "관리")
+                self.assertFalse(payload["nsfw"])
+
+    async def test_serialized_commands_explicitly_allow_members_and_server_installations(self):
+        tree = self.make_tree()
+        # Command metadata must override restrictive tree defaults from another adapter.
+        tree.allowed_installs = bot_ui.app_commands.AppInstallationType(guild=False, user=True)
+        tree.allowed_contexts = bot_ui.app_commands.AppCommandContext(
+            guild=False, dm_channel=False, private_channel=True,
+        )
+        register_slash_commands(tree)
+        self.assert_public_registration(tree)
+
+    async def test_reused_owned_commands_normalize_stale_access_metadata(self):
+        tree = self.make_tree()
+        original = register_slash_commands(tree)
+        for command in original:
+            command.default_permissions = bot_ui.discord.Permissions.none()
+            command.allowed_installs = bot_ui.app_commands.AppInstallationType(guild=False, user=True)
+            command.allowed_contexts = bot_ui.app_commands.AppCommandContext(
+                guild=False, dm_channel=False, private_channel=True,
+            )
+            command.guild_only = command.name != "관리"
+            command.nsfw = True
+        reused = register_slash_commands(tree)
+        self.assertTrue(all(left is right for left, right in zip(original, reused)))
+        self.assert_public_registration(tree)
+
+    async def test_ordinary_member_can_execute_all_four_general_adapters(self):
+        tree = self.make_tree()
+        start, question, image, growth = (AsyncMock() for _ in range(4))
+        register_slash_commands(tree, start_service=start, question_service=question,
+                                image_service=image, growth_service=growth)
+        with patch.dict(os.environ, {}, clear=True):
+            for name, service in (("시작", start), ("내정보", growth)):
+                target = self.interaction()
+                await tree.get_command(name).callback(target)
+                service.assert_awaited_once_with(target)
+            for name, service in (("질문", question), ("그림", image)):
+                target = self.interaction()
+                await tree.get_command(name).callback(target)
+                modal = target.response.send_modal.call_args.args[0]
+                modal.prompt = SimpleNamespace(value="일반 회원 요청")
+                await modal.on_submit(target)
+                service.assert_awaited_once_with(target, "일반 회원 요청")
+
+    async def test_configured_padak_without_discord_admin_can_open_but_other_member_cannot(self):
+        tree = self.make_tree()
+        register_slash_commands(tree)
+        configured = (855749166764654653, 491239880005910538)
+        with patch.dict(os.environ, {"SPECIAL_ADMIN_USER_IDS": ",".join(map(str, configured))}, clear=True):
+            for actor in (*configured, 10):
+                target = self.interaction(actor)
+                await tree.get_command("관리").callback(target)
+                target.response.send_message.assert_awaited_once()
+                self.assertTrue(target.response.send_message.call_args.kwargs["ephemeral"])
+                self.assertIsInstance(target.response.send_message.call_args.kwargs["view"], bot_ui.AdminPanelView)
+            target = self.interaction()
+            await tree.get_command("관리").callback(target)
+            self.assertEqual(target.response.send_message.call_args.args, (bot_ui.UNAUTHORIZED_ADMIN_MESSAGE,))
+            self.assertTrue(target.response.send_message.call_args.kwargs["ephemeral"])
+            self.assertNotIn("view", target.response.send_message.call_args.kwargs)
 
     async def test_registration_is_idempotent_and_retains_five_global_command_objects(self):
         tree = self.make_tree()

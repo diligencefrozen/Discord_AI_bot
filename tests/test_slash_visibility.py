@@ -50,6 +50,59 @@ class SlashVisibilityTests(unittest.IsolatedAsyncioTestCase):
             target.tree.sync.assert_awaited_once()
             self.assertTrue(state.published)
 
+    async def test_server_context_install_and_age_gates_are_repaired(self):
+        for field, value, counter in (
+            ("allowed_contexts", discord.app_commands.AppCommandContext(guild=False, dm_channel=True), "context_mismatch_count"),
+            ("allowed_contexts", discord.app_commands.AppCommandContext(guild=True, dm_channel=False), "context_mismatch_count"),
+            ("allowed_contexts", discord.app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True), "context_mismatch_count"),
+            ("allowed_installs", discord.app_commands.AppInstallationType(guild=False, user=True), "install_mismatch_count"),
+            ("allowed_installs", discord.app_commands.AppInstallationType(guild=True, user=True), "install_mismatch_count"),
+            ("nsfw", True, "age_restricted_count"),
+        ):
+            with self.subTest(field=field):
+                remote = [command(name) for name in EXPECTED_NAMES]
+                setattr(next(item for item in remote if item.name == "질문"), field, value)
+                self.assertEqual(summarize_slash_visibility(remote)[counter], 1)
+                target, state = bot(remote), SlashVisibilityAudit()
+                self.assertTrue(await state.run(target, "auto"))
+                target.tree.sync.assert_awaited_once()
+
+    async def test_admin_dm_context_is_repaired_without_restricting_members(self):
+        remote = [command(name) for name in EXPECTED_NAMES]
+        next(item for item in remote if item.name == "관리").allowed_contexts = (
+            discord.app_commands.AppCommandContext(guild=True, dm_channel=True))
+        target, state = bot(remote), SlashVisibilityAudit()
+        self.assertTrue(await state.run(target, "auto"))
+        target.tree.sync.assert_awaited_once()
+
+    async def test_readonly_records_bad_context_without_publishing(self):
+        remote = [command(name) for name in EXPECTED_NAMES]
+        remote[0].allowed_installs = discord.app_commands.AppInstallationType(user=True)
+        target, state = bot(remote), SlashVisibilityAudit()
+        self.assertFalse(await state.run(target, "0"))
+        target.tree.sync.assert_not_awaited()
+        self.assertEqual(state.summary["install_mismatch_count"], 1)
+        self.assertIn("서버 설치", state.status_text())
+
+    async def test_wrong_local_access_policy_never_publishes(self):
+        for field, value in (("default_permissions", discord.Permissions.none()),
+                             ("allowed_contexts", discord.app_commands.AppCommandContext(dm_channel=True))):
+            target, state = bot([]), SlashVisibilityAudit()
+            setattr(target.tree.get_commands()[0], field, value)
+            with self.assertLogs("slash_visibility", level="ERROR"):
+                self.assertFalse(await state.run(target, "1"))
+            target.tree.fetch_commands.assert_not_awaited()
+            target.tree.sync.assert_not_awaited()
+
+    async def test_bad_sync_result_is_not_reported_as_published(self):
+        target, state = bot([]), SlashVisibilityAudit()
+        result = [command(name) for name in EXPECTED_NAMES]
+        result[0].allowed_contexts = discord.app_commands.AppCommandContext(dm_channel=True)
+        target.tree.sync.return_value = result
+        with self.assertLogs("slash_visibility", level="ERROR"):
+            self.assertFalse(await state.run(target, "1"))
+        self.assertFalse(state.published)
+
     async def test_readonly_reports_missing_without_repair_and_explicit_one_can_repair(self):
         target, state = bot([]), SlashVisibilityAudit()
         self.assertFalse(await state.run(target, "0"))
@@ -122,6 +175,80 @@ class SlashVisibilityTests(unittest.IsolatedAsyncioTestCase):
         target.tree.fetch_commands.return_value = [obsolete]
         await state.audit_guild_aliases(target, "auto")
         obsolete.delete.assert_not_awaited()
+
+    async def test_guild_copy_permissions_are_repaired_in_place_without_deleting_commands(self):
+        for mode in ("0", "auto", "1"):
+            target, state = bot(), SlashVisibilityAudit()
+            await state.run(target, mode)
+            target.guilds = [SimpleNamespace(id=802904099816472616)]
+            copies = [command(name, discord.Permissions.none()) for name in ("질문", "관리")]
+            for item in copies:
+                item.application_id = target.application_id
+                item.edit = AsyncMock(return_value=command(item.name))
+            unrelated = command("extension", discord.Permissions.none())
+            unrelated.edit = AsyncMock()
+            foreign = command("질문", discord.Permissions.none())
+            foreign.application_id, foreign.edit = 100, AsyncMock()
+            menu = command("관리", discord.Permissions.none())
+            menu.type, menu.edit = discord.AppCommandType.user, AsyncMock()
+            target.tree.fetch_commands.return_value = [*copies, unrelated, foreign, menu]
+            await state.audit_guild_aliases(target, mode)
+            await state.audit_guild_aliases(target, mode)
+            for item in copies:
+                if mode == "0":
+                    item.edit.assert_not_awaited()
+                else:
+                    item.edit.assert_awaited_once_with(default_member_permissions=None)
+                item.delete.assert_not_awaited()
+            for item in (unrelated, foreign, menu):
+                item.edit.assert_not_awaited()
+                item.delete.assert_not_awaited()
+            self.assertEqual(state.guild_shadow_count, 2)
+            self.assertEqual(state.guild_restricted_count, 2)
+            self.assertEqual(state.guild_repaired_count, 0 if mode == "0" else 2)
+
+    async def test_guild_repair_failure_does_not_hide_other_results_or_leak_response(self):
+        target, state = bot(), SlashVisibilityAudit()
+        await state.run(target, "auto")
+        target.guilds = [SimpleNamespace(id=5)]
+        failed, healthy = (command(name, discord.Permissions.none()) for name in ("관리", "질문"))
+        failed.edit = AsyncMock(side_effect=RuntimeError("SECRET_REMOTE_BODY"))
+        healthy.edit = AsyncMock(return_value=command("질문"))
+        target.tree.fetch_commands.return_value = [failed, healthy]
+        with self.assertLogs("slash_visibility", level="WARNING") as logs:
+            await state.audit_guild_aliases(target, "auto")
+        self.assertNotIn("SECRET_REMOTE_BODY", "\n".join(logs.output))
+        self.assertEqual(state.guild_repaired_count, 1)
+        self.assertEqual(state.guild_repair_failed_count, 1)
+        failed.delete.assert_not_awaited()
+        healthy.edit.assert_awaited_once_with(default_member_permissions=None)
+
+    async def test_failed_global_safety_audit_prevents_guild_default_changes(self):
+        target, state = bot([command("foreign")]), SlashVisibilityAudit()
+        with self.assertLogs("slash_visibility", level="ERROR"):
+            await state.run(target, "auto")
+        target.guilds = [SimpleNamespace(id=5)]
+        copy = command("관리", discord.Permissions.none())
+        copy.edit = AsyncMock()
+        target.tree.fetch_commands.return_value = [copy]
+        await state.audit_guild_aliases(target, "auto")
+        copy.edit.assert_not_awaited()
+        copy.delete.assert_not_awaited()
+
+    async def test_alias_delete_failure_cannot_skip_guild_access_repair(self):
+        target, state = bot(), SlashVisibilityAudit()
+        await state.run(target, "auto")
+        target.guilds = [SimpleNamespace(id=5)]
+        alias, copy = command("ai질문"), command("질문", discord.Permissions.none())
+        alias.delete.side_effect = RuntimeError("SECRET_DELETE_BODY")
+        copy.edit = AsyncMock(return_value=command("질문"))
+        target.tree.fetch_commands.return_value = [alias, copy]
+        with self.assertLogs("slash_visibility", level="WARNING") as logs:
+            await state.audit_guild_aliases(target, "auto")
+        self.assertNotIn("SECRET_DELETE_BODY", "\n".join(logs.output))
+        copy.edit.assert_awaited_once_with(default_member_permissions=None)
+        self.assertEqual(state.guild_repaired_count, 1)
+        self.assertEqual(state.guild_aliases_removed, 0)
 
 
 if __name__ == "__main__":
