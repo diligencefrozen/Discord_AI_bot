@@ -6,6 +6,7 @@ import unittest
 
 from moderation_rules import (
     BAD_ROOTS,
+    LINK_REGEX,
     MAX_FILLER_GAP,
     active_bad_roots,
     consume_exemption,
@@ -16,6 +17,67 @@ from moderation_rules import (
     normalize_text,
     should_moderate_message,
 )
+
+
+class SharedLinkPolicyTests(unittest.TestCase):
+    def test_standard_http_links_include_reported_naver_url(self):
+        for value in (
+            "https://naver.com", "http://naver.com", "HTTPS://NAVER.COM",
+            "https://example.invalid/path?q=1#section", "http://127.0.0.1:8080/",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNotNone(LINK_REGEX.search(value))
+
+    def test_common_schemeless_web_addresses(self):
+        for value in (
+            "www.example.com", "WWW.NAVER.COM", "www.example.co.kr/path?q=1",
+            "www.my-site.example:8080/path", "www.example.com.",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNotNone(LINK_REGEX.search(value))
+
+    def test_schemeless_discord_invites(self):
+        for value in (
+            "discord.gg/example", "DISCORD.GG/Example123", "discord.gg/a-b",
+            "discord.com/invite/example", "discordapp.com/invite/example",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNotNone(LINK_REGEX.search(value))
+
+    def test_existing_explicit_bare_domain_matches_are_preserved(self):
+        for value in (
+            "youtu.be/example", "youtube.com/watch?v=1", "gall.dcinside.com/board",
+            "m.dcinside.com/board", "news.naver.com/article/1", "news.v.daum.com/v/1",
+            "YOUTUBE.COM", "prefixyoutube.comsuffix",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNotNone(LINK_REGEX.search(value))
+
+    def test_markdown_and_angle_wrappers_do_not_hide_links(self):
+        for link in ("https://naver.com", "www.example.com", "discord.gg/example"):
+            for wrapper in ("<{}>", "[사이트]({})", "||{}||", "`{}`", "앞문장 {} 뒷문장"):
+                with self.subTest(link=link, wrapper=wrapper):
+                    self.assertIsNotNone(LINK_REGEX.search(wrapper.format(link)))
+
+    def test_ordinary_text_files_versions_and_emails_are_not_links(self):
+        for value in (
+            "ㅇ", "일반 채팅입니다", "ordinary English prose", "main.py", "photo.png",
+            "archive.tar.gz", "release 1.2.3", "Python 3.13.0", "user@example.com",
+            "person@www.example.com", "person@discord.gg/example", "example.com",
+            "www.", "www.file", "www._example.com", "discord.gg/", "discord.com/invite/",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(LINK_REGEX.search(value))
+
+    def test_links_do_not_gain_profanity_normalization_or_network_lookups(self):
+        self.assertIsNone(LINK_REGEX.search("https:\u200b//example.com"))
+        self.assertIsNone(LINK_REGEX.search("ｗｗｗ．example．com"))
+
+    def test_long_non_matching_hosts_remain_bounded(self):
+        started = time.perf_counter()
+        for value in ("www." + "a" * 100_000, "www." + "a." * 50_000 + "1"):
+            self.assertIsNone(LINK_REGEX.search(value))
+        self.assertLess(time.perf_counter() - started, 5.0)
 
 
 class ModerationRulesTests(unittest.TestCase):

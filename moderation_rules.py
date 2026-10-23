@@ -17,6 +17,22 @@ import unicodedata
 from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
 
 
+# One link policy is shared by new messages, edits, scans and AI prompts.
+# Preserve the historical HTTP(S) and explicit bare-domain rules verbatim;
+# additionally recognise common scheme-less web addresses and Discord invites.
+# Do not treat arbitrary dotted words, filenames or email addresses as links.
+# Host labels are bounded and separated by literal dots, avoiding ambiguous
+# nested repetitions. This checks syntax only and performs no DNS/network I/O.
+LINK_REGEX = re.compile(
+    r"https?://\S+"
+    r"|youtu\.be|youtube\.com|gall\.dcinside\.com|m\.dcinside\.com|news\.(naver|v\.daum)\.com"
+    r"|(?<![\w@.-])www\."
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?![\w@-])"
+    r"|(?<![\w@.-])(?:discord\.gg|discord(?:app)?\.com/invite)/[a-z0-9-]+(?![\w@-])",
+    re.I,
+)
+
+
 # Keep this list in sync with the original bot policy.  Adding normalization or
 # matching behavior must not silently change the configured policy vocabulary.
 BAD_ROOTS = frozenset(

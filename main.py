@@ -39,6 +39,7 @@ from ai_providers import (
 )
 from moderation_rules import (
     BAD_ROOTS,
+    LINK_REGEX,
     active_bad_roots,
     find_badroot as find_badroot_strict,
     lookup_exemption as lookup_rule_exemption,
@@ -2345,10 +2346,6 @@ GAME_CARD_CHANNELS = {
     820536422808944662,
 }
 
-LINK_REGEX = re.compile(
-    r'https?://\S+|youtu\.be|youtube\.com|gall\.dcinside\.com|m\.dcinside\.com|news\.(naver|v\.daum)\.com',
-    re.I,
-)
 EDIT_MODERATION = EditModerationService(
     bot, evaluate=_evaluate_message_policy, delete=safe_delete,
     consume_pass=use_profanity_pass, has_pass=is_user_exempt_from_profanity,

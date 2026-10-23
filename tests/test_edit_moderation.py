@@ -4,13 +4,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-import re
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 
 from edit_moderation import EditModerationConfig, EditModerationService, evaluate_policy
-from moderation_rules import find_badroot
+from moderation_rules import LINK_REGEX, find_badroot
 
 
 UTC = timezone.utc
@@ -20,7 +19,7 @@ NOW = datetime(2026, 10, 22, 12, tzinfo=UTC)
 def policy(message):
     return evaluate_policy(message.content, message.channel.id,
                            parent_channel_id=getattr(message.channel, "parent_id", None),
-                           link_regex=re.compile(r"https?://\S+", re.I), find_badroot=find_badroot,
+                           link_regex=LINK_REGEX, find_badroot=find_badroot,
                            allowed_link_channel_ids={99}, exempt_profanity_channel_ids={98})
 
 
@@ -121,6 +120,76 @@ class PurePolicyTests(unittest.TestCase):
 
 
 class EditEventTests(unittest.IsolatedAsyncioTestCase):
+    async def test_link_only_edits_share_policy_and_allow_channel_and_counted_pass_exceptions(self):
+        for link in ("https://naver.com", "www.naver.com", "discord.gg/example", "discord.com/invite/example"):
+            with self.subTest(link=link):
+                channel = Channel()
+                worker = service([channel])
+                before, after = message("ㅇ", channel=channel, edited=False), message(link, channel=channel)
+                worker.record_new_outcome(before, "clean")
+                self.assertEqual(await worker.on_raw_edit(payload(after)), "deleted")
+                self.assertEqual(worker.delete.call_args.kwargs["reason"], "link")
+                self.assertIsNone(worker.delete.call_args.kwargs["matched_rule"])
+                await worker.on_cached_edit(before, after)
+                worker.delete.assert_awaited_once()
+        for channel_id, has_pass, expected in ((99, False, "clean"), (10, True, "exempt")):
+            with self.subTest(channel_id=channel_id, has_pass=has_pass):
+                channel = Channel(channel_id)
+                worker = service([channel], consume_pass=Mock(return_value=has_pass))
+                current = message("https://naver.com", channel=channel)
+                self.assertEqual(await worker.on_raw_edit(payload(current)), expected)
+                self.assertEqual(await worker.on_cached_edit(message("ㅇ", channel=channel), current), expected)
+                worker.delete.assert_not_awaited()
+                self.assertEqual(worker.consume_pass.call_count, int(has_pass))
+
+    async def test_naver_link_preview_partial_edit_fetches_actual_current_body(self):
+        channel = Channel()
+        worker = service([channel])
+        before = message("ㅇ", channel=channel, edited=False)
+        worker.record_new_outcome(before, "clean")
+        current = message("https://naver.com", channel=channel)
+        channel.fetch_message.return_value = current
+        raw = payload(before, content=False)
+        raw.data = {"id": str(current.id), "channel_id": str(channel.id),
+                    "embeds": [{"type": "link", "url": "https://naver.com"}]}
+        self.assertEqual(await worker.on_raw_edit(raw), "deleted")
+        channel.fetch_message.assert_awaited_once_with(current.id)
+        worker.delete.assert_awaited_once()
+        self.assertEqual(worker.delete.call_args.args[0].content, "https://naver.com")
+        self.assertEqual(worker.delete.call_args.kwargs["reason"], "link")
+        self.assertEqual(await worker.on_cached_edit(before, current), "already_deleted")
+        worker.delete.assert_awaited_once()
+
+    async def test_preview_url_never_replaces_or_invents_the_message_body(self):
+        channel = Channel()
+        worker = service([channel])
+        current = message("ㅇ", channel=channel)
+        channel.fetch_message.return_value = current
+        raw = payload(current, content=False)
+        raw.data = {"id": str(current.id), "embeds": [{"type": "link", "url": "https://naver.com"}]}
+        self.assertEqual(await worker.on_raw_edit(raw), "clean")
+        channel.fetch_message.assert_awaited_once()
+        worker.delete.assert_not_awaited()
+        worker.consume_pass.assert_not_called()
+
+    async def test_current_link_edit_does_not_need_unnecessary_history_permission(self):
+        channel = Channel()
+        channel.permissions.read_message_history = False
+        worker = service([channel])
+        current = message("https://naver.com", channel=channel)
+        self.assertEqual(await worker.on_raw_edit(payload(current)), "deleted")
+        channel.fetch_message.assert_not_awaited()
+        worker.delete.assert_awaited_once()
+
+    async def test_missing_body_requires_history_permission_before_fetch(self):
+        channel = Channel()
+        channel.permissions.read_message_history = False
+        worker = service([channel])
+        current = message("https://naver.com", channel=channel)
+        self.assertEqual(await worker.on_raw_edit(payload(current, content=False)), "history_forbidden")
+        channel.fetch_message.assert_not_awaited()
+        worker.delete.assert_not_awaited()
+
     async def test_safe_original_then_edit_deletes_current_body_once(self):
         channel = Channel()
         worker = service([channel])
@@ -372,6 +441,21 @@ class EditEventTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HistoryScanTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_scan_checks_link_edits_without_spending_passes(self):
+        channel = Channel()
+        channel.messages = [message("https://naver.com", channel=channel)]
+        worker = service([channel])
+        result = await worker.scan_once()
+        self.assertEqual(result.deleted, 1)
+        self.assertEqual(worker.delete.call_args.kwargs["reason"], "link")
+        worker.consume_pass.assert_not_called()
+        channel = Channel()
+        channel.permissions.read_message_history = False
+        worker = service([channel])
+        result = await worker.scan_once()
+        self.assertEqual(result.forbidden, 1)
+        self.assertEqual(channel.history_calls, [])
+
     async def test_two_phases_cover_96_hours_and_creation_not_edit_time(self):
         channel = Channel()
         recent = message("시발", channel=channel, message_id=1)

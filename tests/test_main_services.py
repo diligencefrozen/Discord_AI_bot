@@ -54,7 +54,7 @@ def services():
         "lookup_rule_exemption": moderation_rules.lookup_exemption,
         "parse_command": moderation_rules.parse_command,
         "ALLOWED_CHANNELS": {99}, "EXEMPT_PROFANITY_CHANNEL_IDS": {98},
-        "LINK_REGEX": re.compile(r"https?://\S+", re.I),
+        "LINK_REGEX": moderation_rules.LINK_REGEX,
         "user_xp_data": {}, "get_today_date": lambda: "2026-10-21",
         "save_xp_data": Mock(), "save_achievements_data": Mock(), "check_achievements": Mock(return_value=[]),
         "safe_delete": AsyncMock(return_value=True), "_metric": Mock(),
@@ -405,6 +405,58 @@ class PublicQuestionTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipIf(discord is None, "requires actual discord.py")
 class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_naver_link_edit_uses_real_policy_delete_and_public_audit_once(self):
+        from edit_moderation import EditModerationService
+
+        for mode in ("cached_first", "raw_first", "uncached", "partial", "preview"):
+            with self.subTest(mode=mode):
+                ns, target, log_channel, audit = self.audit_context("ㅇ")
+                now = datetime.datetime.now(datetime.timezone.utc)
+                target.created_at, target.edited_at = now, None
+                target.channel.fetch_message = AsyncMock(return_value=target)
+                target.channel.get_partial_message = Mock(return_value=SimpleNamespace(delete=target.delete))
+                worker = EditModerationService(
+                    SimpleNamespace(get_channel=lambda _id: target.channel, user=SimpleNamespace(id=99)),
+                    evaluate=ns["_evaluate_message_policy"], delete=ns["safe_delete"],
+                    consume_pass=ns["use_profanity_pass"], has_pass=ns["is_user_exempt_from_profanity"],
+                    remember=audit.remember)
+                ns["EDIT_MODERATION"] = worker
+                self.assertTrue(await ns["_moderate_message_content"](target))
+                before = SimpleNamespace(**vars(target))
+                target.content, target.edited_at = "https://naver.com", now + datetime.timedelta(seconds=1)
+                data = {"id": "123", "channel_id": "1", "content": target.content,
+                        "edited_timestamp": target.edited_at.isoformat(), "author": {"id": "42", "username": "author"}}
+                raw = SimpleNamespace(guild_id=1, channel_id=1, message_id=123,
+                                      cached_message=None if mode == "uncached" else before,
+                                      message=target if mode != "uncached" else None, data=data)
+                if mode == "partial":
+                    data.pop("content")
+                elif mode == "preview":
+                    raw.data = {"id": "123", "channel_id": "1", "embeds": [{"type": "link", "url": target.content}]}
+                ns["add_xp"] = Mock(side_effect=AssertionError("edit replayed XP"))
+                ns["_generate_text_response"] = AsyncMock(side_effect=AssertionError("edit replayed AI"))
+                with self.assertLogs("deletion_audit", level="INFO") as captured:
+                    if mode == "cached_first":
+                        await ns["on_message_edit"](before, target)
+                        await ns["on_raw_message_edit"](raw)
+                    else:
+                        await ns["on_raw_message_edit"](raw)
+                        await ns["on_message_edit"](before, target)
+                    await ns["on_message_delete"](target)
+                target.delete.assert_awaited_once()
+                log_channel.send.assert_awaited_once()
+                card = log_channel.send.call_args.kwargs["embed"]
+                original = next(field.value for field in card.fields if "원문" in field.name)
+                self.assertEqual(original.replace("\u200b", ""), "https://naver.com")
+                self.assertIn("링크", next(field.value for field in card.fields if "사유" in field.name))
+                self.assertIn("수정", str(card.to_dict()))
+                self.assertNotIn(target.content, "\n".join(captured.output))
+                ns["add_xp"].assert_not_called()
+                ns["_generate_text_response"].assert_not_awaited()
+                ns["_observe_typing_message"].assert_not_called()
+                ns["_typing_message_fallback"].assert_not_called()
+                self.assertEqual(target.channel.fetch_message.await_count, int(mode in {"partial", "preview"}))
+
     def audit_context(self, content="시321133발"):
         from deletion_audit import DeletionAuditService
 

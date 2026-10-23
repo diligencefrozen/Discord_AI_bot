@@ -247,7 +247,7 @@ class EditModerationService:
             self._deleted.move_to_end(key)
         self._trim()
 
-    def _eligibility(self, message: Any, *, permissions: bool = True) -> str | None:
+    def _eligibility(self, message: Any, *, permissions: bool = True, require_history: bool = False) -> str | None:
         guild, channel, author = (getattr(message, key, None) for key in ("guild", "channel", "author"))
         if guild is None:
             return "dm"
@@ -262,8 +262,10 @@ class EditModerationService:
         if permissions:
             try:
                 perms = channel.permissions_for(guild.me)
-                if not all(getattr(perms, permission, False) for permission in ("view_channel", "read_message_history", "manage_messages")):
+                if not all(getattr(perms, permission, False) for permission in ("view_channel", "manage_messages")):
                     return "forbidden"
+                if require_history and not getattr(perms, "read_message_history", False):
+                    return "history_forbidden"
             except Exception:
                 return "forbidden"
         return None
@@ -271,7 +273,7 @@ class EditModerationService:
     async def inspect(self, message: Any, *, trigger: str = "message_edit", enforce_permissions: bool = True) -> str:
         if not self.config.enabled:
             return "disabled"
-        excluded = self._eligibility(message, permissions=enforce_permissions)
+        excluded = self._eligibility(message, permissions=enforce_permissions, require_history=trigger == "history_scan")
         if excluded:
             self.last_event_code = excluded
             return excluded
@@ -404,9 +406,16 @@ class EditModerationService:
         if not getattr(payload, "guild_id", None):
             return "dm"
         data = getattr(payload, "data", {})
-        # Discord also updates rich embeds without editing the message body.
+        # Link previews may be the only partial update we observe. They are
+        # a signal to fetch the CURRENT body, never evidence for deletion by
+        # themselves. Decorative/embed-only updates still avoid network I/O.
         if "content" not in data and "embeds" in data and set(data) <= {"id", "channel_id", "guild_id", "embeds"}:
-            return "embed_only"
+            embeds = data.get("embeds")
+            preview = (isinstance(embeds, (list, tuple)) and any(
+                isinstance(item, Mapping) and isinstance(item.get("url"), str)
+                and item["url"][:8].lower().startswith(("http://", "https://")) for item in embeds[:10]))
+            if not preview:
+                return "embed_only"
         channel = self.bot.get_channel(payload.channel_id)
         if channel is None or getattr(getattr(channel, "guild", None), "id", None) != payload.guild_id:
             self.last_event_code = "channel_unavailable"
@@ -419,7 +428,7 @@ class EditModerationService:
         # checked on the fetched current message rather than the partial event.
         probe = SimpleNamespace(guild=channel.guild, channel=channel,
                                 author=SimpleNamespace(id=-1, bot=False))
-        excluded = self._eligibility(probe)
+        excluded = self._eligibility(probe, require_history=current is None)
         if excluded:
             self.last_event_code = excluded
             return excluded
@@ -505,11 +514,11 @@ class EditModerationService:
             async def channel_window(channel: Any, after: datetime, before: datetime) -> None:
                 guild_id, channel_id = channel.guild.id, channel.id
                 probe = SimpleNamespace(guild=channel.guild, channel=channel, author=SimpleNamespace(id=-1, bot=False))
-                excluded = self._eligibility(probe)
+                excluded = self._eligibility(probe, require_history=True)
                 if excluded:
                     if (guild_id, channel_id) not in excluded_channels:
                         excluded_channels.add((guild_id, channel_id))
-                        increment(guild_id, "forbidden" if excluded == "forbidden" else "excluded")
+                        increment(guild_id, "forbidden" if excluded in {"forbidden", "history_forbidden"} else "excluded")
                     return
                 key = (guild_id, channel_id)
                 remaining = self.config.max_messages_per_channel - counts.get(key, 0)
