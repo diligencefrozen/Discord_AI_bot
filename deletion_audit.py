@@ -86,17 +86,28 @@ def _size(value: int | None) -> str:
     return f"{value / (1024 * 1024):,.1f} MB"
 
 
+def _identity_reference(identifier: int, marker: str, fallback: str) -> str:
+    """Only trusted numeric snapshot identities may create clickable mentions.
+
+    The transport always uses AllowedMentions.none(); these references identify
+    the actual account/channel without copying a mutable display name or pinging.
+    Unknown identities remain plain escaped text instead of guessed mentions.
+    """
+    if type(identifier) is int and 0 < identifier < (1 << 64):
+        return f"<{marker}{identifier}>"
+    return _text(fallback, 120)
+
+
 def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime | None = None,
                          include_content: bool = True) -> discord.Embed:
-    """Prioritize the original body, keeping IDs and delivery time in one footer."""
+    """Compact legacy-style identity links, original body and a KST footer."""
     deleted_at = deleted_at or datetime.now(timezone.utc)
     if deleted_at.tzinfo is None:
         deleted_at = deleted_at.replace(tzinfo=timezone.utc)
-    author = _text(snapshot.author_name or "작성자 확인 불가", 120)
-    author_id = str(snapshot.author_id) if snapshot.author_id else "확인 불가"
-    channel = _text(snapshot.channel_name or "채널 이름 확인 불가", 120)
+    author = _identity_reference(snapshot.author_id, "@", snapshot.author_name or "작성자 확인 불가")
+    channel = _identity_reference(snapshot.channel_id, "#", snapshot.channel_name or "채널 확인 불가")
     reason_code = _code(snapshot.reason.code)
-    embed = discord.Embed(title="🗑️ 메시지 삭제 기록", description=f"**{author}** · #{channel}", color=0xED4245)
+    embed = discord.Embed(title="메시지 삭제 기록", description=f"**User:** {author}\n**Channel:** {channel}", color=0xED4245)
     if not include_content:
         original = "원문 기록이 비활성화되어 있습니다."
     elif not snapshot.content_available:
@@ -109,7 +120,7 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
         original = "본문 없음 · 첨부파일/스티커/임베드만 있는 메시지"
     else:
         original = "본문 없음 · 빈 메시지"
-    embed.add_field(name="삭제된 원문", value=original[:1024], inline=False)
+    embed.add_field(name="Deleted Content", value=original[:1024], inline=False)
     detection = REASON_LABELS[reason_code]
     if snapshot.delete_origin == "bot":
         detection = "봇 직접 삭제 · " + detection
@@ -137,14 +148,14 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
         emoji_lines = []
         for item in snapshot.emojis[:12]:
             if item.kind == "custom":
-                emoji_lines.append(f"커스텀 {'움직이는 ' if item.animated else ''}이모지 {_text(item.name, 60)} · ID {item.id}")
+                emoji_lines.append(f"커스텀 {'움직이는 ' if item.animated else ''}이모지 {_text(item.name, 60)}")
             else:
                 emoji_lines.append(_text(item.text, 80))
         if len(snapshot.emojis) > 12:
             emoji_lines.append(f"외 {len(snapshot.emojis) - 12}개 표시 생략")
         if emoji_lines:
             embed.add_field(name="이모지", value="\n".join(emoji_lines)[:850], inline=False)
-        stickers = [f"{_text(item.name, 100)} · ID {item.id} · {_text(item.format, 40)}" for item in snapshot.stickers[:4]]
+        stickers = [f"{_text(item.name, 100)} · {_text(item.format, 40)}" for item in snapshot.stickers[:4]]
         if stickers or snapshot.sticker_count:
             embed.add_field(name=f"스티커 · {snapshot.sticker_count if snapshot.sticker_count is not None else '미상'}개",
                             value=_collection(stickers, snapshot.sticker_count, snapshot.stickers_available), inline=False)
@@ -155,7 +166,7 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
             attachment_lines.append(
                 f"{_text(item.filename or '이름 미상', 90)} · {kind}\n"
                 f"{_text(item.content_type or 'MIME 미상', 60)} · {_size(item.size)}"
-                f"{dimensions} · ID {item.id or '미상'}" + (" · 스포일러 예" if item.spoiler else "")
+                f"{dimensions}" + (" · 스포일러 예" if item.spoiler else "")
             )
         count = snapshot.attachment_count
         image_count = sum(item.kind in {"image", "gif"} for item in snapshot.attachments)
@@ -171,9 +182,8 @@ def build_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at: datetime
                             value=_collection(embeds, snapshot.embed_count, snapshot.embeds_available), inline=False)
         if snapshot.truncated_fields:
             embed.add_field(name="확보 범위", value="일부 데이터는 안전한 메모리/표시 상한으로 생략되었습니다.", inline=False)
-    embed.set_footer(text=(f"삭제 확인 {deleted_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST · 봇 수신 기준\n"
-                           f"메시지 ID {snapshot.message_id} · 작성자 ID {author_id} · 채널 ID {snapshot.channel_id}\n"
-                           f"서버 {_text(snapshot.guild_name or '이름 확인 불가', 120)} · ID {snapshot.guild_id}"))
+    embed.set_footer(text=(f"{_text(snapshot.guild_name or '서버 이름 확인 불가', 120)} | "
+                           f"{deleted_at.astimezone(KST):%Y-%m-%d %H:%M:%S} KST"))
     # Field caps above normally stay below 6000; trim metadata from the end if
     # every untrusted metadata item happens to hit its maximum simultaneously.
     removed = False
@@ -196,7 +206,6 @@ def build_metadata_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at:
                        "snapshot_not_found", "snapshot_stale"}
     reason_code = reason_code if reason_code in allowed_reasons else "unknown_permissions"
     embed = build_deletion_embed(snapshot, deleted_at=deleted_at, include_content=False)
-    embed.title = "🗑️ 메시지 삭제 기록"
     if reason_code == "content_disabled":
         content_state = "원문 기록이 비활성화되어 있습니다."
     elif reason_code in {"snapshot_not_found", "snapshot_stale"}:
@@ -205,7 +214,7 @@ def build_metadata_deletion_embed(snapshot: MessageAuditSnapshot, *, deleted_at:
         content_state = "원본 채널 공개 정책에 따라 생략 · 원문 비공개"
         if not snapshot.content_available:
             content_state += "\n원문 확인 불가(캐시/스냅샷 없음)"
-    embed.set_field_at(0, name="삭제된 원문", value=content_state, inline=False)
+    embed.set_field_at(0, name="Deleted Content", value=content_state, inline=False)
     counts = " · ".join(f"{label} {count}개"
                         for label, count in (("첨부파일", snapshot.attachment_count),
                                              ("스티커", snapshot.sticker_count), ("임베드", snapshot.embed_count)) if count)

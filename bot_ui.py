@@ -454,6 +454,18 @@ def _typing_display_name(user: Any) -> str:
     return "".join("\\" + char if char in "\\`*_~|><[]()#" else char for char in name)
 
 
+def _typing_user_reference(user: Any) -> str:
+    """Link to the actual account; only a validated Discord ID creates a mention.
+
+    The outbound payload disables all notifications. A literal fallback keeps
+    persistent view construction and incomplete test/member objects safe.
+    """
+    user_id = getattr(user, "id", None)
+    if _is_integer_id(user_id) and user_id < 2**64:
+        return f"<@{user_id}>"
+    return _typing_display_name(user)
+
+
 class TypingIntroView(_IntroActions, _LayoutViewBase):
     """One Components V2 box containing notice text and both button rows.
 
@@ -466,8 +478,8 @@ class TypingIntroView(_IntroActions, _LayoutViewBase):
                  growth_service=None, menu_service=None):
         super().__init__(timeout=None)
         self._configure_services(question_service, image_service, growth_service, menu_service)
-        display_name = _typing_display_name(user)
-        self.text = f"**👀 {display_name}님, 채팅을 작성 중이셨네요!**\n\n필요하시면 도리봇이 도와드릴게요."
+        user_reference = _typing_user_reference(user)
+        self.text = f"**👀 {user_reference}님, 채팅을 작성 중이셨네요!**\n\n필요하시면 도리봇이 도와드릴게요."
         buttons = self._intro_buttons()
         buttons[0].style = discord.ButtonStyle.primary
         self.add_item(_Container(
@@ -816,7 +828,7 @@ class SlashCommandRegistrationState:
 
 
 def typing_intro_payload(user: Any, **services: Any) -> dict[str, Any]:
-    """Build one V2 public notice with a plain display name and no mentions."""
+    """Build one V2 notice with a clickable profile and no mention notifications."""
     return {
         "view": TypingIntroView(user, **services),
         "allowed_mentions": _no_mentions(),

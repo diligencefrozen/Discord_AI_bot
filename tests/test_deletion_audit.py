@@ -67,7 +67,7 @@ def raw(message_id=100, **kwargs):
 
 
 def field(embed, name):
-    name = {"탐지 사유": "삭제 사유", "탐지 정보": "삭제 사유"}.get(name, name)
+    name = {"탐지 사유": "삭제 사유", "탐지 정보": "삭제 사유", "원문": "Deleted Content"}.get(name, name)
     return next(item.value for item in embed.fields if name in item.name)
 
 
@@ -128,12 +128,11 @@ class EmbedTests(unittest.TestCase):
         self.assertIn("시발", field(embed, "탐지 사유"))
         self.assertNotIn("시321133발", field(embed, "탐지 사유"))
         self.assertIn("2026-10-22 19:23:45 KST", embed.footer.text)
-        self.assertIn("작성자", embed.description)
-        self.assertIn("ID 50", embed.footer.text)
-        self.assertIn("채널 ID 11", embed.footer.text)
+        self.assertEqual(embed.description, "**User:** <@50>\n**Channel:** <#11>")
+        self.assertEqual(embed.footer.text, "운영 서버 | 2026-10-22 19:23:45 KST")
         self.assertIn("봇 직접 삭제", field(embed, "삭제 사유"))
         self.assertIn("자동 검열 · 금칙어", field(embed, "삭제 사유"))
-        self.assertIn("100", embed.footer.text)
+        self.assertNotIn("100", embed.footer.text)
         self.assertEqual(embed.colour.value, 0xED4245)
 
     def test_attachment_only_and_uncached_original_are_distinct(self):
@@ -161,7 +160,8 @@ class EmbedTests(unittest.TestCase):
         self.assertIn("wave", field(embed, "이모지"))
         self.assertIn("움직이는", field(embed, "이모지"))
         self.assertIn("인사", field(embed, "스티커"))
-        self.assertIn("ID 7", field(embed, "스티커"))
+        self.assertIn("png", field(embed, "스티커"))
+        self.assertNotIn("ID 7", field(embed, "스티커"))
         self.assertIn("움직이는 이미지", field(embed, "첨부파일"))
         self.assertIn("동영상", field(embed, "첨부파일"))
         self.assertIn("문서", field(embed, "첨부파일"))
@@ -173,7 +173,9 @@ class EmbedTests(unittest.TestCase):
         embed = build_deletion_embed(capture_message_snapshot(target))
         rendered = str(embed.to_dict())
         self.assertNotIn("@everyone", rendered)
-        self.assertNotIn("<@50>", rendered)
+        # Only the trusted author reference may be clickable. Body mentions are inert.
+        self.assertEqual(embed.description, "**User:** <@50>\n**Channel:** <#11>")
+        self.assertNotIn("<@50>", field(embed, "원문"))
         self.assertNotIn("```", rendered)
         self.assertNotIn("https://evil.test", rendered)
         self.assertNotIn("**fake**", rendered)
@@ -395,13 +397,15 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.service.destination_for(1, 123))
         self.assertIsNone(self.service.destination_for(1, 20))
 
-    async def test_explicit_unknown_raw_source_restores_known_ids_without_inventing_content(self):
+    async def test_explicit_unknown_raw_source_keeps_channel_link_without_inventing_content(self):
         self.channels.pop(11)
         await self.service.on_raw_message_delete(raw())
         self.destination.send.assert_awaited_once()
         rendered = str(self.destination.send.call_args.kwargs["embed"].to_dict())
-        for expected in ("100", "채널 ID 11", "작성자 확인 불가", "원문 확인 불가"):
+        for expected in ("<#11>", "작성자 확인 불가", "원문 확인 불가"):
             self.assertIn(expected, rendered)
+        self.assertNotIn("메시지 ID", rendered)
+        self.assertNotIn("<@", rendered)
         self.assertEqual(self.service.diagnostics(1)["last_reason"], "source_not_found")
         self.assertEqual(self.service.diagnostics(1)["sent_metadata_only"], 1)
         self.assertEqual(self.service.diagnostics(1)["failed"], 0)
@@ -428,8 +432,9 @@ class PublicServiceTests(unittest.IsolatedAsyncioTestCase):
             embed = call.kwargs["embed"]
             self.assertIn("메시지 삭제 기록", embed.title)
             self.assertNotIn("열람 범위 제한", embed.title)
-            for expected in ("채널 ID 11", "메시지 ID", "KST"):
+            for expected in ("<#11>", "KST"):
                 self.assertIn(expected, str(embed.to_dict()))
+            self.assertNotIn("메시지 ID", str(embed.to_dict()))
             for secret in ("private-sensitive-content",):
                 self.assertNotIn(secret, str(embed.to_dict()))
         status = self.service.diagnostics(1)
@@ -859,10 +864,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service._semaphore.release()
         await pending
         footer = self.channel.send.call_args.kwargs["embed"].footer.text
-        self.assertIn("삭제 확인", footer)
         self.assertIn("2026-10-22 19:00:00 KST", footer)
         self.assertNotIn("19:05:00", footer)
-        self.assertIn("봇 수신 기준", footer)
+        self.assertEqual(footer, "운영 서버 | 2026-10-22 19:00:00 KST")
 
     async def test_http_confirmation_time_is_retained_while_delivery_is_queued(self):
         current = [datetime(2026, 10, 22, 10, 1, 0, tzinfo=timezone.utc)]

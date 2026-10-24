@@ -446,7 +446,7 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 target.delete.assert_awaited_once()
                 log_channel.send.assert_awaited_once()
                 card = log_channel.send.call_args.kwargs["embed"]
-                original = next(field.value for field in card.fields if "원문" in field.name)
+                original = next(field.value for field in card.fields if field.name == "Deleted Content")
                 self.assertEqual(original.replace("\u200b", ""), "https://naver.com")
                 self.assertIn("링크", next(field.value for field in card.fields if "사유" in field.name))
                 self.assertIn("수정", str(card.to_dict()))
@@ -491,7 +491,7 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         return ns, target, log_channel, audit
 
     async def test_real_moderation_to_public_card_preserves_original_and_deduplicates_events(self):
-        ns, target, log_channel, _audit = self.audit_context()
+        ns, target, log_channel, audit = self.audit_context()
         with self.assertLogs("deletion_audit", level="INFO") as captured:
             self.assertFalse(await ns["_moderate_message_content"](target))
             await ns["on_message_delete"](target)
@@ -503,7 +503,9 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         rendered = str(payload["embed"].to_dict())
         self.assertIn("시321133발", rendered)
         self.assertIn(moderation_rules.find_badroot(target.content), rendered)
-        self.assertIn("123", rendered)
+        self.assertEqual(payload["embed"].description, "**User:** <@42>\n**Channel:** <#1>")
+        self.assertNotIn("메시지 ID", rendered)
+        self.assertIn((target.guild.id, target.id), audit._delivered)
         self.assertNotIn("시321133발", "\n".join(captured.output))
         self.assertEqual(payload["allowed_mentions"].to_dict()["parse"], [])
 
@@ -523,8 +525,11 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         log_channel.send.assert_awaited_once()
         card = log_channel.send.call_args.kwargs["embed"]
         rendered = str(card.to_dict())
-        for legacy in ("Apple Watch", "42", "moderator-only", "123", "KST"):
+        for legacy in ("<@42>", "<#1>", "KST"):
             self.assertIn(legacy, rendered)
+        for redundant in ("Apple Watch", "moderator-only", "메시지 ID", "채널 ID"):
+            self.assertNotIn(redundant, rendered)
+        self.assertIn((target.guild.id, target.id), audit._delivered)
         self.assertIn("금칙어", rendered)
         for secret in (target.content, "PRIVATE-FILENAME", moderation_rules.find_badroot(target.content)):
             self.assertNotIn(secret, rendered)
@@ -559,9 +564,8 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         target.delete.assert_awaited_once()
         log_channel.send.assert_awaited_once()
         card = log_channel.send.call_args.kwargs["embed"]
-        self.assertIn("Apple Watch", card.description)
-        self.assertIn("moderator-only", card.description)
-        original = next(field.value for field in card.fields if "원문" in field.name)
+        self.assertEqual(card.description, "**User:** <@42>\n**Channel:** <#1>")
+        original = next(field.value for field in card.fields if field.name == "Deleted Content")
         detected = next(field.value for field in card.fields if "삭제 사유" in field.name)
         self.assertIn("시321133발", original)
         self.assertIn(moderation_rules.find_badroot(target.content), detected)
@@ -596,7 +600,10 @@ class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
         rendered = str(log_channel.send.call_args.kwargs["embed"].to_dict())
         self.assertIn("시321133발", rendered)
         self.assertIn("수정", rendered)
-        self.assertIn("123", rendered)
+        self.assertEqual(log_channel.send.call_args.kwargs["embed"].description,
+                         "**User:** <@42>\n**Channel:** <#1>")
+        self.assertNotIn("메시지 ID", rendered)
+        self.assertIn((target.guild.id, target.id), audit._delivered)
         self.assertNotIn("시321133발", "\n".join(captured.output))
         ns["add_xp"].assert_not_called()
         ns["_generate_text_response"].assert_not_awaited()

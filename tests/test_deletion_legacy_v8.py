@@ -48,12 +48,14 @@ class LegacyDeletionV8Tests(unittest.IsolatedAsyncioTestCase):
     def rendered(self):
         return str(self.destination.send.call_args.kwargs["embed"].to_dict())
 
-    def assert_base(self, message_id=100, *, known_author=True):
+    def assert_base(self, *, known_author=True):
         card = self.destination.send.call_args.kwargs["embed"]
-        for value in (str(message_id), "메시지 ID", "채널 ID 11", "KST"):
+        for value in ("<#11>", "KST"):
             self.assertIn(value, str(card.to_dict()))
+        for label in ("메시지 ID", "채널 ID", "작성자 ID"):
+            self.assertNotIn(label, str(card.to_dict()))
         self.assertNotIn("열람 범위 제한", card.title)
-        self.assertIn("Apple Watch" if known_author else "작성자 확인 불가", str(card.to_dict()))
+        self.assertIn("<@50>" if known_author else "작성자 확인 불가", card.description)
         self.assertEqual(self.destination.send.call_args.kwargs["allowed_mentions"].to_dict()["parse"], [])
 
     async def test_T01_public_source_sends_legacy_fields_plus_body_once(self):
@@ -69,7 +71,7 @@ class LegacyDeletionV8Tests(unittest.IsolatedAsyncioTestCase):
         await self.service.delete(target, reason="profanity", matched_rule=find_badroot(target.content), detail="SECRET-DETAIL")
         self.destination.send.assert_awaited_once()
         self.assert_base()
-        self.assertIn("moderator-only", self.rendered())
+        self.assertIn("<#11>", self.rendered())
         self.assertIn("금칙어", self.rendered())
         self.assertEqual(self.service.diagnostics(1)["last_reason"], "private_source")
         self.assertIn("공개 정책", self.rendered())
@@ -132,14 +134,14 @@ class LegacyDeletionV8Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(embed_field(self.destination.send.call_args.kwargs["embed"], "원문"), "시발")
         self.assertIn("수정 후 검열", self.rendered())
 
-    async def test_T08_raw_without_snapshot_preserves_ids_not_invented_author(self):
+    async def test_T08_raw_without_snapshot_preserves_channel_link_not_invented_author(self):
         await self.service.on_raw_message_delete(raw(self.source))
         self.assert_base(known_author=False)
         self.assertIn("원문 확인 불가", self.rendered())
         self.assertNotIn("Apple Watch", self.rendered())
         self.assertEqual(self.service.diagnostics(1)["sent_metadata_only"], 1)
 
-    async def test_T08_raw_missing_source_channel_still_records_explicit_ids(self):
+    async def test_T08_raw_missing_source_channel_still_links_explicit_source(self):
         self.channels.pop(11)
         await self.service.on_raw_message_delete(raw(self.source))
         self.assert_base(known_author=False)

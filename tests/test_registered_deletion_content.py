@@ -41,7 +41,7 @@ class RegisteredDeletionContentTests(unittest.IsolatedAsyncioTestCase):
         target.delete.assert_awaited_once()
         destination.send.assert_awaited_once()
         rendered = str(destination.send.call_args.kwargs["embed"].to_dict())
-        for expected in ("Apple Watch", "moderator-only", "시321133발", "시발"):
+        for expected in ("<@50>", "<#937715555232780318>", "시321133발", "시발"):
             self.assertIn(expected, rendered)
         self.assertNotIn("원문 비공개", rendered)
         self.assertEqual(service.diagnostics(source.guild)["sent_full"], 1)

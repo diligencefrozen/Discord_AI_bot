@@ -4724,7 +4724,7 @@ async def _admin_action_service(interaction, action_id):
         f"권한 판정 근거: {deletion_status.get('last_permission_reason') or '없음'} · 단계 {deletion_status.get('last_permission_stage') or '없음'}\n"
         f"마지막 상세 전송: {last_full_text}\n"
         f"전송 테스트: {deletion_status.get('test_result', 'not_run')}\n"
-        "※ 기본 기록은 작성자·채널·메시지 ID를 보존하며 원문 공개 성공을 뜻하지 않습니다.\n"
+        "※ 기본 기록은 작성자·채널을 표시하며, 원문은 공개 설정에 따라 표시합니다.\n"
         "등록 원본은 원문 공개가 기본이며, 미등록 비공개 채널은 보호합니다. 전송 테스트와 실제 삭제 처리는 별도 확인합니다.\n"
         "삭제 스냅샷은 메모리에만 잠시 보관하며 파일은 다운로드하지 않습니다.\n"
         f"{_slash_visibility_audit.status_text()}\n"

@@ -94,7 +94,7 @@ class AdminAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ENABLED=1 · INCLUDE_CONTENT=1 · ALL_GUILD_CHANNELS=1", text)
             self.assertIn("등록 원본 공개 기록: 켜짐 · 설정 유효", text)
             self.assertIn("선택 동의 목록: 유효 · 이 서버 1개", text)
-            self.assertIn("기본 기록은 작성자·채널·메시지 ID를 보존", text)
+            self.assertIn("기본 기록은 작성자·채널을 표시하며, 원문은 공개 설정에 따라 표시합니다.", text)
             self.assertIn("등록 원본은 원문 공개가 기본", text)
             self.assertIn("권한 판정 근거: source_member_scope_exceeded · 단계 member_overwrites", text)
             self.assertNotIn("전송 성공/실패", text)

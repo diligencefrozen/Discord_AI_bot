@@ -56,7 +56,7 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         container = view.children[0]
         self.assertEqual(len(container.children), 6)
         text, divider, heading, first, spacer, second = container.children
-        self.assertEqual(text.content, "**👀 Apple Watch님, 채팅을 작성 중이셨네요!**\n\n필요하시면 도리봇이 도와드릴게요.")
+        self.assertEqual(text.content, "**👀 <@42>님, 채팅을 작성 중이셨네요!**\n\n필요하시면 도리봇이 도와드릴게요.")
         self.assertEqual(heading.content, "**🐻 도리봇 · 빠른 실행**")
         self.assertTrue(divider.visible)
         self.assertEqual(divider.spacing, bot_ui.discord.SeparatorSpacing.small)
@@ -235,13 +235,27 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(target.response.send_message.call_args.kwargs["ephemeral"])
         self.assertEqual(service.await_count, 2)
 
-    async def test_typing_greeting_uses_safe_display_names_without_mentions(self):
+    async def test_typing_greeting_links_the_account_without_trusting_names_or_mentions(self):
+        user_id = 855749166764654653
+        names = ("Apple Watch", "바뀐 별명", "@everyone <@123>", "**name**\n\x00\u202e")
+        for name in names:
+            with self.subTest(name=name):
+                user = SimpleNamespace(id=user_id, display_name=name, mention="@everyone <@123> <@&456>")
+                payload = bot_ui.typing_intro_payload(user)
+                self.assertEqual(payload["view"].text,
+                                 f"**👀 <@{user_id}>님, 채팅을 작성 중이셨네요!**\n\n필요하시면 도리봇이 도와드릴게요.")
+                for field in ("users", "roles", "everyone", "replied_user"):
+                    self.assertFalse(getattr(payload["allowed_mentions"], field))
+                if bot_ui.DISCORD_AVAILABLE:
+                    self.assertEqual(payload["allowed_mentions"].to_dict()["parse"], [])
+
+    async def test_typing_greeting_uses_safe_display_names_when_id_is_unavailable(self):
         names = ("Apple Watch", "늘어버린 도리", "😡🐻👩\u200d💻", "name" * 100,
                  "**name** _x_ `code` ||spoiler|| [label](https://example.com)",
                  "@everyone @here <@123> <@&456>", "line\n\r\tbreak\x00\u202e")
         for name in names:
             with self.subTest(name=name):
-                user = SimpleNamespace(id=42, display_name=name, mention="@everyone <@123>")
+                user = SimpleNamespace(display_name=name, mention="@everyone <@123>")
                 payload = bot_ui.typing_intro_payload(user)
                 text = payload["view"].text
                 self.assertTrue(text.startswith("**👀 "))
@@ -260,10 +274,20 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("x" * 40 + "…님", bot_ui.TypingIntroView(SimpleNamespace(display_name="x" * 100)).text)
 
     async def test_typing_name_fallback_never_uses_the_mention_property(self):
-        for user in (None, SimpleNamespace(id=42, mention="@everyone"),
+        for user in (None, SimpleNamespace(mention="@everyone"),
                      SimpleNamespace(display_name="\x00\u202e"), SimpleNamespace(display_name=123)):
             self.assertIn("👀 사용자님", bot_ui.TypingIntroView(user).text)
         self.assertIn("👀 account님", bot_ui.TypingIntroView(SimpleNamespace(name="account")).text)
+
+    async def test_typing_profile_reference_rejects_malformed_ids(self):
+        for invalid_id in (None, True, False, 0, -1, 2**64, 42.0, "42", "42> @everyone <@123"):
+            with self.subTest(user_id=invalid_id):
+                user = SimpleNamespace(id=invalid_id, display_name="**별명** @everyone", mention="<@123>")
+                payload = bot_ui.typing_intro_payload(user)
+                self.assertNotRegex(payload["view"].text, r"<@[!&]?[0-9]+>")
+                self.assertIn("\\*\\*별명\\*\\* @\u200beveryone님", payload["view"].text)
+                self.assertFalse(payload["allowed_mentions"].users)
+        self.assertIn(f"<@{2**64 - 1}>", bot_ui.TypingIntroView(SimpleNamespace(id=2**64 - 1)).text)
 
     async def test_configuration_diagnostics_never_contain_raw_values(self):
         os.environ["SPECIAL_ADMIN_USER_IDS"] = f"{OLD_ADMIN},{NEW_ADMIN}"
@@ -445,6 +469,7 @@ class BotUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(children), 6)
         self.assertTrue(children[1].visible)
         self.assertFalse(children[4].visible)
+        self.assertIn("<@42>", children[0].content)
         self.assertTrue(payload["view"].is_persistent())
         self.assertFalse(payload["allowed_mentions"].users)
 

@@ -81,6 +81,8 @@ def raw(source, message_id=100, **overrides):
 def embed_field(embed, needle):
     if needle in ("탐지", "탐지 정보", "탐지 사유"):
         needle = "삭제 사유"
+    elif needle == "원문":
+        needle = "Deleted Content"
     return next(item.value for item in embed.fields if needle in item.name)
 
 
@@ -111,9 +113,9 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         kwargs = self.destination.send.call_args.kwargs
         embed = kwargs["embed"]
         self.assertEqual(embed_field(embed, "원문"), "공개 원문 😀")
-        self.assertIn("작성자", embed.description)
-        self.assertIn("작성자 ID 50", embed.footer.text)
-        self.assertIn(f"채널 ID {self.source.id}", embed.footer.text)
+        self.assertEqual(embed.description, f"**User:** <@50>\n**Channel:** <#{self.source.id}>")
+        self.assertNotIn("작성자 ID", embed.footer.text)
+        self.assertNotIn("채널 ID", embed.footer.text)
         self.assertIn("KST", embed.footer.text)
         self.assertNotIn("열람 범위 제한", embed.title)
         self.assertEqual(kwargs["allowed_mentions"].to_dict()["parse"], [])
@@ -266,7 +268,8 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("원문 확인 불가", embed_field(embed, "원문"))
         self.assertNotIn("공개 원문", str(embed.to_dict()))
         self.assertNotIn("작성자 (ID: 50)", str(embed.to_dict()))
-        self.assertIn("100", embed.footer.text)
+        self.assertEqual(embed.description, "**User:** 작성자 확인 불가\n**Channel:** <#11>")
+        self.assertNotIn("메시지 ID", str(embed.to_dict()))
         self.assert_counts(metadata=1)
 
     async def test_empty_attachment_message_is_full_not_missing_snapshot(self):
@@ -362,8 +365,10 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         await self.service.on_message_delete(target)
         self.destination.send.assert_awaited_once()
         rendered = str(self.destination.send.call_args.kwargs["embed"].to_dict())
-        for legacy in ("PRIVATE-AUTHOR-NAME", "channel-11", "메시지 ID", "100", "KST"):
+        for legacy in ("<@50>", "<#11>", "KST"):
             self.assertIn(legacy, rendered)
+        for redundant in ("PRIVATE-AUTHOR-NAME", "메시지 ID", "채널 ID"):
+            self.assertNotIn(redundant, rendered)
         for secret in ("private-secret-body",):
             self.assertNotIn(secret, rendered)
         status = self.assert_counts(metadata=1)
@@ -551,8 +556,10 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         rendered = str(embed.to_dict())
         self.assertLessEqual(len(embed), 6000)
         self.assertTrue(all(len(field.value) <= 1024 for field in embed.fields))
-        for unsafe in ("@everyone", "<@50>", "```", "https://evil.test", "**fake**"):
+        for unsafe in ("@everyone", "```", "https://evil.test", "**fake**"):
             self.assertNotIn(unsafe, rendered)
+        self.assertNotIn("<@50>", embed_field(embed, "원문"))
+        self.assertEqual(embed.description, "**User:** <@50>\n**Channel:** <#11>")
         self.assertIn("일부 표시", embed_field(embed, "원문"))
         self.assertEqual(kwargs["allowed_mentions"].to_dict()["parse"], [])
         self.assert_counts(full=1)
@@ -636,7 +643,7 @@ class V7PublicDeletionPipelineTests(unittest.IsolatedAsyncioTestCase):
         status = self.assert_counts(metadata=1)
         self.assertEqual(status["last_reason"], "private_source")
         self.assertNotIn("must-not-retry-private-content", str(self.destination.send.call_args.kwargs["embed"].to_dict()))
-        self.assertIn("작성자", self.destination.send.call_args.kwargs["embed"].description)
+        self.assertIn("<@50>", self.destination.send.call_args.kwargs["embed"].description)
         self.assertNotIn("must-not-retry-private-content", "\n".join(captured.output))
         self.assertIn((1, 100), self.service._delivered)
 

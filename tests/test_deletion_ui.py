@@ -33,25 +33,46 @@ def fields(card):
 class CompactDeletionCardTests(unittest.TestCase):
     def test_text_only_card_prioritizes_body_with_two_fields(self):
         card = build_deletion_embed(snapshot(), deleted_at=DELETED_AT)
-        self.assertEqual(card.title, "🗑️ 메시지 삭제 기록")
-        self.assertEqual(card.description, "**Apple Watch** · #moderator-only")
-        self.assertEqual(list(fields(card)), ["삭제된 원문", "삭제 사유"])
-        self.assertEqual(fields(card)["삭제된 원문"], "시321133발")
+        self.assertEqual(card.title, "메시지 삭제 기록")
+        self.assertEqual(card.description, "**User:** <@855749166764654653>\n**Channel:** <#937715555232780318>")
+        self.assertEqual(list(fields(card)), ["Deleted Content", "삭제 사유"])
+        self.assertEqual(fields(card)["Deleted Content"], "시321133발")
         self.assertIn("시발", fields(card)["삭제 사유"])
         self.assertNotIn("시321133발", fields(card)["삭제 사유"])
         self.assertNotIn("없음", str(card.to_dict()))
         self.assertNotIn("0개", str(card.to_dict()))
 
-    def test_all_ids_and_deletion_timestamp_appear_once_in_footer(self):
-        card = build_deletion_embed(snapshot(), deleted_at=DELETED_AT)
+    def test_identity_links_replace_numeric_id_labels_and_footer_is_server_and_time(self):
+        current = snapshot()
+        card = build_deletion_embed(current, deleted_at=DELETED_AT)
         visible = card.title + card.description + "".join(fields(card).values()) + card.footer.text
-        for value in ("1563079141299982417", "855749166764654653",
-                      "937715555232780318", "585087748948623380"):
-            self.assertEqual(visible.count(value), 1)
-            self.assertIn(value, card.footer.text)
+        self.assertEqual(card.footer.text, "운영 서버 | 2026-10-23 15:38:28 KST")
+        for value in ("1563079141299982417", "585087748948623380", "메시지 ID", "채널 ID", "작성자 ID"):
+            self.assertNotIn(value, visible)
+        self.assertEqual(visible.count("<@855749166764654653>"), 1)
+        self.assertEqual(visible.count("<#937715555232780318>"), 1)
         self.assertEqual(visible.count("2026-10-23 15:38:28 KST"), 1)
         self.assertNotIn("15:38:27", visible)
-        self.assertIn("봇 수신 기준", card.footer.text)
+        # IDs still exist internally for delivery routing, deduplication and diagnostics.
+        self.assertEqual((current.message_id, current.guild_id), (1563079141299982417, 585087748948623380))
+
+    def test_display_name_changes_cannot_change_identity_links_or_inject_mentions(self):
+        current = replace(snapshot(), author_name="@everyone **fake** <@999>",
+                          channel_name="@here [fake](https://evil.test)")
+        card = build_deletion_embed(current, deleted_at=DELETED_AT)
+        self.assertEqual(card.description, "**User:** <@855749166764654653>\n**Channel:** <#937715555232780318>")
+        for untrusted in ("everyone", "fake", "<@999>", "https://evil.test"):
+            self.assertNotIn(untrusted, card.description)
+
+    def test_unknown_or_malformed_identity_never_creates_a_guessed_mention(self):
+        for author_id, channel_id in ((0, 0), (-1, -1), (True, True), ("50> @everyone", "11> @here")):
+            with self.subTest(author_id=author_id, channel_id=channel_id):
+                current = replace(snapshot(), author_id=author_id, channel_id=channel_id,
+                                  author_name="", channel_name="")
+                card = build_deletion_embed(current, deleted_at=DELETED_AT)
+                self.assertEqual(card.description, "**User:** 작성자 확인 불가\n**Channel:** 채널 확인 불가")
+                self.assertNotIn("<@", card.description)
+                self.assertNotIn("<#", card.description)
 
     def test_edit_and_scan_context_keeps_relevant_timestamps(self):
         for trigger, expected in (("message_edit", "수정 후 검열"), ("history_scan", "정기 재점검")):
@@ -68,16 +89,16 @@ class CompactDeletionCardTests(unittest.TestCase):
     def test_unknown_body_is_distinct_from_empty_known_body(self):
         unknown = replace(snapshot(), content="", content_available=False)
         empty = snapshot("")
-        self.assertIn("원문 확인 불가", fields(build_deletion_embed(unknown))["삭제된 원문"])
-        self.assertIn("본문 없음", fields(build_deletion_embed(empty))["삭제된 원문"])
+        self.assertIn("원문 확인 불가", fields(build_deletion_embed(unknown))["Deleted Content"])
+        self.assertIn("본문 없음", fields(build_deletion_embed(empty))["Deleted Content"])
 
     def test_metadata_only_card_does_not_render_empty_sections_or_internal_policy_codes(self):
         card = build_metadata_deletion_embed(snapshot("private body"), deleted_at=DELETED_AT)
-        self.assertEqual(list(fields(card)), ["삭제된 원문", "삭제 사유"])
+        self.assertEqual(list(fields(card)), ["Deleted Content", "삭제 사유"])
         rendered = str(card.to_dict())
         for unwanted in ("private body", "시발", "private_source", "기록 상태", "0개", "확보 범위"):
             self.assertNotIn(unwanted, rendered)
-        self.assertIn("원문 비공개", fields(card)["삭제된 원문"])
+        self.assertIn("원문 비공개", fields(card)["Deleted Content"])
 
     def test_metadata_only_card_keeps_nonempty_counts_without_private_media_names(self):
         current = replace(snapshot("private body"), attachment_count=2, sticker_count=1)
