@@ -113,7 +113,7 @@ def message(content, channel_id=1):
 class MainModerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_message_and_prompt_spend_once_for_link_profanity_or_both(self):
         for route in ("message", "interaction"):
-            for content in ("병12121신", "https://example.com", "병ㄱㄱㄱ신 https://example.com"):
+            for content in ("병12121신", "ㅂ122121ㅅ", "https://example.com", "병ㄱㄱㄱ신 https://example.com"):
                 for count in (0, 1, 2):
                     with self.subTest(route=route, content=content, count=count):
                         ns = services()
@@ -405,6 +405,67 @@ class PublicQuestionTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipIf(discord is None, "requires actual discord.py")
 class MainDeletionAuditIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_digit_obfuscated_consonants_are_deleted_before_xp_and_keep_raw_audit_body(self):
+        ns, target, log_channel, audit = self.audit_context("ㅂ122121ㅅ")
+        violation = ns["_evaluate_message_policy"](target)
+        self.assertIsNotNone(violation)
+        self.assertEqual(violation.matched_rule, "ㅄ")
+        ns["add_xp"] = Mock(side_effect=AssertionError("blocked message awarded XP"))
+        with self.assertLogs("deletion_audit", level="INFO") as captured:
+            await ns["on_message"](target)
+            await ns["on_message_delete"](target)
+            await ns["on_raw_message_delete"](SimpleNamespace(
+                guild_id=1, channel_id=1, message_id=123, cached_message=target))
+        target.delete.assert_awaited_once()
+        log_channel.send.assert_awaited_once()
+        card = log_channel.send.call_args.kwargs["embed"]
+        self.assertEqual(next(field.value for field in card.fields if field.name == "Deleted Content"),
+                         "ㅂ122121ㅅ")
+        self.assertIn("ㅄ", next(field.value for field in card.fields if "삭제 사유" in field.name))
+        self.assertEqual(target.content, "ㅂ122121ㅅ")
+        self.assertIn((target.guild.id, target.id), audit._delivered)
+        self.assertNotIn(target.content, "\n".join(captured.output))
+        ns["add_xp"].assert_not_called()
+        ns["bot"].process_commands.assert_not_awaited()
+        ns["_typing_message_fallback"].assert_not_called()
+
+    async def test_digit_obfuscated_consonant_edit_reuses_shared_policy_and_single_audit(self):
+        from edit_moderation import EditModerationService
+
+        ns, target, log_channel, audit = self.audit_context("ㅇ")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        target.created_at, target.edited_at = now, None
+        worker = EditModerationService(
+            SimpleNamespace(get_channel=lambda _id: target.channel, user=SimpleNamespace(id=99)),
+            evaluate=ns["_evaluate_message_policy"], delete=ns["safe_delete"],
+            consume_pass=ns["use_profanity_pass"], has_pass=ns["is_user_exempt_from_profanity"],
+            remember=audit.remember)
+        ns["EDIT_MODERATION"] = worker
+        self.assertTrue(await ns["_moderate_message_content"](target))
+        before = SimpleNamespace(**vars(target))
+        target.content, target.edited_at = "ㅂ122121ㅅ", now + datetime.timedelta(seconds=1)
+        raw = SimpleNamespace(guild_id=1, channel_id=1, message_id=123,
+                              cached_message=before, message=target,
+                              data={"content": target.content, "edited_timestamp": target.edited_at.isoformat()})
+        ns["add_xp"] = Mock(side_effect=AssertionError("edit replayed XP"))
+        ns["_generate_text_response"] = AsyncMock(side_effect=AssertionError("edit replayed AI"))
+        with self.assertLogs("deletion_audit", level="INFO") as captured:
+            await asyncio.gather(ns["on_raw_message_edit"](raw), ns["on_message_edit"](before, target))
+            await ns["on_message_delete"](target)
+        target.delete.assert_awaited_once()
+        log_channel.send.assert_awaited_once()
+        card = log_channel.send.call_args.kwargs["embed"]
+        self.assertEqual(next(field.value for field in card.fields if field.name == "Deleted Content"),
+                         "ㅂ122121ㅅ")
+        reason = next(field.value for field in card.fields if "삭제 사유" in field.name)
+        self.assertIn("ㅄ", reason)
+        self.assertIn("수정 후 검열", str(card.to_dict()))
+        self.assertNotIn(target.content, "\n".join(captured.output))
+        ns["add_xp"].assert_not_called()
+        ns["_generate_text_response"].assert_not_awaited()
+        ns["_observe_typing_message"].assert_not_called()
+        ns["_typing_message_fallback"].assert_not_called()
+
     async def test_naver_link_edit_uses_real_policy_delete_and_public_audit_once(self):
         from edit_moderation import EditModerationService
 

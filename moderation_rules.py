@@ -89,6 +89,19 @@ def _matching_atoms(text: str) -> str:
     return unicodedata.normalize("NFC", normalize_text(text)).casefold()
 
 
+# NFKC maps compatibility ㅄ to one PIEUP-SIOS atom (ᄡ), rather than the
+# separate keystrokes ᄇᄉ. Treat these isolated jamo as equivalent for matching
+# only, after NFC has protected complete syllables such as 값 and 밥상.
+# The scanner retains the unexpanded atom's position: a compound jamo used as
+# filler must still consume one gap position, not two.
+_JAMO_MATCHING_ALIASES = {
+    "\u1121": "\u1107\u1109",  # isolated initial/compatibility PIEUP-SIOS
+    "\u11b9": "\u1107\u1109",  # isolated final PIEUP-SIOS
+    "\u11b8": "\u1107",        # isolated final PIEUP
+    "\u11ba": "\u1109",        # isolated final SIOS
+}
+
+
 def _is_filler(ch: str) -> bool:
     number = ord(ch)
     return (
@@ -129,7 +142,7 @@ def _compile_rules(roots: tuple[str, ...]) -> _CompiledRules:
     normalized_roots: set[str] = set()
     latin_roots: list[tuple[int, str]] = []
     for root in roots:
-        normalized = _matching_atoms(root)
+        normalized = "".join(_JAMO_MATCHING_ALIASES.get(ch, ch) for ch in _matching_atoms(root))
         if not normalized or normalized in normalized_roots:
             continue
         normalized_roots.add(normalized)
@@ -224,21 +237,22 @@ def find_badroot(text: str, roots: Iterable[str] = BAD_ROOTS) -> Optional[str]:
             if best == 0:
                 return rules.roots[0]
     for position, ch in enumerate(normalized):
-        for node_id in rules.transitions.get(ch, ()):
-            node = rules.nodes[node_id]
-            if node.parent >= 0:
-                previous = latest[node.parent]
-                if (
-                    previous < 0
-                    or previous < last_non_filler
-                    or position - previous > MAX_FILLER_GAP + 1
-                ):
-                    continue
-            latest[node_id] = position
-            if node.output is not None and (best is None or node.output < best):
-                best = node.output
-                if best == 0:
-                    return rules.roots[0]
+        for atom in _JAMO_MATCHING_ALIASES.get(ch, ch):
+            for node_id in rules.transitions.get(atom, ()):
+                node = rules.nodes[node_id]
+                if node.parent >= 0:
+                    previous = latest[node.parent]
+                    if (
+                        previous < 0
+                        or previous < last_non_filler
+                        or position - previous > MAX_FILLER_GAP + 1
+                    ):
+                        continue
+                latest[node_id] = position
+                if node.output is not None and (best is None or node.output < best):
+                    best = node.output
+                    if best == 0:
+                        return rules.roots[0]
         if not _is_filler(ch):
             last_non_filler = position
     return rules.roots[best] if best is not None else None

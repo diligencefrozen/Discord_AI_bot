@@ -94,6 +94,43 @@ class ModerationRulesTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(find_badroot(value), "병신")
 
+    def test_reported_split_compound_jamo_obfuscation(self):
+        for value in ("ㅄ", "ㅂㅅ", "ㅂ122121ㅅ", "ㅂ１２２１２１ㅅ", "ㅂ1-_-2ㅅ", "ㅂ\u200b122121\u200bㅅ"):
+            with self.subTest(value=value):
+                self.assertEqual(find_badroot(value), "ㅄ")
+
+    def test_compound_jamo_forms_share_matching_without_changing_policy_roots(self):
+        forms = ("ㅄ", "ㅂㅅ", "ᄡ", "ᆹ", "ᄇ122121ᄉ", "ᆸ122121ᆺ", "ﾲ122121ﾵ")
+        for root in ("ㅄ", "ㅂㅅ", "ᄡ", "ᆹ"):
+            for value in forms:
+                with self.subTest(root=root, value=value):
+                    self.assertEqual(find_badroot(value, (root,)), root)
+        self.assertEqual(find_badroot("ㅂ122121ㅅ", ("ㅄ", "ㅂㅅ")), "ㅂㅅ")
+        self.assertIsNone(find_badroot("ㅂ122121ㅅ", ()))
+
+    def test_split_compound_jamo_keeps_existing_filler_limits(self):
+        for filler in ("1", "-", "a", "ㄱ", " "):
+            with self.subTest(filler=filler):
+                self.assertEqual(find_badroot("ㅂ" + filler * MAX_FILLER_GAP + "ㅅ"), "ㅄ")
+                self.assertIsNone(find_badroot("ㅂ" + filler * (MAX_FILLER_GAP + 1) + "ㅅ"))
+
+    def test_compound_jamo_does_not_split_normal_syllables(self):
+        for value in ("값", "값을 계산합니다", "갑자기 소식이 왔어요", "방송", "박수", "밥상"):
+            for form in ("NFC", "NFD", "NFKC", "NFKD"):
+                with self.subTest(value=value, form=form):
+                    self.assertIsNone(find_badroot(unicodedata.normalize(form, value)))
+
+    def test_split_compound_jamo_does_not_join_across_prose_or_symbols(self):
+        for value in ("ㅂ보통ㅅ", "ㅂ🙂ㅅ", "ㅂéㅅ", "ㅂ漢ㅅ"):
+            with self.subTest(value=value):
+                self.assertIsNone(find_badroot(value))
+
+    def test_compound_jamo_filler_still_counts_as_one_source_atom(self):
+        for root, prefix, suffix in (("병신", "병", "신"), ("fuck", "f", "uck")):
+            with self.subTest(root=root):
+                self.assertEqual(find_badroot(prefix + "ㅄ" * MAX_FILLER_GAP + suffix, (root,)), root)
+                self.assertIsNone(find_badroot(prefix + "ㅄ" * (MAX_FILLER_GAP + 1) + suffix, (root,)))
+
     def test_bounded_filler_and_disallowed_categories(self):
         self.assertEqual(find_badroot("씨--발"), "씨발")
         for filler in ("-", "a", "1", "ㄱ", " "):
@@ -173,6 +210,7 @@ class ModerationRulesTests(unittest.TestCase):
         started = time.perf_counter()
         self.assertIsNone(find_badroot("f" * 100_000 + "u" * 100_000 + "c" * 100_000))
         self.assertIsNone(find_badroot("병" + "a" * 100_000 + "신"))
+        self.assertIsNone(find_badroot("ㅂ" + "1" * 100_000 + "ㅅ", ("ㅄ",)))
         # A deliberately broad ceiling catches explosive backtracking without
         # imposing a microbenchmark target on slower CI machines.
         self.assertLess(time.perf_counter() - started, 5.0)
