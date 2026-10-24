@@ -64,11 +64,12 @@ def active_bad_roots() -> tuple[str, ...]:
     return tuple(sorted(BAD_ROOTS, key=lambda root: (root.casefold(), root)))
 
 
-# Zero-width formatting characters are removed before matching.  Only ASCII
-# letters/digits, Hangul jamo, whitespace and punctuation may fill a gap.  A
-# complete Korean syllable is never filler, preventing normal prose from
-# joining unrelated words.  Sixteen characters cover common obfuscation while
-# setting an explicit limit on how far a partial root may span.
+# Zero-width formatting characters are removed before matching. Korean roots
+# also tolerate inserted ASCII letters, numbers, jamo, whitespace, punctuation,
+# symbols, marks and format characters. Complete syllables and other letters
+# remain boundaries so unrelated words in ordinary prose are not joined.
+# Only the conservative Latin matcher retains the historical 16-character gap
+# limit. Korean scanning is linear with bounded state even for long insertions.
 ZERO_WIDTH_CHARS = frozenset("\u00ad\u034f\u061c\u180e\u200b\u200c\u200d\u2060\ufeff")
 MAX_FILLER_GAP = 16
 _ASCII_PUNCTUATION = frozenset(string.punctuation)
@@ -92,8 +93,8 @@ def _matching_atoms(text: str) -> str:
 # NFKC maps compatibility ㅄ to one PIEUP-SIOS atom (ᄡ), rather than the
 # separate keystrokes ᄇᄉ. Treat these isolated jamo as equivalent for matching
 # only, after NFC has protected complete syllables such as 값 and 밥상.
-# The scanner retains the unexpanded atom's position: a compound jamo used as
-# filler must still consume one gap position, not two.
+# The scanner retains the unexpanded atom's position for prose boundaries;
+# Latin gap accounting also continues to use the original atoms.
 _JAMO_MATCHING_ALIASES = {
     "\u1121": "\u1107\u1109",  # isolated initial/compatibility PIEUP-SIOS
     "\u11b9": "\u1107\u1109",  # isolated final PIEUP-SIOS
@@ -103,6 +104,8 @@ _JAMO_MATCHING_ALIASES = {
 
 
 def _is_filler(ch: str) -> bool:
+    """Historical Latin filler policy; keep its prose and URL safeguards."""
+
     number = ord(ch)
     return (
         "a" <= ch <= "z"
@@ -115,6 +118,14 @@ def _is_filler(ch: str) -> bool:
         or 0xA960 <= number <= 0xA97F
         or 0xD7B0 <= number <= 0xD7FF
     )
+
+
+def _is_korean_filler(ch: str) -> bool:
+    # Do not use a blanket non-Hangul rule: accented/CJK letters and complete
+    # syllables are prose boundaries. Emoji can include variation/combining
+    # marks and invisible formatting, all of which are valid inserted filler.
+    category = unicodedata.category(ch)
+    return _is_filler(ch) or category[0] in "NSM" or category == "Cf"
 
 
 @dataclass(frozen=True)
@@ -215,11 +226,12 @@ def _find_obfuscated_latin(text: str, root: str) -> bool:
 def find_badroot(text: str, roots: Iterable[str] = BAD_ROOTS) -> Optional[str]:
     """Return the configured root found in *text*, or ``None``.
 
-    A deterministic prefix-state scan permits up to ``MAX_FILLER_GAP`` explicit
-    filler atoms between characters.  It has no regex backtracking: each input
-    character visits only trie transitions for that literal character, with
-    bounded state independent of message length.  Original policy priority is
-    retained (longest root first, then original string), including custom sets.
+    A deterministic prefix-state scan skips inserted filler between Korean
+    root characters without a gap-length bypass. Latin roots retain their
+    conservative boundary and ``MAX_FILLER_GAP`` policy. No regex backtracking
+    is involved: input atoms visit only their trie transitions, with bounded
+    state independent of message length. Original policy priority is retained
+    (longest root first, then original string), including custom sets.
     """
 
     rules = _DEFAULT_RULES if roots is BAD_ROOTS else _compile_rules(
@@ -242,18 +254,14 @@ def find_badroot(text: str, roots: Iterable[str] = BAD_ROOTS) -> Optional[str]:
                 node = rules.nodes[node_id]
                 if node.parent >= 0:
                     previous = latest[node.parent]
-                    if (
-                        previous < 0
-                        or previous < last_non_filler
-                        or position - previous > MAX_FILLER_GAP + 1
-                    ):
+                    if previous < 0 or previous < last_non_filler:
                         continue
                 latest[node_id] = position
                 if node.output is not None and (best is None or node.output < best):
                     best = node.output
                     if best == 0:
                         return rules.roots[0]
-        if not _is_filler(ch):
+        if not _is_korean_filler(ch):
             last_non_filler = position
     return rules.roots[best] if best is not None else None
 
