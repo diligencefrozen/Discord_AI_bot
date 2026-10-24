@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock
 
 import discord
-from slash_access import slash_access_report
+from slash_access import slash_access_report_with_refresh
 from test_main_services import services, message
 
 
@@ -18,7 +18,7 @@ def adapter():
                     and node.name == "slash_access_diagnostic")
     function.decorator_list = []
     namespace = {"discord": discord, "logging": logging, "time": time,
-                 "slash_access_report": slash_access_report, "_slash_diagnostic_cooldowns": {}}
+                 "slash_access_report_with_refresh": slash_access_report_with_refresh, "_slash_diagnostic_cooldowns": {}}
     exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
     return namespace
 

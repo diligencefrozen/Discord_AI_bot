@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from deletion_audit import DeletionAuditService
 from edit_moderation import EditModerationService, evaluate_policy
 from slash_visibility import SlashVisibilityAudit, slash_sync_mode
-from slash_access import slash_access_report
+from slash_access import slash_access_report_with_refresh
 from bot_storage import PickleStore
 from bot_metrics import MetricsStore
 from ai_providers import (
@@ -4446,7 +4446,7 @@ async def slash_access_diagnostic(ctx):
     _slash_diagnostic_cooldowns[key] = now
     try:
         await ctx.reply(
-            slash_access_report(ctx.author, ctx.guild, ctx.channel),
+            await slash_access_report_with_refresh(ctx.author, ctx.guild, ctx.channel),
             allowed_mentions=discord.AllowedMentions.none(), mention_author=False, delete_after=90,
         )
     except Exception:

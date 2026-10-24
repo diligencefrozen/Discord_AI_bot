@@ -1,13 +1,17 @@
 """Self-diagnostics keep Discord command access separate from bot authorization."""
 
+import asyncio
+import copy
+import datetime
 import os
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 
-from slash_access import slash_access_report
+import slash_access
+from slash_access import slash_access_report, slash_access_report_with_refresh
 
 
 USER_ID = 491239880005910538
@@ -261,6 +265,206 @@ class RealSlashAccessPermissionTests(unittest.TestCase):
         channel = discord.TextChannel(state=self.state, guild=self.guild, data=self.channel_data)
         self.assertFalse(channel.permissions_for(self.actor).use_application_commands)
         self.assertIn("역할·회원별", slash_access_report(self.actor, self.guild, channel))
+
+
+class FreshSlashAccessTests(unittest.IsolatedAsyncioTestCase):
+    """Real discord.py snapshots, with only the three REST transports mocked."""
+
+    member = RealSlashAccessPermissionTests.member
+    overwrite = staticmethod(RealSlashAccessPermissionTests.overwrite)
+
+    def setUp(self):
+        RealSlashAccessPermissionTests.setUp(self)
+        self.fresh_roles = [copy.copy(role) for role in self.guild.roles]
+        self.fresh_member = self.member(USER_ID, [self.member_role_id])
+        self.fresh_channel = discord.TextChannel(state=self.state, guild=self.guild, data={
+            **self.channel_data, "permission_overwrites": [],
+        })
+        self.roles = AsyncMock(side_effect=lambda: self.fresh_roles)
+        self.member_fetch = AsyncMock(side_effect=lambda _id: self.fresh_member)
+        self.channel_fetch = AsyncMock(side_effect=lambda _id: self.fresh_channel)
+        for name, mock in (("fetch_roles", self.roles), ("fetch_member", self.member_fetch), ("fetch_channel", self.channel_fetch)):
+            patcher = patch.object(discord.Guild, name, mock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        slot_patch = patch("slash_access._REFRESH_SLOTS", asyncio.Semaphore(2))
+        slot_patch.start()
+        self.addCleanup(slot_patch.stop)
+
+    async def report(self):
+        return await slash_access_report_with_refresh(self.actor, self.guild, self.channel)
+
+    async def test_fresh_allow_compares_cached_denial_without_mutating_permission_caches(self):
+        original_roles = self.guild._roles
+        original_overwrites = self.channel._overwrites
+        original_member_guild = self.fresh_member.guild
+        report = await self.report()
+        self.assertIn("캐시 · 내 애플리케이션 명령어 사용: 거부", report)
+        self.assertIn("Discord 새 조회 · 내 앱 명령 사용: 허용", report)
+        self.assertIn("캐시와 새 조회가 다릅니다", report)
+        self.assertIn("명령 목록·실행 복구를 보장하지 않습니다", report)
+        self.assertNotIn("거부를 확인하고 해제해야", report)
+        self.assertIn("진단 v2 · 검사 시각", report)
+        self.assertIn("KST", report)
+        self.assertIn("서버 기본 허용", report)
+        self.assertIs(self.guild._roles, original_roles)
+        self.assertIs(self.channel._overwrites, original_overwrites)
+        self.assertIs(self.fresh_member.guild, original_member_guild)
+        self.assertFalse(self.channel.permissions_for(self.actor).use_application_commands)
+        self.member_fetch.assert_awaited_once_with(USER_ID)
+        self.channel_fetch.assert_awaited_once_with(CHANNEL_ID)
+        self.assertNotIn(str(USER_ID), report)
+        self.assertNotIn("Offline member", report)
+        self.assertLess(len(report), 2000)
+
+    async def test_rest_role_values_replace_stale_server_base_in_snapshot_only(self):
+        original_base = self.guild.default_role.permissions.value
+        for role in self.fresh_roles:
+            if role.id == self.guild.id:
+                role._permissions &= ~discord.Permissions(use_application_commands=True).value
+        report = await self.report()
+        self.assertIn("Discord 새 조회 · 내 앱 명령 사용: 거부", report)
+        self.assertIn("서버 기본 거부", report)
+        self.assertEqual(self.guild.default_role.permissions.value, original_base)
+        self.assertNotIn("캐시와 새 조회가 다릅니다", report)
+        self.assertNotIn("거부를 확인하고 해제해야", report)
+        self.assertIn("위 새 조회의 권한 단계", report)
+
+    async def test_fresh_member_overwrite_denial_is_separate_from_panel_auth(self):
+        self.fresh_channel = discord.TextChannel(state=self.state, guild=self.guild, data={
+            **self.channel_data,
+            "permission_overwrites": [self.overwrite(USER_ID, 1, use_application_commands=False)],
+        })
+        report = await self.report()
+        self.assertIn("Discord 새 조회 · 내 앱 명령 사용: 거부", report)
+        self.assertIn("회원 우선 거부", report)
+        self.assertIn("도리봇 /관리 인증: 허용", report)
+
+    async def test_fresh_view_denial_explains_implicit_command_mask(self):
+        self.fresh_channel = discord.TextChannel(state=self.state, guild=self.guild, data={
+            **self.channel_data,
+            "permission_overwrites": [self.overwrite(USER_ID, 1, view_channel=False)],
+        })
+        report = await self.report()
+        self.assertIn("Discord 새 조회 · 내 앱 명령 사용: 거부", report)
+        self.assertIn("채널 보기 거부", report)
+        self.assertIn("서버 기본 허용", report)
+        self.assertNotIn("거부를 확인하고 해제해야", report)
+        self.assertIn("위 새 조회의 권한 단계", report)
+
+    async def test_fresh_roles_and_timeout_replace_stale_member_data(self):
+        self.fresh_member._roles = discord.utils.SnowflakeList([])
+        self.fresh_member.timed_out_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)
+        report = await self.report()
+        self.assertIn("타임아웃 적용 중", report)
+        self.assertIn("Discord 새 조회 · 내 앱 명령 사용: 거부", report)
+        self.assertFalse(self.actor.is_timed_out())
+        self.assertNotIn("거부를 확인하고 해제해야", report)
+        self.assertIn("위 새 조회의 권한 단계", report)
+
+    async def test_fresh_member_role_assignment_is_used_instead_of_cached_assignment(self):
+        self.fresh_member._roles = discord.utils.SnowflakeList([self.admin_role_id])
+        self.fresh_channel = self.channel
+        report = await self.report()
+        self.assertIn("Discord 새 조회 · 내 앱 명령 사용: 허용", report)
+        self.assertIn("새 조회 근거: Administrator 권한", report)
+        self.assertEqual(list(self.actor._roles), [self.member_role_id])
+
+    async def test_current_scope_is_validated_before_any_http(self):
+        for target in (self.actor, self.channel):
+            original_guild = target.guild
+            target.guild = SimpleNamespace(id=500)
+            report = await self.report()
+            self.assertIn("member_or_channel_unavailable", report)
+            target.guild = original_guild
+        self.roles.assert_not_awaited()
+        self.member_fetch.assert_not_awaited()
+        self.channel_fetch.assert_not_awaited()
+
+    async def test_cache_allow_does_not_fetch(self):
+        self.channel = self.fresh_channel
+        report = await self.report()
+        self.assertIn("내 애플리케이션 명령어 사용: 허용", report)
+        self.assertNotIn("Discord 새 조회", report)
+        self.roles.assert_not_awaited()
+
+    async def test_rest_scope_mismatch_is_unknown_and_never_applied(self):
+        self.fresh_member = self.member(123, [self.member_role_id])
+        report = await self.report()
+        self.assertIn("확인 불가 (snapshot_scope_invalid)", report)
+        self.assertNotIn("Discord 새 조회 · 내 앱 명령 사용: 허용", report)
+
+    async def test_missing_role_evidence_is_unknown(self):
+        self.fresh_roles = [role for role in self.fresh_roles if role.id != self.member_role_id]
+        report = await self.report()
+        self.assertIn("확인 불가 (snapshot_roles_incomplete)", report)
+
+    async def test_failures_are_sanitized_and_pending_requests_are_cancelled_on_timeout(self):
+        self.roles.side_effect = RuntimeError("SECRET_API_BODY")
+        report = await self.report()
+        self.assertIn("확인 불가 (refresh_failed)", report)
+        self.assertNotIn("SECRET_API_BODY", report)
+        self.assertNotIn("TOKEN", report)
+        cancelled = asyncio.Event()
+        async def slow_roles():
+            try:
+                await asyncio.sleep(30)
+            finally:
+                cancelled.set()
+        self.roles.side_effect = slow_roles
+        with patch("slash_access._REFRESH_TIMEOUT_SECONDS", 0.01):
+            report = await self.report()
+        self.assertIn("확인 불가 (timeout)", report)
+        self.assertTrue(cancelled.is_set())
+
+    async def test_api_error_codes_are_fixed_and_do_not_expose_response_bodies(self):
+        cases = ((discord.Forbidden, 403, "forbidden"),
+                 (discord.NotFound, 404, "not_found"),
+                 (discord.HTTPException, 500, "http_error"))
+        for error_type, status, code in cases:
+            self.roles.side_effect = error_type(SimpleNamespace(status=status, reason="SECRET_REASON"), "SECRET_BODY")
+            report = await self.report()
+            self.assertIn(f"확인 불가 ({code})", report)
+            self.assertNotIn("SECRET", report)
+
+    async def test_only_two_simultaneous_self_refreshes_enter_rest(self):
+        active = high_water = 0
+        async def roles():
+            nonlocal active, high_water
+            active += 1
+            high_water = max(high_water, active)
+            try:
+                await asyncio.sleep(0.01)
+                return self.fresh_roles
+            finally:
+                active -= 1
+        self.roles.side_effect = roles
+        await asyncio.gather(*(self.report() for _ in range(6)))
+        self.assertEqual(high_water, 2)
+
+    async def test_thread_fetches_and_uses_fresh_parent_instead_of_cached_parent(self):
+        thread_id = CHANNEL_ID + 2
+        cached_thread = discord.Thread(state=self.state, guild=self.guild, data={
+            "id": str(thread_id), "parent_id": str(CHANNEL_ID), "owner_id": str(USER_ID),
+            "name": "Offline thread", "type": 11, "message_count": 1, "member_count": 1,
+            "thread_metadata": {"archived": False, "auto_archive_duration": 1440,
+                                "archive_timestamp": "2026-10-24T00:00:00+00:00", "locked": False},
+        })
+        self.guild._channels[self.channel.id] = self.channel
+        self.channel = cached_thread
+        self.channel_fetch.side_effect = lambda value: cached_thread if value == thread_id else self.fresh_channel
+        report = await self.report()
+        self.assertIn("Discord 새 조회 · 내 앱 명령 사용: 허용", report)
+        self.assertEqual(self.channel_fetch.await_count, 2)
+        self.assertFalse(cached_thread.permissions_for(self.actor).use_application_commands)
+
+    async def test_bot_identity_is_validated_without_author_identity_dump(self):
+        bot_id = 900000000000000001
+        self.state.user = SimpleNamespace(id=bot_id)
+        self.guild._members[bot_id] = self.member(bot_id, [])
+        report = await self.report()
+        self.assertIn(f"응답 봇 ID: {bot_id}", report)
+        self.assertNotIn(str(USER_ID), report)
 
 
 if __name__ == "__main__":
